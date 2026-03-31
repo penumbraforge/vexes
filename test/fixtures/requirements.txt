@@ -1,0 +1,12 @@
+# Test requirements file
+requests==2.31.0
+flask>=2.3.0
+numpy~=1.24.0
+pandas  # no version
+# comment line
+-r other-requirements.txt
+beautifulsoup4[html5lib]==4.12.2 ; python_version >= "3.8"
+git+https://github.com/user/repo.git
+file:../local-pkg
+Django==4.2.7
+urllib3>=2.0.0,<3.0.0

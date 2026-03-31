@@ -1,0 +1,44 @@
+{
+  "name": "@penumbraforge/vexes",
+  "version": "0.1.0",
+  "description": "Cross-ecosystem dependency security scanner. Shakes the tree to see what falls. Zero dependencies.",
+  "type": "module",
+  "bin": {
+    "vexes": "bin/vexes.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test test/test-*.js",
+    "scan": "node bin/vexes.js scan",
+    "analyze": "node bin/vexes.js analyze"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "security",
+    "vulnerability",
+    "scanner",
+    "supply-chain",
+    "osv",
+    "npm",
+    "pypi",
+    "cargo",
+    "dependencies",
+    "cli"
+  ],
+  "author": "Shadoe Myers <shadoe@penumbraforge.com> (https://github.com/penumbraforge)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/penumbraforge/vexes.git"
+  },
+  "homepage": "https://github.com/penumbraforge/vexes",
+  "dependencies": {},
+  "devDependencies": {}
+}
