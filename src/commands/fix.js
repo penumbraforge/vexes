@@ -1,13 +1,12 @@
-import { resolve, basename, join } from 'node:path';
-import { statSync, existsSync, readFileSync } from 'node:fs';
+import { resolve, basename } from 'node:path';
+import { statSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
 import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
-import { VERSION, EXIT, SEVERITY, NPM_REGISTRY_URL } from '../core/constants.js';
+import { VERSION, EXIT, NPM_REGISTRY_URL } from '../core/constants.js';
 import { discover as discoverNpm, parseLockfile as parseNpmLock } from '../parsers/npm.js';
-import { queryBatch, filterBySeverity } from '../advisories/osv.js';
+import { queryBatch, isQueryComplete } from '../advisories/osv.js';
 import { fetchJSON } from '../core/fetcher.js';
-import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 
 /**
  * `vexes fix` — Generate verified, safe upgrade commands for vulnerabilities.
@@ -63,6 +62,8 @@ export async function runFix(flags, args) {
   const uniqueDeps = [...dedupMap.values()];
 
   const osvResult = await queryBatch(uniqueDeps);
+  const scanComplete = isQueryComplete(osvResult, uniqueDeps.length);
+  const warnings = [...osvResult.failures];
   spinner?.stop(`${uniqueDeps.length} packages scanned`);
 
   // 2. Collect vulnerabilities with fix data
@@ -76,17 +77,32 @@ export async function runFix(flags, args) {
   }
 
   if (vulnsByPackage.size === 0) {
-    if (!isJSON) out(`\n  ${C.green}\u2713 No vulnerabilities found — nothing to fix${C.reset}\n`);
-    return EXIT.OK;
+    if (isJSON) {
+      out(JSON.stringify({
+        version: VERSION,
+        command: 'fix',
+        timestamp: new Date().toISOString(),
+        complete: scanComplete,
+        fixes: [],
+        warnings,
+      }, null, 2));
+    } else if (scanComplete) {
+      out(`\n  ${C.green}\u2713 No vulnerabilities found — nothing to fix${C.reset}\n`);
+    } else {
+      out(`\n  ${C.red}! Fix scan incomplete — some packages could not be checked, so no verified recommendations can be made${C.reset}\n`);
+    }
+    return scanComplete ? EXIT.OK : EXIT.ERROR;
   }
 
   // 3. For each vulnerable package, determine the best safe version
   const fixSpinner = isJSON ? null : createSpinner('Verifying fix versions against OSV...');
   const fixes = [];
+  let hadIncompleteVerification = false;
 
   for (const [pkgName, vulns] of vulnsByPackage) {
     const currentVersion = vulns[0].version;
     const ecosystem = vulns[0].ecosystem;
+    let verificationIncomplete = false;
 
     // Collect ALL fix versions from ALL vulns for this package
     const fixCandidates = new Set();
@@ -117,6 +133,10 @@ export async function runFix(flags, args) {
     let bestFix = null;
     for (const candidate of sorted) {
       const verification = await verifyFixVersion(pkgName, candidate, ecosystem);
+      if (verification.incomplete) {
+        verificationIncomplete = true;
+        hadIncompleteVerification = true;
+      }
       if (verification.safe) {
         bestFix = {
           version: candidate,
@@ -135,6 +155,10 @@ export async function runFix(flags, args) {
       const latest = await getLatestVersion(pkgName, ecosystem);
       if (latest) {
         const latestVerification = await verifyFixVersion(pkgName, latest, ecosystem);
+        if (latestVerification.incomplete) {
+          verificationIncomplete = true;
+          hadIncompleteVerification = true;
+        }
         if (latestVerification.safe) {
           bestFix = { version: latest, verified: true, existsOnRegistry: true, ownVulns: [], isLatest: true };
         }
@@ -156,19 +180,26 @@ export async function runFix(flags, args) {
         command,
         isLatest: bestFix.isLatest || false,
       } : null,
-      reason: bestFix ? null : 'All known fix versions are themselves vulnerable — manual review required',
+      reason: bestFix ? null : verificationIncomplete
+        ? 'Could not verify fix version safety — OSV query incomplete'
+        : 'All known fix versions are themselves vulnerable — manual review required',
     });
   }
 
   fixSpinner?.stop(`${fixes.length} packages analyzed`);
+  if (hadIncompleteVerification) {
+    warnings.push('one or more candidate fix versions could not be fully verified');
+  }
+  const complete = scanComplete && !hadIncompleteVerification;
 
   // 4. Output
   if (isJSON) {
     out(JSON.stringify({
       version: VERSION, command: 'fix',
       timestamp: new Date().toISOString(),
+      complete,
       fixes,
-      warnings: osvResult.failures,
+      warnings,
     }, null, 2));
   } else {
     out(header('Fix Recommendations'));
@@ -206,12 +237,17 @@ export async function runFix(flags, args) {
     const line = '\u2500'.repeat(50);
     out(`  ${C.dim}${line}${C.reset}`);
     out(`  ${fixable.length} fixable \u00b7 ${unfixable.length} require manual review`);
-    if (osvResult.failures.length > 0) {
-      out(`  ${C.yellow}! ${osvResult.failures.length} scan failure(s) — some packages may not have been checked${C.reset}`);
+    if (warnings.length > 0) {
+      out(`  ${C.yellow}! ${warnings.length} warning(s) — results may be incomplete${C.reset}`);
     }
     out(`  ${C.dim}${line}${C.reset}\n`);
+
+    if (!complete) {
+      out(`  ${C.red}${C.bold}! FIX INCOMPLETE${C.reset} ${C.red}— some packages or candidate versions could not be verified.${C.reset}\n`);
+    }
   }
 
+  if (!complete) return EXIT.ERROR;
   return fixes.some(f => !f.recommendation) ? EXIT.VULNS_FOUND : EXIT.OK;
 }
 
@@ -219,19 +255,23 @@ export async function runFix(flags, args) {
  * Verify a fix version is safe by querying OSV for it.
  * The CRITICAL check: does the fix version itself have known vulnerabilities?
  */
-async function verifyFixVersion(pkgName, version, ecosystem) {
+export async function verifyFixVersion(pkgName, version, ecosystem) {
   try {
     const result = await queryBatch([{ name: pkgName, version, ecosystem }]);
+    if (!isQueryComplete(result, 1)) {
+      return { safe: false, exists: false, ownVulns: [], incomplete: true };
+    }
     const key = `${ecosystem}:${pkgName}@${version}`;
     const vulns = result.results.get(key) || [];
     return {
       safe: vulns.length === 0,
-      exists: true, // If OSV can query it, it exists
+      exists: true,
       ownVulns: vulns,
+      incomplete: false,
     };
   } catch {
     // If we can't verify, DON'T recommend — fail safe
-    return { safe: false, exists: false, ownVulns: [] };
+    return { safe: false, exists: false, ownVulns: [], incomplete: true };
   }
 }
 
@@ -252,14 +292,30 @@ async function getLatestVersion(pkgName, ecosystem) {
 }
 
 /**
+ * Shell-escape a string to prevent command injection when copy-pasted.
+ * Wraps in single quotes, escaping any existing single quotes.
+ * Only applies escaping when the string contains shell-unsafe characters.
+ */
+function shellEscape(s) {
+  // Safe: alphanumeric, @, /, ., -, _
+  if (/^[a-zA-Z0-9@/._-]+$/.test(s)) return s;
+  // Wrap in single quotes, escape existing single quotes
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/**
  * Generate the exact install command for a fix.
+ * Package names and versions are shell-escaped to prevent injection
+ * when the user copy-pastes the command.
  */
 function generateCommand(pkgName, version, ecosystem) {
+  const safeName = shellEscape(pkgName);
+  const safeVersion = shellEscape(version);
   switch (ecosystem) {
-    case 'npm':  return `npm install ${pkgName}@${version}`;
-    case 'pypi': return `pip install ${pkgName}==${version}`;
-    case 'cargo': return `cargo update -p ${pkgName} --precise ${version}`;
-    default: return `# upgrade ${pkgName} to ${version}`;
+    case 'npm':  return `npm install ${safeName}@${safeVersion}`;
+    case 'pypi': return `pip install ${safeName}==${safeVersion}`;
+    case 'cargo': return `cargo update -p ${safeName} --precise ${safeVersion}`;
+    default: return `# upgrade ${safeName} to ${safeVersion}`;
   }
 }
 

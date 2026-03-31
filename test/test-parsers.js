@@ -5,6 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { parseLockfile as parseNpmLock, parseManifest as parseNpmManifest } from '../src/parsers/npm.js';
 import { parseRequirements, parsePoetryLock, parsePyprojectToml } from '../src/parsers/pypi.js';
 import { parseLockfile as parseCargoLock } from '../src/parsers/cargo.js';
+import { parseManifest as parseGoMod } from '../src/parsers/go.js';
+import { parseManifest as parseGemfile } from '../src/parsers/ruby.js';
+import { parseManifest as parseComposerJson } from '../src/parsers/php.js';
+import { parseManifest as parseCsproj } from '../src/parsers/dotnet.js';
+import { parseManifest as parsePom } from '../src/parsers/java.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixtures = join(__dirname, 'fixtures');
@@ -142,6 +147,85 @@ describe('Cargo.lock parser', () => {
     for (const dep of deps) {
       assert.equal(dep.isPinned, true);
     }
+  });
+});
+
+describe('go.mod parser', () => {
+  const deps = parseGoMod(join(fixtures, 'go.mod'));
+
+  it('parses require blocks and single-line require directives', () => {
+    assert.equal(deps.length, 3);
+    assert.ok(deps.find(d => d.name === 'github.com/gin-gonic/gin' && d.version === 'v1.10.0'));
+    assert.ok(deps.find(d => d.name === 'github.com/google/uuid' && d.version === 'v1.6.0'));
+  });
+
+  it('marks // indirect dependencies as non-direct', () => {
+    const dep = deps.find(d => d.name === 'golang.org/x/text');
+    assert.ok(dep);
+    assert.equal(dep.isDirect, false);
+  });
+});
+
+describe('Gemfile parser', () => {
+  const deps = parseGemfile(join(fixtures, 'Gemfile'));
+
+  it('extracts best-effort versions from gem declarations', () => {
+    const rails = deps.find(d => d.name === 'rails');
+    const puma = deps.find(d => d.name === 'puma');
+    assert.ok(rails);
+    assert.ok(puma);
+    assert.equal(rails.version, '7.1.3');
+    assert.equal(puma.version, '6.4.2');
+  });
+
+  it('marks exact version specs as pinned', () => {
+    const rails = deps.find(d => d.name === 'rails');
+    const puma = deps.find(d => d.name === 'puma');
+    assert.equal(rails.isPinned, false);
+    assert.equal(puma.isPinned, true);
+  });
+});
+
+describe('composer.json parser', () => {
+  const deps = parseComposerJson(join(fixtures, 'composer.json'));
+
+  it('parses require and require-dev sections', () => {
+    assert.ok(deps.find(d => d.name === 'laravel/framework' && d.version === '11.2.0'));
+    assert.ok(deps.find(d => d.name === 'guzzlehttp/guzzle' && d.version === '7.8.1'));
+    assert.ok(deps.find(d => d.name === 'phpunit/phpunit' && d.version === '10.5.0'));
+  });
+
+  it('skips platform packages that do not map to Packagist', () => {
+    assert.ok(!deps.find(d => d.name === 'php'));
+    assert.ok(!deps.find(d => d.name === 'ext-json'));
+  });
+});
+
+describe('.csproj parser', () => {
+  const deps = parseCsproj(join(fixtures, 'Example.csproj'));
+
+  it('parses self-closing and nested PackageReference forms', () => {
+    assert.ok(deps.find(d => d.name === 'Newtonsoft.Json' && d.version === '13.0.3'));
+    assert.ok(deps.find(d => d.name === 'Serilog' && d.version === '3.1.1'));
+  });
+
+  it('sets ecosystem to nuget', () => {
+    for (const dep of deps) {
+      assert.equal(dep.ecosystem, 'nuget');
+    }
+  });
+});
+
+describe('pom.xml parser', () => {
+  const deps = parsePom(join(fixtures, 'pom.xml'));
+
+  it('parses explicit Maven dependency versions', () => {
+    assert.ok(deps.find(d => d.name === 'org.springframework:spring-core' && d.version === '6.1.5'));
+    assert.ok(deps.find(d => d.name === 'org.junit.jupiter:junit-jupiter' && d.version === '5.10.2'));
+  });
+
+  it('skips property-reference versions that are not concrete', () => {
+    assert.ok(!deps.find(d => d.name === 'com.example:internal-shared'));
   });
 });
 

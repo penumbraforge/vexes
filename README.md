@@ -36,8 +36,8 @@ vexes is a dependency security scanner that goes beyond vulnerability databases.
 
 | Layer | Detection Method | What it catches |
 |-------|-----------------|----------------|
-| **1. AST Analysis** | Parses JS/Python source via acorn AST | `eval()`, `child_process.exec()`, credential harvesting, obfuscated code, dynamic imports |
-| **2. Dependency Graph** | Profiles newly added dependencies | Phantom dependencies (brand-new packages), circular staging, typosquatting |
+| **1. AST Analysis** | Parses JS/Python source via acorn AST | `eval()`, `child_process.exec()`, credential harvesting, obfuscated code, dynamic imports, `WebAssembly`, `setTimeout(string)`, DNS exfiltration, prototype chain escapes |
+| **2. Dependency Graph** | Profiles newly added dependencies | Phantom dependencies (brand-new packages), circular staging, typosquatting, Unicode homoglyph attacks |
 | **3. Behavioral Fingerprinting** | Diffs capability profiles between versions | A utility library that suddenly gains network+exec capabilities |
 | **4. Registry Metadata** | Analyzes publish history, maintainers, timing | Account takeovers, rapid publishes, dormant package reactivation |
 
@@ -85,7 +85,7 @@ vexes scan --json                   # Machine-readable JSON output
 vexes scan --cached                 # Use cached results (skip freshness check)
 ```
 
-**Ecosystems supported:** npm (package-lock.json), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Homebrew (Brewfile.lock.json, Brewfile)
+**Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.sum), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml), Homebrew (Brewfile.lock.json, Brewfile)
 
 **Exit codes:** `0` = clean, `1` = vulnerabilities found, `2` = error/incomplete scan
 
@@ -114,6 +114,7 @@ vexes analyze --json                # Machine-readable JSON output
 - `CAPABILITY_ESCALATION` -- Package gained dangerous capabilities between versions
 - `AST_DANGEROUS_PATTERN` -- Dangerous code patterns in install scripts
 - `TARBALL_DANGEROUS_PATTERN` -- Dangerous patterns in actual package source code
+- `HOMOGLYPH` -- Package name contains suspicious Unicode (zero-width chars, RTL override, non-ASCII)
 - `MISSING_PROVENANCE` -- No Sigstore provenance attestation
 - `NO_REPOSITORY` -- No source repository link
 
@@ -234,8 +235,15 @@ src/
     allowlists.js     Known-good packages, popular package sets
   parsers/
     npm.js            package-lock.json v1/v2/v3, package.json fallback
-    pypi.js           requirements.txt, poetry.lock, Pipfile.lock, pyproject.toml
+    pnpm.js           pnpm-lock.yaml v6/v9
+    yarn.js           yarn.lock v1 (classic) and v2+ (Berry)
+    pypi.js           requirements.txt (-r recursive), poetry.lock, Pipfile.lock, pyproject.toml
     cargo.js          Cargo.lock
+    go.js             go.sum
+    ruby.js           Gemfile.lock
+    php.js            composer.lock
+    dotnet.js         packages.lock.json (NuGet)
+    java.js           gradle.lockfile, pom.xml
     brew.js           Brewfile.lock.json, Brewfile
   advisories/
     osv.js            OSV.dev batch queries, CVSS v3.1 scoring, severity mapping
@@ -266,21 +274,29 @@ test/
 
 ## Security design principles
 
-1. **Fail loud, not clean.** A security scanner that silently reports clean on failure is worse than useless. If queries fail, vexes exits with code 2 and prints `SCAN INCOMPLETE`.
+1. **Fail loud, not clean.** A security scanner that silently reports clean on failure is worse than useless. If queries fail, vexes exits with code 2 and prints `SCAN INCOMPLETE`. Invalid ecosystems are rejected outright instead of silently scanning nothing.
 
 2. **Zero dependencies.** The dependency chain is the attack surface. vexes has none. Acorn is vendored. SQLite is Node.js built-in.
 
-3. **Terminal injection protection.** All external data (package names, vulnerability summaries) is sanitized before terminal output. ANSI escape sequences from malicious package metadata cannot execute terminal commands.
+3. **Terminal injection protection.** All external data is sanitized with a comprehensive filter covering CSI sequences (with intermediate bytes), OSC (BEL and ST terminators), DCS/APC/PM/SOS sequences, C1 control codes (0x80-0x9F), and bare ESC bytes.
 
 4. **Prototype pollution protection.** Config file merging rejects `__proto__`, `constructor`, and `prototype` keys.
 
-5. **Command injection prevention.** The guard command uses `execFileSync` (no shell) with an allowlist of known package managers. User input never touches a shell.
+5. **Command injection prevention.** The guard command uses `execFileSync` (no shell) with an allowlist of known package managers. Fix commands are shell-escaped before display. Guard setup resolves the vexes binary path at install time rather than using `npx` at runtime.
 
-6. **Gzip bomb protection.** Tarball inspection enforces both compressed and decompressed size limits to prevent memory exhaustion.
+6. **Gzip bomb + SSRF protection.** Tarball downloads enforce streaming size limits, HTTPS-only URLs, and a registry host allowlist to prevent memory exhaustion and SSRF attacks.
 
-7. **Cache corruption recovery.** Corrupted SQLite entries are detected, deleted, and treated as cache misses. The scanner degrades to a NoOpCache if the database is unreadable.
+7. **Cache integrity.** Corrupted entries are auto-deleted. Degraded results are never cached. TTL is clamped to prevent config-based stale data attacks (max 7 days advisory, 30 days metadata).
 
 8. **Never recommend vulnerable fixes.** The `fix` command cross-checks every recommended version against OSV before presenting it.
+
+9. **Critical signals are undisableable.** `KNOWN_COMPROMISED`, `PHANTOM_DEPENDENCY`, `CIRCULAR_STAGING`, and `CAPABILITY_ESCALATION` cannot be turned off via config -- they detect active attacks.
+
+10. **Allowlisted packages are still inspected.** Known-good packages (esbuild, sharp, etc.) have their signals downweighted, not suppressed. AST analysis runs on all packages regardless of allowlist status.
+
+11. **Unicode homoglyph detection.** Package names are checked for invisible characters (zero-width spaces, BIDI overrides) and non-ASCII homoglyphs that could disguise malicious packages.
+
+12. **Integrity-aware lockfile diffing.** Guard detects when a package tarball changes without a version bump by comparing integrity hashes.
 
 ## License
 

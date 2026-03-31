@@ -8,6 +8,16 @@ const ECOSYSTEM_MAP = {
   'PyPI':      'PyPI',
   'cargo':     'crates.io',
   'crates.io': 'crates.io',
+  'go':        'Go',
+  'Go':        'Go',
+  'ruby':      'RubyGems',
+  'RubyGems':  'RubyGems',
+  'php':       'Packagist',
+  'Packagist': 'Packagist',
+  'nuget':     'NuGet',
+  'NuGet':     'NuGet',
+  'java':      'Maven',
+  'Maven':     'Maven',
 };
 
 const KNOWN_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEM_MAP));
@@ -25,17 +35,18 @@ const SEVERITY_NORMALIZE = {
  * A security scanner must never silently report clean when queries failed.
  *
  * @param {Array<{ name: string, version: string, ecosystem: string }>} packages
- * @returns {Promise<{ results: Map, failures: string[], droppedVulns: string[], queriedCount: number, failedCount: number }>}
+ * @returns {Promise<{ results: Map, failures: string[], droppedVulns: string[], queriedCount: number, failedCount: number, checked: Set<string> }>}
  */
 export async function queryBatch(packages) {
   const results = new Map();
   const failures = [];
   const droppedVulns = [];
+  const checked = new Set();
   let queriedCount = 0;
   let failedCount = 0;
 
   if (packages.length === 0) {
-    return { results, failures, droppedVulns, queriedCount: 0, failedCount: 0 };
+    return { results, failures, droppedVulns, queriedCount: 0, failedCount: 0, checked };
   }
 
   const batches = [];
@@ -76,7 +87,9 @@ export async function queryBatch(packages) {
 
       // Validate response length matches query length
       if (response.results.length !== batch.length) {
-        log.warn(`OSV returned ${response.results.length} results for ${batch.length} queries — partial response`);
+        const msg = `OSV returned ${response.results.length} results for ${batch.length} queries — partial response`;
+        log.warn(msg);
+        failures.push(msg);
         failedCount += Math.max(0, batch.length - response.results.length);
       }
 
@@ -86,8 +99,11 @@ export async function queryBatch(packages) {
 
       const resultCount = Math.min(response.results.length, batch.length);
       for (let i = 0; i < resultCount; i++) {
+        const pkg = batch[i];
+        const key = `${pkg.ecosystem}:${pkg.name}@${pkg.version}`;
         const osvResult = response.results[i];
         queriedCount++;
+        checked.add(key);
         if (osvResult?.vulns?.length > 0) {
           const ids = osvResult.vulns.map(v => v.id).filter(id => typeof id === 'string' && id.length > 0);
           if (ids.length > 0) {
@@ -147,7 +163,19 @@ export async function queryBatch(packages) {
     }
   }
 
-  return { results, failures, droppedVulns, queriedCount, failedCount };
+  return { results, failures, droppedVulns, queriedCount, failedCount, checked };
+}
+
+/**
+ * Determine whether an OSV query result fully covered the expected packages.
+ * A complete query must have no recorded failures and must account for every package.
+ */
+export function isQueryComplete(result, expectedCount = null) {
+  if (!result) return false;
+  const expected = expectedCount ?? result.checked?.size ?? result.queriedCount;
+  return result.failures.length === 0 &&
+    result.failedCount === 0 &&
+    result.queriedCount >= expected;
 }
 
 /**

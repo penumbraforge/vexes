@@ -16,6 +16,16 @@ const DANGEROUS_CALLEES = new Set([
   'eval', 'Function',
 ]);
 
+// Timer functions that act as eval when passed a string argument
+const TIMER_EVAL_METHODS = new Set([
+  'setTimeout', 'setInterval', 'setImmediate',
+]);
+
+// Globals that can be used with computed property access to reach dangerous functions
+const DANGEROUS_GLOBALS = new Set([
+  'globalThis', 'global', 'window', 'self', 'GLOBAL', 'root',
+]);
+
 const SPAWN_METHODS = new Set([
   'exec', 'execSync', 'spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork',
 ]);
@@ -26,11 +36,12 @@ const VM_METHODS = new Set([
 ]);
 
 const NETWORK_MODULES = new Set([
-  'http', 'https', 'net', 'dgram', 'tls', 'http2',
+  'http', 'https', 'net', 'dgram', 'tls', 'http2', 'dns', 'node:dns',
 ]);
 
 const NETWORK_METHODS = new Set([
   'request', 'get', 'connect', 'createConnection', 'createServer',
+  'resolve', 'resolve4', 'resolve6', 'resolveTxt', 'lookup', // dns exfiltration
 ]);
 
 const FS_WRITE_METHODS = new Set([
@@ -50,6 +61,18 @@ const SENSITIVE_ENV_KEYS = new Set([
 ]);
 
 const SYSTEM_PATHS = ['/usr/', '/etc/', '/bin/', '/sbin/', '/var/', '/tmp/', '/root/'];
+
+// Sensitive files that should never be read by an install script
+const SENSITIVE_READ_PATHS = [
+  '/etc/passwd', '/etc/shadow', '/etc/hosts',
+  '.ssh/', '.aws/', '.gnupg/', '.npmrc', '.netrc',
+  '.env', '.git/config',
+];
+
+// Methods for reading files (detect credential theft)
+const FS_READ_METHODS = new Set([
+  'readFile', 'readFileSync', 'createReadStream',
+]);
 
 /**
  * Inspect JavaScript source code for dangerous patterns.
@@ -192,6 +215,14 @@ function trackBindings(node, ctx) {
         const localName = prop.value?.name || prop.key?.name;
         if (localName) {
           ctx.requireBindings.set(localName, modName);
+        }
+      }
+    } else if (node.id?.type === 'ArrayPattern') {
+      // const [,exec] = [null, require('child_process').exec]
+      // Track all identifier elements as potential module bindings
+      for (const elem of node.id.elements) {
+        if (elem?.type === 'Identifier') {
+          ctx.requireBindings.set(elem.name, modName);
         }
       }
     }
@@ -398,6 +429,54 @@ function analyzeCall(node, findings, ctx) {
       return;
     }
 
+    // process.mainModule.require — escape hatch to bypass require hook restrictions
+    if (methodName === 'require' && callee.object?.type === 'MemberExpression') {
+      const grandparent = callee.object;
+      if (grandparent.object?.name === 'process' && grandparent.property?.name === 'mainModule') {
+        findings.push({
+          pattern: 'PROCESS_SPAWN',
+          severity: 'CRITICAL',
+          description: 'process.mainModule.require() — escape hatch bypasses require restrictions',
+          line: node.start,
+        });
+        return;
+      }
+    }
+
+    // module.constructor._load — internal Node.js module loader escape hatch
+    if (methodName === '_load' && callee.object?.type === 'MemberExpression') {
+      const grandparent = callee.object;
+      if (grandparent.property?.name === 'constructor') {
+        findings.push({
+          pattern: 'CODE_EXECUTION',
+          severity: 'CRITICAL',
+          description: 'module.constructor._load() — internal module loader escape hatch',
+          line: node.start,
+        });
+        return;
+      }
+    }
+
+    // fs.readFile/readFileSync reading sensitive paths (credential theft)
+    if (FS_READ_METHODS.has(methodName)) {
+      const mod = ctx.requireBindings.get(objName) || ctx.importBindings.get(objName);
+      if (mod === 'fs' || mod === 'node:fs' || mod === 'fs/promises' || mod === 'node:fs/promises') {
+        const firstArg = node.arguments?.[0];
+        if (firstArg?.type === 'Literal' && typeof firstArg.value === 'string') {
+          const target = firstArg.value;
+          if (SENSITIVE_READ_PATHS.some(sp => target.includes(sp))) {
+            findings.push({
+              pattern: 'ENV_HARVESTING',
+              severity: 'CRITICAL',
+              description: `${objName}.${methodName}('${target}') — reads sensitive file`,
+              line: node.start,
+            });
+            return;
+          }
+        }
+      }
+    }
+
     // Buffer.from(..., 'base64') — payload decode pattern
     if (objName === 'Buffer' && methodName === 'from' && node.arguments?.length >= 2) {
       const encoding = node.arguments[1];
@@ -431,6 +510,34 @@ function analyzeCall(node, findings, ctx) {
       // This is handled in analyzeMember
       return;
     }
+
+    // WebAssembly.instantiate / WebAssembly.compile — binary code execution
+    if (objName === 'WebAssembly' &&
+        (methodName === 'instantiate' || methodName === 'compile' ||
+         methodName === 'instantiateStreaming' || methodName === 'compileStreaming')) {
+      findings.push({
+        pattern: 'CODE_EXECUTION',
+        severity: 'CRITICAL',
+        description: `WebAssembly.${methodName}() — executes binary WebAssembly code`,
+        line: node.start,
+      });
+      return;
+    }
+
+    // Prototype chain escape: Object.getPrototypeOf(x).constructor(code)
+    // This gets a reference to Function constructor without using the name "Function"
+    if (methodName === 'constructor' && node.arguments?.length > 0) {
+      const firstArg = node.arguments[0];
+      if (firstArg?.type === 'Literal' && typeof firstArg.value === 'string') {
+        findings.push({
+          pattern: 'CODE_EXECUTION',
+          severity: 'CRITICAL',
+          description: '.constructor() with string argument — prototype chain escape to create functions',
+          line: node.start,
+        });
+        return;
+      }
+    }
   }
 
   // Top-level fetch() call
@@ -441,6 +548,57 @@ function analyzeCall(node, findings, ctx) {
       description: 'fetch() — makes network request',
       line: node.start,
     });
+  }
+
+  // Indirect eval: (0, eval)('code') — comma operator makes callee a SequenceExpression
+  if (callee.type === 'SequenceExpression' && callee.expressions?.length > 0) {
+    const last = callee.expressions[callee.expressions.length - 1];
+    if (last.type === 'Identifier' && DANGEROUS_CALLEES.has(last.name)) {
+      findings.push({
+        pattern: 'CODE_EXECUTION',
+        severity: 'CRITICAL',
+        description: `Indirect ${last.name}() via comma operator — evasion of direct call detection`,
+        line: node.start,
+      });
+    }
+  }
+
+  // setTimeout/setInterval with string argument = eval equivalent
+  if (callee.type === 'Identifier' && TIMER_EVAL_METHODS.has(callee.name)) {
+    const firstArg = node.arguments?.[0];
+    if (firstArg && (firstArg.type === 'Literal' && typeof firstArg.value === 'string') ||
+        (firstArg?.type === 'TemplateLiteral')) {
+      findings.push({
+        pattern: 'CODE_EXECUTION',
+        severity: 'CRITICAL',
+        description: `${callee.name}() with string argument — executes code like eval()`,
+        line: node.start,
+      });
+    }
+  }
+
+  // Computed property access on dangerous globals: globalThis['eval']('code')
+  if (callee.type === 'MemberExpression' && callee.computed) {
+    const objName = callee.object?.name;
+    if (objName && DANGEROUS_GLOBALS.has(objName)) {
+      const propValue = callee.property?.value; // Literal property value
+      if (propValue && (DANGEROUS_CALLEES.has(propValue) || propValue === 'require')) {
+        findings.push({
+          pattern: 'CODE_EXECUTION',
+          severity: 'CRITICAL',
+          description: `${objName}['${propValue}']() — computed property access to dangerous function`,
+          line: node.start,
+        });
+      } else {
+        // Any computed access to globals is suspicious
+        findings.push({
+          pattern: 'POSSIBLE_OBFUSCATION',
+          severity: 'HIGH',
+          description: `Computed property access on ${objName} — possible evasion of static analysis`,
+          line: node.start,
+        });
+      }
+    }
   }
 }
 
@@ -459,16 +617,39 @@ function analyzeNew(node, findings, ctx) {
       line: node.start,
     });
   }
+
+  // new Worker(...) — can execute arbitrary code in a separate thread
+  if (callee.type === 'Identifier' && callee.name === 'Worker') {
+    findings.push({
+      pattern: 'CODE_EXECUTION',
+      severity: 'HIGH',
+      description: 'new Worker() — spawns code execution in separate thread',
+      line: node.start,
+    });
+  }
+
+  // new WebAssembly.Module / new WebAssembly.Instance — binary code execution
+  if (callee.type === 'MemberExpression' &&
+      callee.object?.name === 'WebAssembly' &&
+      (callee.property?.name === 'Module' || callee.property?.name === 'Instance')) {
+    findings.push({
+      pattern: 'CODE_EXECUTION',
+      severity: 'CRITICAL',
+      description: `new WebAssembly.${callee.property.name}() — executes binary WebAssembly code`,
+      line: node.start,
+    });
+  }
 }
 
 /**
  * Analyze member expressions for env harvesting.
  */
 function analyzeMember(node, findings, ctx) {
-  // process.env.SENSITIVE_KEY
+  // process.env.SENSITIVE_KEY  (dot notation)
+  // process['env'].SENSITIVE_KEY  (computed notation — evasion technique)
   if (node.object?.type === 'MemberExpression' &&
       node.object.object?.name === 'process' &&
-      node.object.property?.name === 'env') {
+      (node.object.property?.name === 'env' || node.object.property?.value === 'env')) {
     const key = node.property?.name || node.property?.value;
     if (key && SENSITIVE_ENV_KEYS.has(key)) {
       findings.push({

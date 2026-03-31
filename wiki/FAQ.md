@@ -13,7 +13,7 @@ vexes uses `node:sqlite` (DatabaseSync) for caching, which was stabilized in Nod
 ### Is this different from `npm audit`?
 
 Yes. `npm audit` only checks npm packages against the GitHub Advisory Database. vexes:
-- Scans **multiple ecosystems** (npm, PyPI, Cargo, Homebrew)
+- Scans **9 ecosystems** (npm, pnpm, Yarn, PyPI, Cargo, Go, Ruby, PHP, NuGet, Java, Homebrew)
 - Uses **OSV.dev** which aggregates from multiple advisory sources
 - Performs **behavioral analysis** (maintainer changes, capability escalation, typosquatting)
 - Can **inspect actual source code** via tarball analysis
@@ -28,7 +28,7 @@ Yes. `npm audit` only checks npm packages against the GitHub Advisory Database. 
 | Behavioral analysis | Yes | Yes | No | No |
 | AST code inspection | Yes | Yes | No | No |
 | Lockfile diffing | Yes | No | No | No |
-| Cross-ecosystem | Yes | JS/Python | Many | Many |
+| Cross-ecosystem | Yes (9) | JS/Python | Many | Many |
 | Cost | Free | Paid | Paid | Free |
 | SARIF output | Yes | Yes | Yes | N/A |
 
@@ -107,3 +107,11 @@ First scan fetches all data from APIs. Subsequent scans use the cache (1-hour TT
 - Use `--ecosystem npm` to scan only one ecosystem
 - Use `--cached` to skip freshness checks
 - Use `--severity critical` to reduce output processing
+
+### Why can't I disable KNOWN_COMPROMISED?
+
+Four critical signals are undisableable by design: `KNOWN_COMPROMISED`, `PHANTOM_DEPENDENCY`, `CIRCULAR_STAGING`, and `CAPABILITY_ESCALATION`. These detect active supply chain attacks. Allowing them to be disabled via `.vexesrc.json` would let a malicious repo config suppress all detection. If you need to ignore a specific known vulnerability, use the `ignore` field in config instead.
+
+### Does vexes support pnpm and Yarn?
+
+Yes. vexes automatically discovers and parses `pnpm-lock.yaml` (v6 and v9) and `yarn.lock` (v1 classic and v2+ Berry format) alongside `package-lock.json`. All three are treated as npm-ecosystem lockfiles and queried against the same OSV database.

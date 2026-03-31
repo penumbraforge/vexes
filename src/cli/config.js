@@ -10,7 +10,7 @@ const VALID_SEVERITIES = new Set(['critical', 'high', 'moderate', 'low']);
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 const DEFAULTS = Object.freeze({
-  ecosystems: ['npm', 'pypi', 'cargo'],
+  ecosystems: ['npm', 'pypi', 'cargo', 'go', 'ruby', 'php', 'nuget', 'java'],
   severity: 'moderate',
   ignore: [],
   analyze: {
@@ -100,7 +100,9 @@ export function loadConfig(dir, flags = {}) {
       const msg = suggestion
         ? `unknown ecosystem "${flags.ecosystem}" — did you mean "${suggestion}"?`
         : `unknown ecosystem "${flags.ecosystem}" — valid options: ${[...VALID_ECOSYSTEMS].join(', ')}`;
-      log.warn(msg);
+      // Reject invalid ecosystems instead of silently scanning nothing.
+      // Using an invalid ecosystem would skip all scanning and report "clean".
+      throw new Error(msg);
     }
     config.ecosystems = [eco];
   }
@@ -125,6 +127,32 @@ export function loadConfig(dir, flags = {}) {
   // Expand ~ in cache dir
   if (typeof config.cache?.dir === 'string' && config.cache.dir.startsWith('~')) {
     config.cache.dir = config.cache.dir.replace('~', homedir());
+  }
+
+  // Enforce cache TTL bounds — prevent config from setting absurd TTLs
+  // that would cause stale (potentially false-clean) results to persist indefinitely.
+  // Max 7 days for advisories, max 30 days for metadata.
+  const MAX_ADVISORY_TTL = 7 * 24 * 60 * 60 * 1000;   // 7 days
+  const MAX_METADATA_TTL = 30 * 24 * 60 * 60 * 1000;   // 30 days
+  if (config.cache?.advisoryTtlMs > MAX_ADVISORY_TTL) {
+    log.warn(`advisory cache TTL clamped to 7 days (was ${Math.round(config.cache.advisoryTtlMs / 86400000)}d)`);
+    config = { ...config, cache: { ...config.cache, advisoryTtlMs: MAX_ADVISORY_TTL } };
+  }
+  if (config.cache?.metadataTtlMs > MAX_METADATA_TTL) {
+    log.warn(`metadata cache TTL clamped to 30 days (was ${Math.round(config.cache.metadataTtlMs / 86400000)}d)`);
+    config = { ...config, cache: { ...config.cache, metadataTtlMs: MAX_METADATA_TTL } };
+  }
+
+  // Validate all ecosystem names (catches invalid values from config files too)
+  if (Array.isArray(config.ecosystems)) {
+    const invalid = config.ecosystems.filter(e => !VALID_ECOSYSTEMS.has(e));
+    if (invalid.length > 0) {
+      log.warn(`ignoring unknown ecosystem(s) from config: ${invalid.join(', ')}`);
+      config = { ...config, ecosystems: config.ecosystems.filter(e => VALID_ECOSYSTEMS.has(e)) };
+      if (config.ecosystems.length === 0) {
+        throw new Error(`no valid ecosystems configured — valid options: ${[...VALID_ECOSYSTEMS].join(', ')}`);
+      }
+    }
   }
 
   return Object.freeze(config);

@@ -1,7 +1,7 @@
 import { SEVERITY } from '../core/constants.js';
 import { KNOWN_POSTINSTALL, POPULAR_NPM, POPULAR_PYPI } from '../core/allowlists.js';
 import { inspectJS, inspectPython } from './ast-inspector.js';
-import { analyzeNewDeps, detectTyposquat } from './dep-graph.js';
+import { analyzeNewDeps, detectTyposquat, detectHomoglyphs } from './dep-graph.js';
 import { buildProfile, diffProfiles } from './behavioral.js';
 import { log } from '../core/logger.js';
 
@@ -39,9 +39,16 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
     return { signals: [], riskScore: 0, riskLevel: 'UNKNOWN', warnings: ['metadata unavailable'] };
   }
 
-  // Check if signal is disabled in config
+  // Check if signal is disabled in config.
+  // Critical safety signals can NEVER be disabled — they detect active compromises.
+  const UNDISABLEABLE_SIGNALS = new Set([
+    'KNOWN_COMPROMISED',
+    'PHANTOM_DEPENDENCY',
+    'CIRCULAR_STAGING',
+    'CAPABILITY_ESCALATION',
+  ]);
   const signalConfig = config?.analyze?.signals || {};
-  const isEnabled = (signal) => signalConfig[signal] !== 'off';
+  const isEnabled = (signal) => UNDISABLEABLE_SIGNALS.has(signal) || signalConfig[signal] !== 'off';
 
   // ─── Layer 4: Registry metadata signals (fast, no async) ───────────
 
@@ -165,6 +172,20 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
     });
   }
 
+  // HOMOGLYPH: suspicious Unicode in package name
+  const homoglyphs = detectHomoglyphs(metadata.name);
+  if (homoglyphs.length > 0) {
+    for (const h of homoglyphs) {
+      signals.push({
+        signal: 'HOMOGLYPH',
+        severity: 'CRITICAL',
+        description: h.description,
+        evidence: { type: h.type, name: metadata.name },
+        layer: 4,
+      });
+    }
+  }
+
   // TYPOSQUAT
   if (isEnabled('TYPOSQUAT')) {
     const popularSet = ecosystem === 'pypi' ? POPULAR_PYPI : POPULAR_NPM;
@@ -184,28 +205,28 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
 
   if (isEnabled('AST_DANGEROUS_PATTERN') && metadata.installScripts) {
     const isKnownGood = KNOWN_POSTINSTALL.has(metadata.name);
-    if (!isKnownGood) {
-      try {
-        for (const [scriptName, scriptBody] of Object.entries(metadata.installScripts)) {
-          if (!scriptBody) continue;
-          const jsSource = extractInlineJS(scriptBody);
-          if (jsSource) {
-            const result = inspectJS(jsSource, `${metadata.name}/${scriptName}`);
-            for (const finding of result.findings) {
-              signals.push({
-                signal: 'AST_DANGEROUS_PATTERN',
-                severity: finding.severity,
-                description: `[${scriptName}] ${finding.description}`,
-                evidence: { script: scriptName, pattern: finding.pattern },
-                layer: 1,
-              });
-            }
+    // Always run AST analysis, even for known-good packages — a compromised version
+    // of esbuild/sharp must still be caught. Findings are downweighted, not suppressed.
+    try {
+      for (const [scriptName, scriptBody] of Object.entries(metadata.installScripts)) {
+        if (!scriptBody) continue;
+        const jsSource = extractInlineJS(scriptBody);
+        if (jsSource) {
+          const result = inspectJS(jsSource, `${metadata.name}/${scriptName}`);
+          for (const finding of result.findings) {
+            signals.push({
+              signal: 'AST_DANGEROUS_PATTERN',
+              severity: finding.severity,
+              description: `[${scriptName}] ${finding.description}`,
+              evidence: { script: scriptName, pattern: finding.pattern, knownGood: isKnownGood },
+              layer: 1,
+            });
           }
         }
-      } catch (err) {
-        log.warn(`AST analysis failed for ${metadata.name}: ${err.message}`);
-        warnings.push(`AST analysis failed: ${err.message}`);
       }
+    } catch (err) {
+      log.warn(`AST analysis failed for ${metadata.name}: ${err.message}`);
+      warnings.push(`AST analysis failed: ${err.message}`);
     }
   }
 
@@ -314,19 +335,30 @@ function buildPreviousProfile(metadata) {
 /**
  * Check if a script string is or contains inspectable JavaScript.
  * Returns the JS source to inspect, or null if not JS.
+ *
+ * Handles shell wrappers that real malware uses:
+ *   sh -c 'node -e "..."'
+ *   bash -c "node -e '...'"
+ *   true; node -e '...'
+ *   echo | node -e '...'
  */
 function extractInlineJS(script) {
-  // node -e 'require("child_process").exec(...)' — THE most common attack vector
-  // Extract the quoted JS payload from node -e or node --eval
-  const nodeEvalMatch = script.match(/^node\s+(?:-e|--eval)\s+['"](.+)['"]\s*$/);
-  if (nodeEvalMatch) return nodeEvalMatch[1];
+  // First, try to extract node -e payload from ANYWHERE in the script
+  // (handles sh -c 'node -e ...', semicolons, pipes, etc.)
+  const nodeEvalAnywhere = script.match(/node\s+(?:-e|--eval)\s+'([^']+)'/);
+  if (nodeEvalAnywhere) return nodeEvalAnywhere[1];
 
-  // Double-quoted variant with escapes
-  const nodeEvalMatch2 = script.match(/^node\s+(?:-e|--eval)\s+"(.+)"\s*$/);
-  if (nodeEvalMatch2) return nodeEvalMatch2[1];
+  const nodeEvalDQ = script.match(/node\s+(?:-e|--eval)\s+"([^"]+)"/);
+  if (nodeEvalDQ) return nodeEvalDQ[1];
 
-  // Shell commands that launch node with scripts — can't inspect without the file
-  if (/^(node|sh|bash|python|ruby|perl|\.\/|\/)\s/.test(script)) return null;
+  // sh -c or bash -c with embedded commands — extract the inner command and recurse
+  const shellCMatch = script.match(/(?:sh|bash)\s+-c\s+['"](.+)['"]\s*$/);
+  if (shellCMatch) return extractInlineJS(shellCMatch[1]);
+
+  // Commands that just reference files — can't inspect without the file
+  // But only skip if there's NO embedded JS we could extract
+  if (/^(node|\.\/|\/)\s+[^\s;|&]*\.(js|mjs|cjs)\b/.test(script)) return null;
+  if (/^(python|ruby|perl)\s/.test(script)) return null;
   if (/^(npm|npx|yarn|pnpm)\s/.test(script)) return null;
 
   // Looks like JS if it has JS-specific syntax

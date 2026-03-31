@@ -1,14 +1,17 @@
 import { resolve, basename } from 'node:path';
 import { statSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
-import { C, createSpinner, header, formatVuln, summary, out } from '../cli/output.js';
+import { C, createSpinner, header, formatVuln, summary, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, SEVERITY, ECOSYSTEMS } from '../core/constants.js';
 import { discover as discoverNpm, parseLockfile as parseNpmLock, parseManifest as parseNpmManifest } from '../parsers/npm.js';
+import { discover as discoverPnpm, parseLockfile as parsePnpmLock } from '../parsers/pnpm.js';
+import { discover as discoverYarn, parseLockfile as parseYarnLock } from '../parsers/yarn.js';
 import { discover as discoverPypi, parseFile as parsePypiFile } from '../parsers/pypi.js';
 import { discover as discoverCargo, parseLockfile as parseCargoLock } from '../parsers/cargo.js';
 import { discover as discoverBrew, parseLockfile as parseBrewLock, parseManifest as parseBrewManifest } from '../parsers/brew.js';
-import { queryBatch, filterBySeverity } from '../advisories/osv.js';
+import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from '../parsers/generic.js';
+import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 
 /**
@@ -41,10 +44,10 @@ export async function runScan(flags, args) {
   // Track warnings for the final report
   const warnings = [];
 
-  // 1. Discover lockfiles
+  // 1. Discover dependency files
   const allDeps = [];
   const ecosystemsFound = new Set();
-  let lockfileCount = 0;
+  let dependencyFileCount = 0;
   let parseFailures = 0;
 
   for (const ecoName of config.ecosystems) {
@@ -56,7 +59,37 @@ export async function runScan(flags, args) {
           const deps = parseNpmLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
-          lockfileCount++;
+          dependencyFileCount++;
+        } catch (err) {
+          const msg = `failed to parse ${basename(lf)}: ${err.message}`;
+          log.error(msg);
+          warnings.push(msg);
+          parseFailures++;
+        }
+      }
+
+      // Also check for pnpm and yarn lockfiles (same npm ecosystem)
+      const { lockfiles: pnpmLocks } = discoverPnpm(targetDir);
+      for (const lf of pnpmLocks) {
+        try {
+          const deps = parsePnpmLock(lf);
+          allDeps.push(...deps);
+          ecosystemsFound.add('npm');
+          dependencyFileCount++;
+        } catch (err) {
+          const msg = `failed to parse ${basename(lf)}: ${err.message}`;
+          log.error(msg);
+          warnings.push(msg);
+          parseFailures++;
+        }
+      }
+      const { lockfiles: yarnLocks } = discoverYarn(targetDir);
+      for (const lf of yarnLocks) {
+        try {
+          const deps = parseYarnLock(lf);
+          allDeps.push(...deps);
+          ecosystemsFound.add('npm');
+          dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
           log.error(msg);
@@ -66,13 +99,13 @@ export async function runScan(flags, args) {
       }
 
       // Fallback to package.json if no lockfile
-      if (lockfiles.length === 0) {
+      if (lockfiles.length === 0 && pnpmLocks.length === 0 && yarnLocks.length === 0) {
         for (const mf of manifests) {
           try {
             const deps = parseNpmManifest(mf);
             allDeps.push(...deps);
             ecosystemsFound.add('npm');
-            lockfileCount++;
+            dependencyFileCount++;
             const msg = 'no lockfile found — scanning package.json (version ranges, lower confidence)';
             if (!isJSON) out(`  ${C.yellow}! ${msg}${C.reset}`);
             warnings.push(msg);
@@ -94,7 +127,7 @@ export async function runScan(flags, args) {
           const deps = parsePypiFile(file.path, file.format);
           allDeps.push(...deps);
           ecosystemsFound.add('pypi');
-          lockfileCount++;
+          dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(file.path)}: ${err.message}`;
           log.error(msg);
@@ -111,9 +144,33 @@ export async function runScan(flags, args) {
           const deps = parseCargoLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('cargo');
-          lockfileCount++;
+          dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
+          log.error(msg);
+          warnings.push(msg);
+          parseFailures++;
+        }
+      }
+    }
+
+    if (GENERIC_ECOSYSTEM_PARSERS[ecoName]) {
+      const { files, usingManifestFallback } = selectGenericFiles(targetDir, ecoName);
+      if (usingManifestFallback) {
+        const manifestList = files.map(file => basename(file.path)).join(', ');
+        const msg = `no lockfile found — scanning ${manifestList} (best-effort manifest fallback, lower confidence)`;
+        warnings.push(msg);
+        if (!isJSON) out(`  ${C.yellow}! ${msg}${C.reset}`);
+      }
+
+      for (const file of files) {
+        try {
+          const deps = parseGenericFile(ecoName, file);
+          allDeps.push(...deps);
+          ecosystemsFound.add(ecoName);
+          dependencyFileCount++;
+        } catch (err) {
+          const msg = `failed to parse ${basename(file.path)}: ${err.message}`;
           log.error(msg);
           warnings.push(msg);
           parseFailures++;
@@ -128,7 +185,7 @@ export async function runScan(flags, args) {
           const deps = parseBrewLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('brew');
-          lockfileCount++;
+          dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
           log.error(msg);
@@ -142,7 +199,7 @@ export async function runScan(flags, args) {
             const deps = parseBrewManifest(mf);
             allDeps.push(...deps);
             ecosystemsFound.add('brew');
-            lockfileCount++;
+            dependencyFileCount++;
           } catch (err) {
             const msg = `failed to parse ${basename(mf)}: ${err.message}`;
             log.error(msg);
@@ -154,7 +211,7 @@ export async function runScan(flags, args) {
     }
   }
 
-  // Distinguish "no lockfiles found" from "lockfiles found but parsing failed"
+  // Distinguish "no dependency files found" from "files found but parsing failed"
   if (allDeps.length === 0 && parseFailures > 0) {
     if (isJSON) {
       out(JSON.stringify({
@@ -163,7 +220,7 @@ export async function runScan(flags, args) {
         errors: warnings, vulnerabilities: [],
       }, null, 2));
     } else {
-      out(`\n  ${C.red}! Lockfiles found but all failed to parse — cannot determine vulnerability status${C.reset}\n`);
+      out(`\n  ${C.red}! Dependency files were found but all failed to parse — cannot determine vulnerability status${C.reset}\n`);
     }
     return EXIT.ERROR;
   }
@@ -190,7 +247,7 @@ export async function runScan(flags, args) {
   const uniqueDeps = [...dedupMap.values()];
 
   if (!isJSON) {
-    out(`  ${C.dim}Found ${uniqueDeps.length} unique packages across ${lockfileCount} lockfile(s)${C.reset}`);
+    out(`  ${C.dim}Found ${uniqueDeps.length} unique packages across ${dependencyFileCount} dependency file(s)${C.reset}`);
   }
 
   // 3. Open cache (graceful degradation if cache fails)
@@ -232,6 +289,7 @@ export async function runScan(flags, args) {
     let fetchedVulns = new Map();
     let queryFailures = [];
     let droppedVulns = [];
+    let queryComplete = true;
     const startTime = Date.now();
 
     if (needsFetch.length > 0) {
@@ -241,10 +299,12 @@ export async function runScan(flags, args) {
       fetchedVulns = osvResult.results;
       queryFailures = osvResult.failures;
       droppedVulns = osvResult.droppedVulns;
+      queryComplete = isQueryComplete(osvResult, needsFetch.length);
 
-      // Cache successful results (individually, don't let one failure abort the rest)
+      // Cache only packages that were actually checked.
       for (const dep of needsFetch) {
         const key = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+        if (!osvResult.checked?.has(key)) continue;
         const vulns = fetchedVulns.get(key) || [];
         try {
           cache.setAdvisories(dep.ecosystem, dep.name, dep.version, vulns);
@@ -285,7 +345,7 @@ export async function runScan(flags, args) {
     });
 
     // 8. Determine completeness — did all queries succeed?
-    const isComplete = queryFailures.length === 0 && parseFailures === 0;
+    const isComplete = queryComplete && parseFailures === 0;
 
     // 9. Format output
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
@@ -331,10 +391,10 @@ export async function runScan(flags, args) {
           }
         }
         for (const { pkg, ver, ecosystem } of fixable.values()) {
-          const cmd = ecosystem === 'npm' ? `npm install ${pkg}@${ver}`
-                    : ecosystem === 'pypi' ? `pip install ${pkg}==${ver}`
-                    : ecosystem === 'cargo' ? `cargo update -p ${pkg} --precise ${ver}`
-                    : `# upgrade ${pkg} to ${ver}`;
+          const cmd = ecosystem === 'npm' ? `npm install ${sanitize(pkg)}@${sanitize(ver)}`
+                    : ecosystem === 'pypi' ? `pip install ${sanitize(pkg)}==${sanitize(ver)}`
+                    : ecosystem === 'cargo' ? `cargo update -p ${sanitize(pkg)} --precise ${sanitize(ver)}`
+                    : `# upgrade ${sanitize(pkg)} to ${sanitize(ver)}`;
           out(`  ${C.cyan}${cmd}${C.reset}`);
         }
         out('');

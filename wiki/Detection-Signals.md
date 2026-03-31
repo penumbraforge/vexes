@@ -16,6 +16,7 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 | `NO_REPOSITORY` | LOW | No source repository link in package metadata |
 | `MISSING_PROVENANCE` | MODERATE / LOW | No Sigstore provenance attestation. MODERATE if combined with other signals, LOW if standalone. |
 | `TYPOSQUAT` | HIGH | Package name is within Levenshtein distance 1-2 of a popular package |
+| `HOMOGLYPH` | CRITICAL | Package name contains invisible Unicode characters (zero-width, BIDI override) or non-ASCII homoglyphs |
 
 ### Layer 1: AST analysis
 
@@ -28,12 +29,12 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 
 | Pattern | Severity | Example |
 |---------|----------|---------|
-| `CODE_EXECUTION` | CRITICAL | `eval()`, `new Function()`, `vm.runInNewContext()`, `process.dlopen()` |
-| `PROCESS_SPAWN` | CRITICAL | `child_process.exec()`, `execSync()`, `spawn()`, `process.binding('spawn_sync')` |
+| `CODE_EXECUTION` | CRITICAL | `eval()`, `new Function()`, `vm.runInNewContext()`, `process.dlopen()`, indirect eval `(0,eval)()`, `setTimeout(string)`, `WebAssembly.instantiate()`, `new Worker()`, `module.constructor._load()`, `.constructor(string)` (prototype chain), `globalThis['eval']()` |
+| `PROCESS_SPAWN` | CRITICAL | `child_process.exec()`, `execSync()`, `spawn()`, `process.binding('spawn_sync')`, `process.mainModule.require()` |
 | `SYSTEM_PATH_WRITE` | CRITICAL | `fs.writeFile('/tmp/backdoor')`, `fs.writeFile('/etc/cron.d/...')` |
 | `SELF_DELETION` | CRITICAL | `fs.unlinkSync(__filename)` -- code erases itself after execution |
-| `ENV_HARVESTING` | CRITICAL | `process.env.AWS_SECRET_ACCESS_KEY`, `process.env.GITHUB_TOKEN` |
-| `NETWORK_ACCESS` | HIGH | `fetch()`, `https.request()`, `http.get()` |
+| `ENV_HARVESTING` | CRITICAL | `process.env.AWS_SECRET_ACCESS_KEY`, `process.env.GITHUB_TOKEN`, `process['env']` (computed), `fs.readFileSync('.ssh/id_rsa')` (sensitive file reads) |
+| `NETWORK_ACCESS` | HIGH | `fetch()`, `https.request()`, `http.get()`, `dns.resolve()` (DNS exfiltration), `dns.lookup()` |
 | `BASE64_DECODE` | HIGH | `Buffer.from(x, 'base64')`, `.toString('base64')` |
 | `DYNAMIC_REQUIRE` | HIGH | `require(variable)` -- loads arbitrary modules |
 | `DYNAMIC_IMPORT` | HIGH | `import(variable)` -- dynamic module loading |
@@ -86,7 +87,18 @@ In `.vexesrc.json`:
 }
 ```
 
-Setting a signal to `"off"` completely suppresses it. Use sparingly.
+Setting a signal to `"off"` suppresses it. Use sparingly.
+
+### Undisableable signals
+
+The following critical signals **cannot be disabled** via config -- they detect active supply chain attacks and suppressing them would create a dangerous blind spot:
+
+- `KNOWN_COMPROMISED` -- package has known vulnerabilities in OSV
+- `PHANTOM_DEPENDENCY` -- brand-new dependency (< 7 days old)
+- `CIRCULAR_STAGING` -- new dependency published by the same account
+- `CAPABILITY_ESCALATION` -- package gained dangerous capabilities between versions
+
+Attempting to set these to `"off"` in `.vexesrc.json` has no effect.
 
 ## Sensitive environment variables detected
 

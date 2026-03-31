@@ -91,7 +91,7 @@ function printHelp() {
 
   ${C.bold}SCAN OPTIONS${C.reset}
     --path <dir>         Target directory ${C.dim}(default: cwd)${C.reset}
-    --ecosystem <name>   Filter: npm, pypi, cargo, brew
+    --ecosystem <name>   Filter: npm, pypi, cargo, go, ruby, php, nuget, java, brew
     --severity <level>   Minimum: critical, high, moderate, low ${C.dim}(default: moderate)${C.reset}
     --fix                Show fix commands for each vulnerability
     --cached             Use cached results without freshness check

@@ -24,7 +24,7 @@ Enumerate dependencies from lockfiles, query OSV.dev, and report known vulnerabi
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--path <dir>` | Target directory | Current working directory |
-| `--ecosystem <name>` | Filter to one ecosystem: `npm`, `pypi`, `cargo`, `brew` | All detected |
+| `--ecosystem <name>` | Filter to one ecosystem: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java`, `brew` | All detected |
 | `--severity <level>` | Minimum severity to report: `critical`, `high`, `moderate`, `low` | `moderate` |
 | `--fix` | Show upgrade commands for fixable vulnerabilities | Off |
 | `--cached` | Use cached results without freshness check | Off |
@@ -33,9 +33,14 @@ Enumerate dependencies from lockfiles, query OSV.dev, and report known vulnerabi
 
 | Ecosystem | Lockfiles | Manifests (fallback) |
 |-----------|-----------|---------------------|
-| npm | `package-lock.json` (v1, v2, v3) | `package.json` (lower confidence) |
-| PyPI | `Pipfile.lock`, `poetry.lock` | `requirements.txt`, `pyproject.toml` |
+| npm | `package-lock.json` (v1, v2, v3), `pnpm-lock.yaml` (v6, v9), `yarn.lock` (v1, v2+) | `package.json` (lower confidence) |
+| PyPI | `Pipfile.lock`, `poetry.lock` | `requirements.txt` (with `-r` recursive), `pyproject.toml` (PEP 621 + Poetry) |
 | Cargo | `Cargo.lock` | |
+| Go | `go.sum` | `go.mod` |
+| Ruby | `Gemfile.lock` | `Gemfile` |
+| PHP | `composer.lock` | `composer.json` |
+| NuGet | `packages.lock.json` | `*.csproj` |
+| Java | `gradle.lockfile` | `pom.xml` |
 | Homebrew | `Brewfile.lock.json` | `Brewfile` |
 
 ### JSON output schema
@@ -77,7 +82,7 @@ Deep behavioral analysis of the dependency supply chain using the 4-layer detect
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--path <dir>` | Target directory | cwd |
-| `--ecosystem <name>` | Filter: `npm`, `pypi` | All detected |
+| `--ecosystem <name>` | Filter: `npm`, `pypi` (deep analysis requires registry metadata) | All detected |
 | `--deep` | Download + AST-inspect actual package source code | Off |
 | `--explain <pkg>` | Detailed breakdown for a specific package | |
 | `--strict` | Exit code 1 on any signal (for CI) | Off |
@@ -157,12 +162,14 @@ vexes guard -- npm install <package>
 ```bash
 npm() {
   if [[ "$1" == "install" || "$1" == "i" || "$1" == "add" ]]; then
-    command npx @penumbraforge/vexes guard -- npm "$@"
+    command /path/to/vexes guard -- npm "$@"
   else
     command npm "$@"
   fi
 }
 ```
+
+The binary path is resolved at setup time (via `which vexes`) rather than using `npx` at runtime. This prevents a compromised registry from injecting code on every guarded install.
 
 Supports bash, zsh, and fish. Remove with `vexes guard --uninstall`.
 

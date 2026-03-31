@@ -19,11 +19,32 @@ export function disableColor() { colorEnabled = false; }
 export function enableColor()  { colorEnabled = isTTY && !noColor; }
 
 /**
- * Strip non-printable and ANSI escape sequences from external data
+ * Strip non-printable and ALL terminal escape sequences from external data
  * to prevent terminal injection via malicious package names/summaries.
+ *
+ * Covers: CSI (with intermediate bytes), OSC (BEL and ST terminators),
+ * DCS/APC/PM/SOS sequences, C1 control codes (0x80-0x9F), and bare ESC.
+ *
+ * Order matters: match complete escape sequences FIRST, then strip remaining
+ * control chars. Otherwise the ESC byte gets stripped before the sequence
+ * regex can match the full pattern.
  */
 export function sanitize(s) {
-  return String(s).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07/g, '');
+  return String(s)
+    // OSC sequences: ESC ] ... (terminated by BEL \x07 or ST \x1b\\)
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+    // DCS/SOS/PM/APC sequences: ESC P|X|^|_ ... ST
+    .replace(/\x1b[PX^_][\s\S]*?\x1b\\/g, '')
+    // CSI sequences: ESC [ (optional intermediate bytes) params final byte
+    .replace(/\x1b\[[\x20-\x2f]*[0-9;?]*[\x20-\x7e]/g, '')
+    // Two-char ESC sequences: ESC + 0x40-0x7E
+    .replace(/\x1b[\x40-\x7e]/g, '')
+    // Catch-all: any remaining ESC byte
+    .replace(/\x1b/g, '')
+    // C1 control codes (0x80-0x9F) — single-byte equivalents of ESC sequences
+    .replace(/[\x80-\x9f]/g, '')
+    // C0 control chars (except \t=0x09, \n=0x0a, \r=0x0d) and DEL
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 }
 
 /** Severity → color */

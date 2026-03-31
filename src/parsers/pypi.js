@@ -13,17 +13,49 @@ function normalize(name) {
 
 /**
  * Parse requirements.txt into dependency list.
+ * Follows -r (recursive include) and -c (constraint) references.
  */
-export function parseRequirements(filePath) {
+export function parseRequirements(filePath, _visited = new Set()) {
+  // Prevent infinite recursion from circular -r includes
+  const resolved = join(filePath, '..', '..', filePath).replace(/\/\.\.\//g, '/'); // normalize
+  if (_visited.has(filePath)) return [];
+  _visited.add(filePath);
+
   let content;
   try { content = readFileSync(filePath, 'utf8'); }
   catch (err) { throw new Error(`cannot read ${filePath}: ${err.code || err.message}`); }
 
   const deps = [];
+  const dir = join(filePath, '..');
   for (const rawLine of content.split('\n')) {
     const line = rawLine.split('#')[0].trim();
     if (!line) continue;
-    if (line.startsWith('-') || line.startsWith('--')) continue; // options
+
+    // Follow -r / --requirement includes recursively
+    const reqMatch = line.match(/^(?:-r|--requirement)\s+(.+)$/);
+    if (reqMatch) {
+      const includePath = join(dir, reqMatch[1].trim());
+      try {
+        deps.push(...parseRequirements(includePath, _visited));
+      } catch (err) {
+        log.warn(`failed to follow -r include ${reqMatch[1]}: ${err.message}`);
+      }
+      continue;
+    }
+
+    // Follow -c / --constraint files (same format, just version constraints)
+    const constraintMatch = line.match(/^(?:-c|--constraint)\s+(.+)$/);
+    if (constraintMatch) {
+      const includePath = join(dir, constraintMatch[1].trim());
+      try {
+        deps.push(...parseRequirements(includePath, _visited));
+      } catch (err) {
+        log.warn(`failed to follow -c constraint ${constraintMatch[1]}: ${err.message}`);
+      }
+      continue;
+    }
+
+    if (line.startsWith('-') || line.startsWith('--')) continue; // other options
 
     // Strip extras: package[extra1,extra2]
     const stripped = line.replace(/\[.*?\]/, '');
@@ -137,7 +169,8 @@ export function parsePipfileLock(filePath) {
 }
 
 /**
- * Parse pyproject.toml [project.dependencies] (TOML subset).
+ * Parse pyproject.toml [project.dependencies], [project.optional-dependencies],
+ * and [tool.poetry.dependencies] (TOML subset).
  */
 export function parsePyprojectToml(filePath) {
   let content;
@@ -145,31 +178,82 @@ export function parsePyprojectToml(filePath) {
   catch (err) { throw new Error(`cannot read ${filePath}: ${err.code || err.message}`); }
 
   const deps = [];
-  let inDeps = false;
+  let inArray = false;       // inside a [...] array value
+  let inSection = null;      // current [section.name]
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
 
-    if (trimmed === '[project]') continue;
-    if (/^\[/.test(trimmed) && trimmed !== '[project]') {
-      inDeps = false;
+    // Track section headers
+    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      inArray = false;
+      inSection = sectionMatch[1].trim();
       continue;
     }
 
-    if (/^dependencies\s*=\s*\[/.test(trimmed)) {
-      inDeps = true;
-      // Check for inline deps on same line
+    // [project] dependencies = [...]
+    if (inSection === 'project' && /^dependencies\s*=\s*\[/.test(trimmed)) {
+      inArray = true;
       const inlineMatch = trimmed.match(/\[(.+)\]/);
       if (inlineMatch) {
         parseDepsArray(inlineMatch[1], deps);
-        inDeps = false;
+        inArray = false;
       }
       continue;
     }
 
-    if (inDeps) {
-      if (trimmed === ']') { inDeps = false; continue; }
-      // Each line is like: "package-name>=1.0.0",
+    // [project.optional-dependencies] — any key = [...] array
+    if (inSection?.startsWith('project.optional-dependencies')) {
+      if (/^[a-zA-Z0-9_-]+\s*=\s*\[/.test(trimmed)) {
+        inArray = true;
+        const inlineMatch = trimmed.match(/\[(.+)\]/);
+        if (inlineMatch) {
+          parseDepsArray(inlineMatch[1], deps);
+          inArray = false;
+        }
+        continue;
+      }
+    }
+
+    // [tool.poetry.dependencies] — key = "version" or key = {version = "..."}
+    if (inSection === 'tool.poetry.dependencies') {
+      const poetryDep = trimmed.match(/^([a-zA-Z0-9._-]+)\s*=\s*"([^"]+)"/);
+      if (poetryDep) {
+        const name = normalize(poetryDep[1]);
+        if (name === 'python') continue; // Skip python version constraint
+        const verMatch = poetryDep[2].match(/[\d].*/);
+        const version = verMatch ? verMatch[0].split(',')[0].trim() : 'latest';
+        deps.push({ name, version, ecosystem: 'pypi', isDirect: true, isPinned: false });
+        continue;
+      }
+      // Table form: name = {version = "^1.0", ...}
+      const poetryTable = trimmed.match(/^([a-zA-Z0-9._-]+)\s*=\s*\{.*version\s*=\s*"([^"]+)"/);
+      if (poetryTable) {
+        const name = normalize(poetryTable[1]);
+        if (name === 'python') continue;
+        const verMatch = poetryTable[2].match(/[\d].*/);
+        const version = verMatch ? verMatch[0].split(',')[0].trim() : 'latest';
+        deps.push({ name, version, ecosystem: 'pypi', isDirect: true, isPinned: false });
+        continue;
+      }
+    }
+
+    // [tool.poetry.dev-dependencies]
+    if (inSection === 'tool.poetry.dev-dependencies') {
+      const poetryDep = trimmed.match(/^([a-zA-Z0-9._-]+)\s*=\s*"([^"]+)"/);
+      if (poetryDep) {
+        const name = normalize(poetryDep[1]);
+        const verMatch = poetryDep[2].match(/[\d].*/);
+        const version = verMatch ? verMatch[0].split(',')[0].trim() : 'latest';
+        deps.push({ name, version, ecosystem: 'pypi', isDirect: true, isDev: true, isPinned: false });
+        continue;
+      }
+    }
+
+    // Inside a [...] array value (for dependencies and optional-dependencies)
+    if (inArray) {
+      if (trimmed === ']') { inArray = false; continue; }
       const m = trimmed.match(/^\s*"([^"]+)"/);
       if (m) {
         const depStr = m[1];

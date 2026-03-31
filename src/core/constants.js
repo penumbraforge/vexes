@@ -25,7 +25,7 @@ export const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
 export const ECOSYSTEMS = Object.freeze({
   npm: {
     osvId: 'npm',
-    lockfiles: ['package-lock.json'],
+    lockfiles: ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'],
     manifests: ['package.json'],
     registryUrl: NPM_REGISTRY_URL,
   },
@@ -39,6 +39,36 @@ export const ECOSYSTEMS = Object.freeze({
     osvId: 'crates.io',
     lockfiles: ['Cargo.lock'],
     manifests: ['Cargo.toml'],
+    registryUrl: null,
+  },
+  go: {
+    osvId: 'Go',
+    lockfiles: ['go.sum'],
+    manifests: ['go.mod'],
+    registryUrl: null,
+  },
+  ruby: {
+    osvId: 'RubyGems',
+    lockfiles: ['Gemfile.lock'],
+    manifests: ['Gemfile'],
+    registryUrl: null,
+  },
+  php: {
+    osvId: 'Packagist',
+    lockfiles: ['composer.lock'],
+    manifests: ['composer.json'],
+    registryUrl: null,
+  },
+  nuget: {
+    osvId: 'NuGet',
+    lockfiles: ['packages.lock.json'],
+    manifests: ['*.csproj'],
+    registryUrl: null,
+  },
+  java: {
+    osvId: 'Maven',
+    lockfiles: ['gradle.lockfile'],
+    manifests: ['pom.xml'],
     registryUrl: null,
   },
   brew: {

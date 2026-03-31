@@ -1,14 +1,14 @@
-import { resolve, join, basename } from 'node:path';
+import { resolve, join } from 'node:path';
 import { statSync, existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { loadConfig } from '../cli/config.js';
 import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
-import { VERSION, EXIT, SEVERITY } from '../core/constants.js';
-import { discover as discoverNpm, parseLockfile as parseNpmLock } from '../parsers/npm.js';
+import { VERSION, EXIT } from '../core/constants.js';
+import { parseLockfile as parseNpmLock } from '../parsers/npm.js';
 import { diffSnapshots, toSnapshot } from '../analysis/diff.js';
-import { queryBatch } from '../advisories/osv.js';
+import { queryBatch, isQueryComplete } from '../advisories/osv.js';
 import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { analyzePackage } from '../analysis/signals.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
@@ -183,22 +183,23 @@ export async function runGuard(flags, args) {
     signalSpinner?.stop(`${results.length} packages analyzed`);
 
     // 5. Decision: block, warn, or allow
-    const critical = results.filter(r => r.riskLevel === 'CRITICAL');
-    const high = results.filter(r => r.riskLevel === 'HIGH');
-    const hasKnownVulns = results.some(r => r.signals.some(s => s.signal === 'KNOWN_COMPROMISED'));
-    const unknown = results.filter(r => r.riskLevel === 'UNKNOWN');
+    const decision = evaluateGuardResults(results, osvData, packagesToAnalyze.length);
+    const { critical, high, hasKnownVulns, unknown, analysisIncomplete, incompleteReasons } = decision;
 
     if (isJSON) {
-      const blocked = critical.length > 0 || hasKnownVulns;
+      const blocked = critical.length > 0 || hasKnownVulns || analysisIncomplete;
       out(JSON.stringify({
         version: VERSION, command: 'guard',
         installCommand: installDisplay,
         diff: { added: diff.added.length, changed: diff.changed.length, removed: diff.removed.length },
         blocked,
+        incomplete: analysisIncomplete,
+        warnings: [...osvData.failures, ...incompleteReasons],
         results,
       }, null, 2));
 
-      return blocked ? EXIT.VULNS_FOUND : EXIT.OK;
+      if (!blocked) return EXIT.OK;
+      return analysisIncomplete && critical.length === 0 && !hasKnownVulns ? EXIT.ERROR : EXIT.VULNS_FOUND;
     }
 
     // Terminal output
@@ -233,12 +234,33 @@ export async function runGuard(flags, args) {
     if (unknown.length > 0) {
       out(`  ${C.yellow}! ${unknown.length} package(s) could not be fully analyzed${C.reset}\n`);
     }
+    if (!decision.osvComplete) {
+      for (const reason of incompleteReasons.filter(r => r.startsWith('OSV'))) {
+        out(`  ${C.yellow}! ${sanitize(reason)}${C.reset}`);
+      }
+      out('');
+    }
 
     if (critical.length > 0 || hasKnownVulns) {
       out(`  ${C.red}${C.bold}\u2717 BLOCKED${C.reset}${C.red} — ${critical.length} critical risk package(s) detected.${C.reset}`);
       out(`  ${C.dim}The install was not executed. Review the findings above.${C.reset}`);
       out(`  ${C.dim}To override: run the install command directly (at your own risk).${C.reset}\n`);
       return EXIT.VULNS_FOUND;
+    }
+
+    if (analysisIncomplete) {
+      out(`  ${C.yellow}${C.bold}! INCOMPLETE${C.reset}${C.yellow} — vexes could not fully verify this install.${C.reset}`);
+      for (const reason of incompleteReasons) {
+        out(`    ${C.dim}${sanitize(reason)}${C.reset}`);
+      }
+
+      if (forceInstall) {
+        out(`\n  ${C.yellow}--force used — proceeding despite incomplete analysis.${C.reset}\n`);
+        return executeRealInstall(manager, installArgs, targetDir);
+      }
+
+      out(`\n  ${C.dim}Install blocked until analysis completes successfully. Use --force to override.${C.reset}\n`);
+      return EXIT.ERROR;
     }
 
     if (high.length > 0) {
@@ -272,6 +294,36 @@ export async function runGuard(flags, args) {
   } finally {
     cache.close();
   }
+}
+
+export function evaluateGuardResults(results, osvData, expectedChecks) {
+  const critical = results.filter(r => r.riskLevel === 'CRITICAL');
+  const high = results.filter(r => r.riskLevel === 'HIGH');
+  const hasKnownVulns = results.some(r => r.signals.some(s => s.signal === 'KNOWN_COMPROMISED'));
+  const unknown = results.filter(r => r.riskLevel === 'UNKNOWN');
+  const osvComplete = isQueryComplete(osvData, expectedChecks);
+  const incompleteReasons = [];
+
+  if (!osvComplete) {
+    const missed = osvData?.failedCount ?? 0;
+    const detail = missed > 0
+      ? `${missed} package(s) were not checked`
+      : 'one or more lookup errors occurred';
+    incompleteReasons.push(`OSV vulnerability lookup incomplete — ${detail}`);
+  }
+  if (unknown.length > 0) {
+    incompleteReasons.push(`${unknown.length} package(s) could not be fully analyzed`);
+  }
+
+  return {
+    critical,
+    high,
+    hasKnownVulns,
+    unknown,
+    osvComplete,
+    analysisIncomplete: incompleteReasons.length > 0,
+    incompleteReasons,
+  };
 }
 
 /**
@@ -381,10 +433,29 @@ function detectShell() {
   return 'bash';
 }
 
+function resolveVexesBinary() {
+  // Resolve to the actual installed binary path at setup time — NOT npx at runtime.
+  // npx fetches from the registry on every invocation, which means a compromised
+  // registry account would let an attacker run arbitrary code on every npm install.
+  try {
+    const result = execFileSync('which', ['vexes'], { encoding: 'utf8', timeout: 5000 }).trim();
+    if (result) return result;
+  } catch { /* not in PATH */ }
+
+  // Fall back to the path of the currently executing script
+  const selfPath = process.argv[1];
+  if (selfPath) return selfPath;
+
+  // Last resort: use npx but warn the user
+  log.warn('could not resolve vexes binary path — wrapper will use npx (less secure, fetches from registry on each run)');
+  return 'npx @penumbraforge/vexes';
+}
+
 function buildBashWrapper() {
+  const vexesBin = resolveVexesBinary();
   return `npm() {
   if [[ "$1" == "install" || "$1" == "i" || "$1" == "add" ]]; then
-    command npx @penumbraforge/vexes guard -- npm "$@"
+    command ${vexesBin} guard -- npm "$@"
   else
     command npm "$@"
   fi
@@ -392,9 +463,10 @@ function buildBashWrapper() {
 }
 
 function buildFishWrapper() {
+  const vexesBin = resolveVexesBinary();
   return `function npm
   if test "$argv[1]" = "install" -o "$argv[1]" = "i" -o "$argv[1]" = "add"
-    command npx @penumbraforge/vexes guard -- npm $argv
+    command ${vexesBin} guard -- npm $argv
   else
     command npm $argv
   end

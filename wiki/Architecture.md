@@ -27,10 +27,11 @@ vexes uses a layered detection architecture. Each layer catches different attack
 Parses JavaScript source using [acorn](https://github.com/acornjs/acorn) (vendored -- zero deps) and walks the AST to detect dangerous call patterns. For Python, uses pattern matching on joined source lines (handling line continuations).
 
 **Key design decisions:**
-- **Tracks `require()` and `import` bindings.** `const { exec } = require('child_process'); exec('cmd')` is correctly traced. The inspector maintains a binding map so destructured imports are caught.
+- **Tracks `require()` and `import` bindings.** `const { exec } = require('child_process'); exec('cmd')` is correctly traced. The inspector maintains a binding map so destructured imports (both object and array patterns) are caught.
 - **Handles both module and script parse modes.** Falls back to script mode if module parse fails.
 - **Error recovery.** If the walker crashes mid-traversal, partial findings are preserved.
 - **Obfuscation detection.** Computed property calls (`obj[expr]()`) and string concatenation in `require()` are flagged as evasion attempts.
+- **Evasion resistance.** Catches indirect eval `(0,eval)()`, `setTimeout(string)`, `globalThis['eval']()`, `process.mainModule.require()`, `module.constructor._load()`, `WebAssembly.instantiate()`, `new Worker()`, prototype chain escapes, and DNS exfiltration via `dns.resolve()`.
 
 ### Layer 2: Dependency Graph (`dep-graph.js`)
 
@@ -76,7 +77,7 @@ Risk Levels:
 Lockfiles/Manifests
         |
         v
-   [ Parsers ]  npm.js, pypi.js, cargo.js, brew.js
+   [ Parsers ]  npm.js, pnpm.js, yarn.js, pypi.js, cargo.js, go.js, ruby.js, php.js, dotnet.js, java.js, brew.js
         |
         v
   Dependency List

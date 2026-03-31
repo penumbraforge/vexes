@@ -22,11 +22,10 @@ describe('Ecosystem validation', () => {
     assert.deepEqual(config.ecosystems, ['npm']);
   });
 
-  it('still sets unknown ecosystem (with warning)', () => {
-    // The config still sets it so the user gets an error at scan time
-    // rather than silently scanning nothing
-    const config = loadConfig('/tmp', { ecosystem: 'nmp' });
-    assert.deepEqual(config.ecosystems, ['nmp']);
+  it('throws on unknown ecosystem instead of silently scanning nothing', () => {
+    // A security tool must reject invalid ecosystems — silently scanning nothing
+    // and reporting "clean" is a total bypass
+    assert.throws(() => loadConfig('/tmp', { ecosystem: 'nmp' }), /unknown ecosystem/);
   });
 });
 

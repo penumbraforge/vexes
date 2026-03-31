@@ -36,6 +36,17 @@ export function diffSnapshots(before, after) {
         fromVersion: prev.version,
         toVersion: dep.version,
       });
+    } else if (dep.integrity && prev.integrity && dep.integrity !== prev.integrity) {
+      // Same version but different integrity hash — tarball was modified.
+      // This is a supply chain attack vector: attacker replaces package contents
+      // without bumping the version number.
+      changed.push({
+        name: dep.name,
+        ecosystem: dep.ecosystem,
+        fromVersion: prev.version,
+        toVersion: dep.version,
+        integrityChanged: true,
+      });
     } else {
       unchanged.push(dep);
     }
@@ -77,5 +88,6 @@ export function toSnapshot(deps) {
     name: d.name,
     version: d.version,
     ecosystem: d.ecosystem,
+    ...(d.integrity ? { integrity: d.integrity } : {}),
   }));
 }

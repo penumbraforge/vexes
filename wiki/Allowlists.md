@@ -6,6 +6,8 @@ vexes ships with built-in allowlists for packages that legitimately trigger cert
 
 When a signal fires for an allowlisted package, it gets a `knownGood: true` evidence flag. The composite scoring engine applies a **0.2x weight multiplier** to known-good signals, reducing their contribution to the risk score by 80%.
 
+**AST analysis always runs.** Even for known-good packages, vexes parses and inspects install scripts via the AST inspector. The findings are produced with the `knownGood` flag so scoring can downweight them, but the analysis itself is never skipped. This ensures that a compromised version of esbuild or sharp cannot hide malicious code in install scripts.
+
 This means:
 - esbuild's legitimate postinstall is flagged at `LOW` severity instead of `HIGH`
 - If esbuild's postinstall suddenly starts accessing `process.env.AWS_SECRET_ACCESS_KEY`, that new signal is NOT downweighted and fires at full severity

@@ -37,9 +37,11 @@ export function parseLockfile(lockfilePath) {
       if (key === '') continue;
       if (!entry.version) continue;
 
-      // Extract name after the last node_modules/ segment
-      const name = key.split('node_modules/').pop();
-      if (!name) continue;
+      // Extract name after the last node_modules/ segment.
+      // npm registry normalizes names to lowercase; do the same for consistent OSV queries.
+      const rawName = key.split('node_modules/').pop();
+      if (!rawName) continue;
+      const name = rawName.toLowerCase();
 
       const dedupKey = `${name}@${entry.version}`;
       if (seen.has(dedupKey)) continue;
@@ -51,6 +53,7 @@ export function parseLockfile(lockfilePath) {
         ecosystem: 'npm',
         isDev: entry.dev === true,
         isDirect: directDeps.has(name),
+        ...(entry.integrity ? { integrity: entry.integrity } : {}),
       });
     }
 
@@ -137,7 +140,7 @@ export function parseManifest(pkgPath) {
 
   const deps = [];
 
-  for (const [section, isDev] of [['dependencies', false], ['devDependencies', true]]) {
+  for (const [section, isDev] of [['dependencies', false], ['devDependencies', true], ['optionalDependencies', false], ['peerDependencies', false]]) {
     const entries = pkg[section];
     if (!entries || typeof entries !== 'object') continue;
 

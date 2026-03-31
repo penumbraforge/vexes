@@ -5,6 +5,8 @@ import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, SEVERITY, ANALYZE_CONCURRENCY } from '../core/constants.js';
 import { discover as discoverNpm, parseLockfile as parseNpmLock } from '../parsers/npm.js';
+import { discover as discoverPnpm, parseLockfile as parsePnpmLock } from '../parsers/pnpm.js';
+import { discover as discoverYarn, parseLockfile as parseYarnLock } from '../parsers/yarn.js';
 import { discover as discoverPypi, parseFile as parsePypiFile } from '../parsers/pypi.js';
 import { queryBatch } from '../advisories/osv.js';
 import { fetchNpmMetadata } from '../advisories/npm-registry.js';
@@ -40,6 +42,7 @@ export async function runAnalyze(flags, args) {
   }
 
   const warnings = [];
+  let parseFailures = 0;
 
   // 1. Discover and parse lockfiles
   const allDeps = [];
@@ -47,19 +50,23 @@ export async function runAnalyze(flags, args) {
 
   for (const ecoName of config.ecosystems) {
     if (ecoName === 'npm') {
-      const { lockfiles } = discoverNpm(targetDir);
-      for (const lf of lockfiles) {
-        try {
-          const deps = parseNpmLock(lf);
-          // For analyze, focus on direct deps by default (transitive deps = too much noise)
-          const directDeps = deps.filter(d => d.isDirect);
+      // Discover from all npm-ecosystem lockfiles: npm, pnpm, yarn
+      for (const [discFn, parseFn] of [[discoverNpm, parseNpmLock], [discoverPnpm, parsePnpmLock], [discoverYarn, parseYarnLock]]) {
+        const { lockfiles } = discFn(targetDir);
+        for (const lf of lockfiles) {
+          try {
+            const deps = parseFn(lf);
+            // For analyze, focus on direct deps by default (transitive deps = too much noise)
+            const directDeps = deps.filter(d => d.isDirect);
           const depsToAnalyze = verbose ? deps : (directDeps.length > 0 ? directDeps : deps);
           allDeps.push(...depsToAnalyze);
           ecosystemsFound.add('npm');
         } catch (err) {
           warnings.push(`failed to parse ${basename(lf)}: ${err.message}`);
           log.error(warnings[warnings.length - 1]);
+          parseFailures++;
         }
+      }
       }
     }
     if (ecoName === 'pypi') {
@@ -75,6 +82,7 @@ export async function runAnalyze(flags, args) {
         } catch (err) {
           warnings.push(`failed to parse ${basename(file.path)}: ${err.message}`);
           log.error(warnings[warnings.length - 1]);
+          parseFailures++;
         }
       }
     }
@@ -123,10 +131,10 @@ export async function runAnalyze(flags, args) {
     let analyzed = 0;
 
     for (let i = 0; i < uniqueDeps.length; i += ANALYZE_CONCURRENCY) {
-      const chunk = uniqueDeps.slice(i, i + ANALYZE_CONCURRENCY);
-      const chunkResults = await Promise.allSettled(
-        chunk.map(dep => analyzeSinglePackage(dep, osvData.results, config, cache))
-      );
+        const chunk = uniqueDeps.slice(i, i + ANALYZE_CONCURRENCY);
+        const chunkResults = await Promise.allSettled(
+          chunk.map(dep => analyzeSinglePackage(dep, osvData, config, cache))
+        );
 
       for (let j = 0; j < chunk.length; j++) {
         const dep = chunk[j];
@@ -249,14 +257,16 @@ export async function runAnalyze(flags, args) {
     // 6. Sort by risk score descending
     results.sort((a, b) => b.riskScore - a.riskScore);
 
-    // 7. Surface packages where metadata fetch failed
-    const unknownResults = results.filter(r => r.riskLevel === 'UNKNOWN');
-    if (unknownResults.length > 0) {
-      warnings.push(`${unknownResults.length} package(s) could not be fully analyzed (metadata unavailable)`);
-      for (const r of unknownResults) {
-        if (r.warnings?.length) warnings.push(...r.warnings.map(w => `${r.name}: ${w}`));
+    // 7. Surface packages where any analysis step was incomplete
+    const incompleteResults = results.filter(r => r.warnings?.length > 0);
+    if (incompleteResults.length > 0) {
+      warnings.push(`${incompleteResults.length} package(s) could not be fully analyzed`);
+      for (const r of incompleteResults) {
+        warnings.push(...r.warnings.map(w => `${r.name}: ${w}`));
       }
     }
+
+    const complete = parseFailures === 0 && incompleteResults.length === 0 && osvData.failures.length === 0;
 
     // 8. Filter — default shows only packages with signals
     const minSeverity = config.severity?.toUpperCase() || 'MODERATE';
@@ -274,6 +284,7 @@ export async function runAnalyze(flags, args) {
         version: VERSION,
         timestamp: new Date().toISOString(),
         command: 'analyze',
+        complete,
         summary: {
           total: uniqueDeps.length,
           flagged: flaggedResults.length,
@@ -293,12 +304,16 @@ export async function runAnalyze(flags, args) {
           out(`  ${C.yellow}Package "${config.explain}" not found in dependencies${C.reset}\n`);
         }
         cache.close();
-        return EXIT.OK;
+        return complete ? EXIT.OK : EXIT.ERROR;
       }
 
       // Normal output
       if (flaggedResults.length === 0) {
-        out(`\n  ${C.green}\u2713 No risk signals detected${C.reset}\n`);
+        if (complete) {
+          out(`\n  ${C.green}\u2713 No risk signals detected${C.reset}\n`);
+        } else {
+          out(`\n  ${C.yellow}! No risk signals detected, but analysis was incomplete${C.reset}\n`);
+        }
       } else {
         out(header('Risk Assessment'));
         out(`  ${C.dim}${'Package'.padEnd(35)} Risk   Signals${C.reset}`);
@@ -339,6 +354,8 @@ export async function runAnalyze(flags, args) {
 
       if (flaggedResults.length > 0) {
         out(`  ${flaggedResults.length} package(s) with risk signals \u00b7 ${parts.join(' \u00b7 ')}`);
+      } else if (!complete) {
+        out(`  ${C.yellow}!${C.reset} ${uniqueDeps.length} packages analyzed — one or more checks were incomplete`);
       } else {
         out(`  ${C.green}\u2713${C.reset} ${uniqueDeps.length} packages analyzed — no concerning signals`);
       }
@@ -355,6 +372,7 @@ export async function runAnalyze(flags, args) {
     const hasCritical = flaggedResults.some(r => r.riskLevel === 'CRITICAL');
     const hasHigh = flaggedResults.some(r => r.riskLevel === 'HIGH');
 
+    if (!complete) return EXIT.ERROR;
     if (config.strict && flaggedResults.length > 0) return EXIT.VULNS_FOUND;
     if (hasCritical || hasHigh) return EXIT.VULNS_FOUND;
     return EXIT.OK;
@@ -367,7 +385,7 @@ export async function runAnalyze(flags, args) {
 /**
  * Analyze a single package through all layers.
  */
-async function analyzeSinglePackage(dep, osvResults, config, cache) {
+export async function analyzeSinglePackage(dep, osvData, config, cache) {
   const key = `${dep.ecosystem}:${dep.name}@${dep.version}`;
 
   // Check signal cache
@@ -383,7 +401,8 @@ async function analyzeSinglePackage(dep, osvResults, config, cache) {
   }
 
   // Get OSV results for this package
-  const osvResult = osvResults.get(key) || null;
+  const osvCovered = osvData?.checked?.has(key) === true;
+  const osvResult = osvCovered ? (osvData.results.get(key) || []) : null;
 
   // Run all signal detectors
   const result = await analyzePackage(metadata, osvResult, {
@@ -399,12 +418,16 @@ async function analyzeSinglePackage(dep, osvResults, config, cache) {
     signals: result.signals,
     riskScore: result.riskScore,
     riskLevel: result.riskLevel,
-    warnings: result.warnings || [],
+    warnings: [...(result.warnings || [])],
   };
+
+  if (!osvCovered) {
+    output.warnings.push('OSV vulnerability lookup incomplete');
+  }
 
   // Only cache complete results — never cache degraded analysis
   // A transient network failure must not poison the cache with false-clean for 24 hours
-  const isDegraded = metadata === null || output.riskLevel === 'UNKNOWN' || (output.warnings?.length > 0);
+  const isDegraded = !osvCovered || metadata === null || output.riskLevel === 'UNKNOWN' || (output.warnings?.length > 0);
   if (!isDegraded) {
     try {
       cache.setSignals(dep.ecosystem, dep.name, dep.version, output);

@@ -27,7 +27,7 @@ vexes scan
 ```
 
 vexes will:
-1. Discover lockfiles in the current directory (package-lock.json, Cargo.lock, Pipfile.lock, etc.)
+1. Discover lockfiles in the current directory (package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock, Pipfile.lock, go.sum, Gemfile.lock, composer.lock, etc.)
 2. Parse all dependencies from those lockfiles
 3. Query the [OSV.dev](https://osv.dev) vulnerability database
 4. Report vulnerabilities grouped by severity

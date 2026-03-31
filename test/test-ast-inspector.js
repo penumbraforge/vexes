@@ -166,14 +166,14 @@ describe('AST Inspector — no false positives', () => {
   });
 
   it('clean fixture file produces zero findings', () => {
-    const source = readFileSync(join(fixtures, 'clean-postinstall.js'), 'utf8');
-    const r = inspectJS(source, 'clean-postinstall.js');
+    const source = readFileSync(join(fixtures, 'clean-postinstall.fixture'), 'utf8');
+    const r = inspectJS(source, 'clean-postinstall.fixture');
     assert.equal(r.findingCount, 0, `Expected 0 findings but got: ${r.findings.map(f => f.pattern).join(', ')}`);
   });
 
   it('malicious fixture file detects all patterns', () => {
-    const source = readFileSync(join(fixtures, 'malicious-postinstall.js'), 'utf8');
-    const r = inspectJS(source, 'malicious-postinstall.js');
+    const source = readFileSync(join(fixtures, 'malicious-postinstall.fixture'), 'utf8');
+    const r = inspectJS(source, 'malicious-postinstall.fixture');
     assert.ok(r.findingCount >= 10, `Expected 10+ findings but got ${r.findingCount}`);
     assert.ok(r.capabilities.executesCode);
     assert.ok(r.capabilities.spawnsProcess);

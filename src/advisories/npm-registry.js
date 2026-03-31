@@ -79,13 +79,23 @@ function normalizeMetadata(data, packageName) {
   const latestPublisher = latestData._npmUser?.name || latestData._npmUser?.email || null;
   const previousPublisher = previousData?._npmUser?.name || previousData?._npmUser?.email || null;
 
-  // Extract scripts from latest version
+  // Extract scripts from latest version.
+  // Check ALL lifecycle scripts that can execute code, not just pre/install/postinstall.
+  // `prepare` is critical: runs after install from git dependencies.
   const scripts = latestData.scripts || {};
-  const hasInstallScripts = !!(scripts.preinstall || scripts.install || scripts.postinstall);
+  const LIFECYCLE_SCRIPTS = [
+    'preinstall', 'install', 'postinstall',
+    'prepare',          // Runs after install (especially from git deps)
+    'prepublish',       // Deprecated but still honored
+    'prepublishOnly',   // Runs only during npm publish
+    'prepack', 'postpack',  // Runs around tarball creation
+    'dependencies',     // npm v7+ — runs after dep tree resolved
+  ];
   const installScripts = {};
-  if (scripts.preinstall) installScripts.preinstall = scripts.preinstall;
-  if (scripts.install) installScripts.install = scripts.install;
-  if (scripts.postinstall) installScripts.postinstall = scripts.postinstall;
+  for (const hook of LIFECYCLE_SCRIPTS) {
+    if (scripts[hook]) installScripts[hook] = scripts[hook];
+  }
+  const hasInstallScripts = Object.keys(installScripts).length > 0;
 
   // Extract dependencies diff (latest vs previous)
   const latestDeps = Object.keys(latestData.dependencies || {});

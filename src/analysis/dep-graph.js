@@ -159,12 +159,14 @@ async function profileDependency(packageName) {
       versionCount: versions.length,
       latestPublisher: latestData?._npmUser?.name || null,
       latestPublishTime: latestTag && timeMap[latestTag] ? new Date(timeMap[latestTag]) : null,
-      hasInstallScripts: !!(latestData?.scripts?.preinstall || latestData?.scripts?.install || latestData?.scripts?.postinstall),
-      installScripts: {
-        preinstall: latestData?.scripts?.preinstall || null,
-        install: latestData?.scripts?.install || null,
-        postinstall: latestData?.scripts?.postinstall || null,
-      },
+      hasInstallScripts: !!(latestData?.scripts?.preinstall || latestData?.scripts?.install ||
+        latestData?.scripts?.postinstall || latestData?.scripts?.prepare ||
+        latestData?.scripts?.prepublish || latestData?.scripts?.prepack),
+      installScripts: Object.fromEntries(
+        ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish', 'prepublishOnly', 'prepack', 'postpack', 'dependencies']
+          .filter(hook => latestData?.scripts?.[hook])
+          .map(hook => [hook, latestData.scripts[hook]])
+      ),
     };
   } catch (err) {
     log.debug(`failed to profile dependency ${packageName}: ${err.message}`);
@@ -202,6 +204,44 @@ export function detectTyposquat(name, popularPackages) {
   }
 
   return matches.sort((a, b) => a.distance - b.distance);
+}
+
+/**
+ * Detect suspicious Unicode characters in package names that could be used for homoglyph attacks.
+ * Flags: RTL override, zero-width characters, non-ASCII lookalikes, mixed scripts.
+ *
+ * @param {string} name — package name
+ * @returns {Array<{ type: string, description: string }>}
+ */
+export function detectHomoglyphs(name) {
+  const findings = [];
+
+  // Check for zero-width and invisible characters
+  if (/[\u200b\u200c\u200d\u200e\u200f\u2060\ufeff]/.test(name)) {
+    findings.push({
+      type: 'INVISIBLE_CHARS',
+      description: `Package name contains invisible Unicode characters (zero-width space, joiner, etc.)`,
+    });
+  }
+
+  // Check for RTL/LTR override characters (can make text appear reversed)
+  if (/[\u202a-\u202e\u2066-\u2069]/.test(name)) {
+    findings.push({
+      type: 'BIDI_OVERRIDE',
+      description: `Package name contains bidirectional override characters — name may appear different than it is`,
+    });
+  }
+
+  // Check for non-ASCII characters (homoglyphs: Cyrillic а vs Latin a, etc.)
+  // Legitimate package names are ASCII-only in npm; PyPI allows Unicode but rarely used
+  if (/[^\x00-\x7f]/.test(name)) {
+    findings.push({
+      type: 'NON_ASCII',
+      description: `Package name contains non-ASCII characters — possible homoglyph attack`,
+    });
+  }
+
+  return findings;
 }
 
 /**

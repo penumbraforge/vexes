@@ -19,12 +19,13 @@ import { FETCH_TIMEOUT_MS, USER_AGENT } from '../core/constants.js';
 // Files worth inspecting in a package tarball
 // JS files worth inspecting in an npm tarball
 const JS_INSPECTABLE = [
-  /\/index\.js$/, /\/index\.mjs$/,
-  /\/main\.js$/, /\/cli\.js$/,
-  /\/bin\/[^/]+\.js$/,
-  /\/install\.js$/, /\/postinstall\.js$/, /\/preinstall\.js$/,
+  /\/index\.js$/, /\/index\.mjs$/, /\/index\.cjs$/,
+  /\/main\.js$/, /\/main\.mjs$/, /\/main\.cjs$/,
+  /\/cli\.js$/, /\/cli\.mjs$/, /\/cli\.cjs$/,
+  /\/bin\/[^/]+\.(?:js|mjs|cjs)$/,
+  /\/install\.js$/, /\/postinstall\.js$/, /\/preinstall\.js$/, /\/prepare\.js$/,
   /\/setup\.js$/, /\/loader\.js$/,
-  /\/dist\/index\.js$/, /\/lib\/index\.js$/,
+  /\/dist\/index\.(?:js|mjs|cjs)$/, /\/lib\/index\.(?:js|mjs|cjs)$/,
 ];
 
 // Python files worth inspecting in an sdist tarball
@@ -45,6 +46,12 @@ const MAX_FILES = 10;
 const MAX_TARBALL_SIZE = 5 * 1024 * 1024; // 5MB
 // Max decompressed size — prevents gzip bombs (a 46-byte gzip can decompress to 4.5PB)
 const MAX_DECOMPRESSED_SIZE = 50 * 1024 * 1024; // 50MB
+
+// Allowed tarball host domains — prevents SSRF via manipulated registry responses
+const ALLOWED_TARBALL_HOSTS = new Set([
+  'registry.npmjs.org',
+  'files.pythonhosted.org',
+]);
 
 /**
  * Download and inspect an npm package tarball for dangerous code patterns.
@@ -113,10 +120,36 @@ export async function inspectTarball(tarballUrl, packageName) {
 }
 
 /**
+ * Validate a tarball URL to prevent SSRF attacks.
+ * Only allows HTTPS URLs from known registry hosts.
+ */
+function validateTarballUrl(tarballUrl) {
+  let parsed;
+  try {
+    parsed = new URL(tarballUrl);
+  } catch {
+    throw new Error(`invalid tarball URL: ${tarballUrl}`);
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`tarball URL must use HTTPS, got ${parsed.protocol} (${tarballUrl})`);
+  }
+
+  if (!ALLOWED_TARBALL_HOSTS.has(parsed.hostname)) {
+    throw new Error(`tarball host "${parsed.hostname}" is not in the allowed list (${[...ALLOWED_TARBALL_HOSTS].join(', ')})`);
+  }
+}
+
+/**
  * Download a tarball and extract JS files that match our inspection patterns.
  * Uses zero external dependencies — native gunzip + raw tar header parsing.
+ *
+ * Security: validates URL (SSRF prevention), streams with size limit (memory exhaustion prevention).
  */
 async function downloadAndExtractJS(tarballUrl, packageName) {
+  // SSRF prevention: only fetch from known registry hosts over HTTPS
+  validateTarballUrl(tarballUrl);
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -134,22 +167,73 @@ async function downloadAndExtractJS(tarballUrl, packageName) {
     throw new Error(`HTTP ${res.status} fetching tarball for ${packageName}`);
   }
 
-  // Enforce size limit
+  // Pre-check Content-Length if available
   const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
   if (contentLength > MAX_TARBALL_SIZE) {
     throw new Error(`tarball too large (${contentLength} bytes) for ${packageName}`);
   }
 
-  const compressed = Buffer.from(await res.arrayBuffer());
-  if (compressed.length > MAX_TARBALL_SIZE) {
-    throw new Error(`tarball too large (${compressed.length} bytes) for ${packageName}`);
+  // Stream the response body with incremental size enforcement.
+  // This prevents memory exhaustion when Content-Length is missing or lies.
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const chunk of res.body) {
+    totalBytes += chunk.length;
+    if (totalBytes > MAX_TARBALL_SIZE) {
+      controller.abort();
+      throw new Error(`tarball download exceeded ${MAX_TARBALL_SIZE} bytes for ${packageName} — aborted`);
+    }
+    chunks.push(chunk);
   }
+  const compressed = Buffer.concat(chunks);
 
   // Gunzip
   const decompressed = await gunzip(compressed);
 
-  // Parse tar
-  const files = parseTar(decompressed, packageName);
+  // Parse tar — first pass extracts package.json to find entry points,
+  // second pass uses those entry points plus static patterns
+  const allEntries = parseTar(decompressed, packageName, true /* returnAll */);
+  const pkgJsonEntry = allEntries.find(f => f.path === 'package.json');
+
+  // Extract additional file patterns from package.json main/bin/exports fields
+  const extraPatterns = [];
+  if (pkgJsonEntry) {
+    try {
+      const pkgData = JSON.parse(pkgJsonEntry.content);
+      if (typeof pkgData.main === 'string') extraPatterns.push(pkgData.main);
+      if (typeof pkgData.bin === 'string') {
+        extraPatterns.push(pkgData.bin);
+      } else if (pkgData.bin && typeof pkgData.bin === 'object') {
+        extraPatterns.push(...Object.values(pkgData.bin).filter(v => typeof v === 'string'));
+      }
+      // exports can be string or object with nested conditions
+      if (typeof pkgData.exports === 'string') {
+        extraPatterns.push(pkgData.exports);
+      } else if (pkgData.exports && typeof pkgData.exports === 'object') {
+        const extractExports = (obj) => {
+          for (const v of Object.values(obj)) {
+            if (typeof v === 'string') extraPatterns.push(v);
+            else if (v && typeof v === 'object') extractExports(v);
+          }
+        };
+        extractExports(pkgData.exports);
+      }
+    } catch { /* malformed package.json — proceed with static patterns */ }
+  }
+
+  // Build the final file list from static patterns + dynamic package.json refs
+  const files = allEntries.filter(f => {
+    if (f.path === 'package.json') return false; // Already used for metadata
+    // Match static inspectable patterns
+    if (INSPECTABLE_PATTERNS.some(p => p.test('/' + f.path))) return true;
+    // Match dynamic patterns from package.json
+    const normalized = f.path.replace(/^\.\//, '');
+    return extraPatterns.some(ep => {
+      const norm = ep.replace(/^\.\//, '');
+      return normalized === norm || normalized.endsWith('/' + norm);
+    });
+  }).slice(0, MAX_FILES);
+
   return files;
 }
 
@@ -179,8 +263,12 @@ function gunzip(buffer) {
 /**
  * Minimal POSIX tar parser — extracts files matching our inspection patterns.
  * No external dependency, just raw 512-byte header parsing.
+ *
+ * @param {Buffer} buffer — decompressed tar data
+ * @param {string} packageName — for logging
+ * @param {boolean} returnAll — if true, return ALL text files (for package.json parsing)
  */
-function parseTar(buffer, packageName) {
+function parseTar(buffer, packageName, returnAll = false) {
   const files = [];
   let offset = 0;
   let fileCount = 0;
@@ -200,6 +288,12 @@ function parseTar(buffer, packageName) {
     const sizeStr = header.subarray(124, 136).toString('utf8').trim();
     const size = parseInt(sizeStr, 8) || 0;
 
+    // Guard against integer overflow — a malicious tar header with a huge size
+    // would corrupt offset calculations and read from wrong positions
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_DECOMPRESSED_SIZE) {
+      break; // Treat as end of archive
+    }
+
     // Extract type flag (byte 156): '0' or '\0' = regular file
     const typeFlag = header[156];
     const isFile = typeFlag === 48 || typeFlag === 0; // '0' or NUL
@@ -214,16 +308,25 @@ function parseTar(buffer, packageName) {
 
     offset += 512; // Move past header
 
-    if (isFile && size > 0) {
-      // Check if this file matches our inspection patterns
-      const shouldInspect = size <= MAX_INSPECT_SIZE &&
-        fileCount < MAX_FILES &&
-        INSPECTABLE_PATTERNS.some(p => p.test('/' + relativePath));
+    if (isFile && size > 0 && size <= MAX_INSPECT_SIZE) {
+      if (returnAll) {
+        // In returnAll mode, extract all reasonably-sized text files
+        // (caller will filter by pattern + package.json refs)
+        if (fileCount < MAX_FILES * 3 && /\.(js|mjs|cjs|json|py|wasm)$/.test(relativePath)) {
+          const content = buffer.subarray(offset, offset + size).toString('utf8');
+          files.push({ path: relativePath, content, size });
+          fileCount++;
+        }
+      } else {
+        // Legacy mode: only extract files matching static patterns
+        const shouldInspect = fileCount < MAX_FILES &&
+          INSPECTABLE_PATTERNS.some(p => p.test('/' + relativePath));
 
-      if (shouldInspect) {
-        const content = buffer.subarray(offset, offset + size).toString('utf8');
-        files.push({ path: relativePath, content, size });
-        fileCount++;
+        if (shouldInspect) {
+          const content = buffer.subarray(offset, offset + size).toString('utf8');
+          files.push({ path: relativePath, content, size });
+          fileCount++;
+        }
       }
     }
 
@@ -260,10 +363,13 @@ export async function getPypiTarballUrl(packageName, version) {
     // Find the sdist (.tar.gz) URL — preferred for source inspection
     const urls = data.urls || [];
     const sdist = urls.find(u => u.packagetype === 'sdist');
-    if (sdist) return sdist.url;
+    const url = sdist?.url || urls[0]?.url || null;
 
-    // Fall back to first available file
-    return urls[0]?.url || null;
+    // Validate the URL before returning — SSRF prevention
+    if (url) {
+      try { validateTarballUrl(url); } catch { return null; }
+    }
+    return url;
   } catch {
     return null;
   }
