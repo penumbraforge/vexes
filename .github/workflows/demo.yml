@@ -1,0 +1,23 @@
+name: "Demo: See vexes in action"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  demo:
+    name: Scan demo project (npm + PyPI + Cargo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: "Step 1: Vulnerability scan across 3 ecosystems"
+        run: node bin/vexes.js scan --path demo || true
+
+      - name: "Step 2: Deep behavioral analysis (4-layer engine)"
+        run: node bin/vexes.js analyze --path demo || true
+
+      - name: "Step 3: Verified fix recommendations"
+        run: node bin/vexes.js fix --path demo || true

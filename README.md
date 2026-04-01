@@ -12,6 +12,8 @@ Zero dependencies. Pure Node.js. Catches real supply chain attacks.
 npx @penumbraforge/vexes scan
 ```
 
+> **[See it in action](https://github.com/penumbraforge/vexes/actions/workflows/demo.yml)** — click "Run workflow" to watch vexes scan a demo project with real vulnerabilities across npm, PyPI, and Cargo. No install needed.
+
 ```
 $ vexes scan
 
