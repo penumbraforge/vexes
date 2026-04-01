@@ -7,6 +7,11 @@
 
 Zero dependencies. Pure Node.js. Catches real supply chain attacks.
 
+```bash
+# Try it now — no install required
+npx @penumbraforge/vexes scan
+```
+
 ```
 $ vexes scan
 
