@@ -1,0 +1,41 @@
+name: vexes
+description: Cross-ecosystem dependency security scanner — catches supply chain attacks that vulnerability databases miss
+author: Shadoe Myers
+
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  command:
+    description: 'Command to run: scan, analyze, or monitor'
+    required: false
+    default: 'scan'
+  severity:
+    description: 'Minimum severity to report: low, moderate, high, critical'
+    required: false
+    default: 'high'
+  path:
+    description: 'Path to scan'
+    required: false
+    default: '.'
+  args:
+    description: 'Additional arguments to pass to vexes'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Run vexes
+      shell: bash
+      run: |
+        npx --yes @penumbraforge/vexes@latest ${{ inputs.command }} \
+          --path ${{ inputs.path }} \
+          --severity ${{ inputs.severity }} \
+          ${{ inputs.args }}

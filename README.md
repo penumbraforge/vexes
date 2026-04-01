@@ -1,5 +1,8 @@
 # vexes
 
+[![CI](https://github.com/penumbraforge/vexes/actions/workflows/ci.yml/badge.svg)](https://github.com/penumbraforge/vexes/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@penumbraforge/vexes)](https://www.npmjs.com/package/@penumbraforge/vexes)
+
 **Cross-ecosystem dependency security scanner. Shakes the tree to see what falls.**
 
 Zero dependencies. Pure Node.js. Catches real supply chain attacks.
@@ -162,12 +165,29 @@ vexes monitor --watch               # Watch lockfiles + poll OSV hourly
 vexes monitor --watch --interval 5  # Poll every 5 minutes
 ```
 
-**GitHub Actions example:**
+**GitHub Action:**
+```yaml
+# .github/workflows/vexes.yml
+name: Dependency Security
+on: [push, pull_request]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: penumbraforge/vexes@v0
+        with:
+          command: scan
+          severity: high
+```
+
+**Or run directly:**
 ```yaml
 - name: Security scan
   run: npx @penumbraforge/vexes monitor --ci --severity high
 
-# Or with SARIF upload to GitHub Advanced Security:
+# With SARIF upload to GitHub Advanced Security:
 - name: Security scan (SARIF)
   run: npx @penumbraforge/vexes monitor --ci --sarif > results.sarif
 - name: Upload SARIF
