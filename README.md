@@ -51,9 +51,9 @@ vexes is a dependency security scanner that goes beyond vulnerability databases.
 | **3. Behavioral Fingerprinting** | Diffs capability profiles between versions | A utility library that suddenly gains network+exec capabilities |
 | **4. Registry Metadata** | Analyzes publish history, maintainers, timing | Account takeovers, rapid publishes, dormant package reactivation |
 
-## Proven detection
+## Detection testing
 
-The red team test suite reconstructs **9 real-world attacks** and proves vexes catches them:
+The red team test suite reconstructs known supply chain attacks and checks that vexes flags each one:
 
 - **axios RAT** (March 2026) -- Hijacked maintainer account, hidden dependency with RAT dropper
 - **Shai-Hulud worm** (September 2025) -- Phished credentials, self-replicating worm via chalk/debug
