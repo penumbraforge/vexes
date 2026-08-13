@@ -172,6 +172,20 @@ vexes monitor --watch               # Watch lockfiles + poll OSV hourly
 vexes monitor --watch --interval 5  # Poll every 5 minutes
 ```
 
+### `vexes explain` -- AI-assisted triage
+
+Turns a wall of CVEs into a prioritized, plain-English action plan: what to fix first, why it matters (blast radius), and the upgrade sequence. **Opt-in and privacy-preserving** -- it calls the Claude API only when `ANTHROPIC_API_KEY` is set. The scanner itself stays fully deterministic and offline; this is a layer on top, not in the middle.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+vexes scan --format json | vexes explain   # Triage a piped scan
+vexes explain --input report.json          # Triage a saved report
+vexes explain --path ./my-project          # Scan, then triage
+```
+
+Findings are summarized (package, version, severity, advisory, fix) before sending -- no source code leaves your machine. Set `VEXES_AI_MODEL` to override the model (default `claude-sonnet-5`).
+
 **GitHub Action:**
 ```yaml
 # .github/workflows/vexes.yml

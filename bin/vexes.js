@@ -67,6 +67,12 @@ async function main() {
       return await runMonitor(flags, args);
     }
 
+    case 'explain':
+    case 'triage': {
+      const { runExplain } = await import('../src/commands/explain.js');
+      return await runExplain(flags, args);
+    }
+
     default:
       printHelp();
       return EXIT.OK;
@@ -86,6 +92,7 @@ function printHelp() {
     fix        Verified fix recommendations with safe upgrade commands
     guard      Pre-install protection via lockfile diffing
     monitor    CI integration (GitHub Actions) + continuous watch
+    explain    AI-assisted triage of findings ${C.dim}(needs ANTHROPIC_API_KEY)${C.reset}
     help       Show this help
     version    Show version
 
@@ -127,6 +134,11 @@ function printHelp() {
     --severity <level>   CI fail threshold ${C.dim}(default: high)${C.reset}
     --interval <min>     Watch poll interval in minutes ${C.dim}(default: 60)${C.reset}
     --sarif              SARIF output for GitHub Advanced Security
+
+  ${C.bold}EXPLAIN OPTIONS${C.reset} ${C.dim}(AI triage — opt-in, needs ANTHROPIC_API_KEY)${C.reset}
+    vexes scan --format json | vexes explain   Triage a piped scan
+    --input <file>       Triage a saved scan JSON report
+    --path <dir>         Or scan this dir first, then triage ${C.dim}(default: cwd)${C.reset}
 
   ${C.bold}CONFIG${C.reset}
     Project: .vexesrc.json in project root

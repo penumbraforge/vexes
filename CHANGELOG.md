@@ -9,6 +9,13 @@ The hardening release. SARIF output for GitHub code scanning, a rewritten
 Action that can't be injection-attacked, and a batch of correctness fixes.
 
 ### Added
+- **AI-assisted triage** — `vexes explain` (alias `triage`) turns a wall of
+  CVEs into a prioritized, plain-English action plan: what to fix first, the
+  blast radius, and the upgrade sequence. Opt-in and privacy-preserving —
+  it calls the Claude API only when `ANTHROPIC_API_KEY` is set, and the
+  scanner itself stays fully deterministic and offline. Composes over a scan:
+  `vexes scan --format json | vexes explain`, `--input <report.json>`, or a
+  fresh `--path <dir>` scan. Zero new dependencies (native fetch).
 - **SARIF 2.1.0 output** — `vexes scan --format sarif` (or `--sarif <file>`
   to write a report) emits a SARIF document for
   github/codeql-action/upload-sarif and any SARIF consumer: one rule per
