@@ -1,6 +1,6 @@
 {
   "name": "@penumbraforge/vexes",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Cross-ecosystem dependency security scanner. Shakes the tree to see what falls. Zero dependencies.",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
     "bin/",
     "src/",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "keywords": [
     "security",
