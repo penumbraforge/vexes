@@ -95,7 +95,7 @@ vexes scan --json                   # Machine-readable JSON output
 vexes scan --cached                 # Use cached results (skip freshness check)
 ```
 
-**Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.sum), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml), Homebrew (Brewfile.lock.json, Brewfile)
+**Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.sum), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml)
 
 **Exit codes:** `0` = clean, `1` = vulnerabilities found, `2` = error/incomplete scan
 
@@ -271,7 +271,6 @@ src/
     php.js            composer.lock
     dotnet.js         packages.lock.json (NuGet)
     java.js           gradle.lockfile, pom.xml
-    brew.js           Brewfile.lock.json, Brewfile
   advisories/
     osv.js            OSV.dev batch queries, CVSS v3.1 scoring, severity mapping
     npm-registry.js   npm registry metadata + provenance attestations

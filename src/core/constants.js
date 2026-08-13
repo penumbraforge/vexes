@@ -71,12 +71,9 @@ export const ECOSYSTEMS = Object.freeze({
     manifests: ['pom.xml'],
     registryUrl: null,
   },
-  brew: {
-    osvId: null, // Homebrew is not in OSV
-    lockfiles: ['Brewfile.lock.json'],
-    manifests: ['Brewfile'],
-    registryUrl: null,
-  },
+  // Homebrew was removed in 0.3.0: OSV has no Homebrew ecosystem, so scans
+  // returned only advisory-free noise. Restorable from git if a real data
+  // source appears (see src/parsers/brew.js in history).
 });
 
 // Cache

@@ -2,7 +2,7 @@
 
 ## Description (paste into repo About)
 
-Cross-ecosystem dependency security scanner with 4-layer behavioral analysis. Detects the axios RAT supply chain attack and similar threats. Scans npm, PyPI, Cargo, and Homebrew via AST code inspection, behavioral fingerprinting, dependency graph profiling, and registry metadata analysis. Pre-install guard, verified fixes, CI/CD with SARIF. Zero dependencies.
+Cross-ecosystem dependency security scanner with 4-layer behavioral analysis. Detects the axios RAT supply chain attack and similar threats. Scans npm, PyPI, Cargo, Go, Ruby, PHP, NuGet, and Java via AST code inspection, behavioral fingerprinting, dependency graph profiling, and registry metadata analysis. Pre-install guard, verified fixes, CI/CD with SARIF. Zero dependencies.
 
 ## Topics (add to repo)
 
@@ -14,4 +14,4 @@ https://github.com/penumbraforge/vexes/wiki
 
 ## Features summary (for GitHub About section, 350 char limit)
 
-Zero-dependency security scanner that detects the axios RAT attack and similar supply chain threats. Scans npm/PyPI/Cargo/Brew with 4-layer detection: AST analysis, dependency graph profiling, behavioral fingerprinting, registry metadata. Pre-install guard, verified fixes, CI/CD with SARIF.
+Zero-dependency security scanner that detects the axios RAT attack and similar supply chain threats. Scans npm/PyPI/Cargo/Go/Ruby/PHP/NuGet/Java with 4-layer detection: AST analysis, dependency graph profiling, behavioral fingerprinting, registry metadata. Pre-install guard, verified fixes, CI/CD with SARIF.

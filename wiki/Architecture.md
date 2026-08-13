@@ -77,7 +77,7 @@ Risk Levels:
 Lockfiles/Manifests
         |
         v
-   [ Parsers ]  npm.js, pnpm.js, yarn.js, pypi.js, cargo.js, go.js, ruby.js, php.js, dotnet.js, java.js, brew.js
+   [ Parsers ]  npm.js, pnpm.js, yarn.js, pypi.js, cargo.js, go.js, ruby.js, php.js, dotnet.js, java.js
         |
         v
   Dependency List

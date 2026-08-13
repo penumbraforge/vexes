@@ -24,7 +24,7 @@ Enumerate dependencies from lockfiles, query OSV.dev, and report known vulnerabi
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--path <dir>` | Target directory | Current working directory |
-| `--ecosystem <name>` | Filter to one ecosystem: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java`, `brew` | All detected |
+| `--ecosystem <name>` | Filter to one ecosystem: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java` | All detected |
 | `--severity <level>` | Minimum severity to report: `critical`, `high`, `moderate`, `low` | `moderate` |
 | `--fix` | Show upgrade commands for fixable vulnerabilities | Off |
 | `--cached` | Use cached results without freshness check | Off |
@@ -41,7 +41,6 @@ Enumerate dependencies from lockfiles, query OSV.dev, and report known vulnerabi
 | PHP | `composer.lock` | `composer.json` |
 | NuGet | `packages.lock.json` | `*.csproj` |
 | Java | `gradle.lockfile` | `pom.xml` |
-| Homebrew | `Brewfile.lock.json` | `Brewfile` |
 
 ### JSON output schema
 

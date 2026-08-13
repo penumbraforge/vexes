@@ -38,7 +38,7 @@ Same format as project config. Applied before project config, so project setting
 
 Array of ecosystems to scan. Default: `["npm", "pypi", "cargo", "go", "ruby", "php", "nuget", "java"]`.
 
-Valid values: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java`, `brew`.
+Valid values: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java`.
 
 **CLI override:** `--ecosystem npm` (sets a single ecosystem)
 

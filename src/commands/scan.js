@@ -9,7 +9,6 @@ import { discover as discoverPnpm, parseLockfile as parsePnpmLock } from '../par
 import { discover as discoverYarn, parseLockfile as parseYarnLock } from '../parsers/yarn.js';
 import { discover as discoverPypi, parseFile as parsePypiFile } from '../parsers/pypi.js';
 import { discover as discoverCargo, parseLockfile as parseCargoLock } from '../parsers/cargo.js';
-import { discover as discoverBrew, parseLockfile as parseBrewLock, parseManifest as parseBrewManifest } from '../parsers/brew.js';
 import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from '../parsers/generic.js';
 import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
@@ -180,37 +179,6 @@ export async function runScan(flags, args) {
       }
     }
 
-    if (ecoName === 'brew') {
-      const { lockfiles, manifests } = discoverBrew(targetDir);
-      for (const lf of lockfiles) {
-        try {
-          const deps = parseBrewLock(lf);
-          allDeps.push(...deps);
-          ecosystemsFound.add('brew');
-          dependencyFileCount++;
-        } catch (err) {
-          const msg = `failed to parse ${basename(lf)}: ${err.message}`;
-          log.error(msg);
-          warnings.push(msg);
-          parseFailures++;
-        }
-      }
-      if (lockfiles.length === 0) {
-        for (const mf of manifests) {
-          try {
-            const deps = parseBrewManifest(mf);
-            allDeps.push(...deps);
-            ecosystemsFound.add('brew');
-            dependencyFileCount++;
-          } catch (err) {
-            const msg = `failed to parse ${basename(mf)}: ${err.message}`;
-            log.error(msg);
-            warnings.push(msg);
-            parseFailures++;
-          }
-        }
-      }
-    }
   }
 
   // Distinguish "no dependency files found" from "files found but parsing failed"
