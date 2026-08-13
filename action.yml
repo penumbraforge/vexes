@@ -32,6 +32,15 @@ inputs:
             sarif_file: vexes.sarif
     required: false
     default: ''
+  fail-on-findings:
+    description: >-
+      When 'true', the action fails the build if vexes reports findings
+      (exit 1) or an incomplete scan (exit 2). Default 'false' — the action
+      succeeds and exposes counts + exit-code as outputs for the caller to
+      act on. (A composite action that fails does not expose its outputs, so
+      gating and output-reading are mutually exclusive by design.)
+    required: false
+    default: 'false'
   node-version:
     description: 'Node.js version to run vexes with'
     required: false
@@ -143,14 +152,15 @@ runs:
 
     - name: Fail on findings
       shell: bash
-      # Turn vexes's exit code into the action's outcome, AFTER outputs are set.
-      # 1 = findings present, 2 = incomplete/error. Callers who want findings to
-      # be non-blocking can set continue-on-error on their `uses:` step and read
-      # the outputs instead.
+      # Opt-in gate. Default is OFF so the action succeeds and its outputs
+      # (counts, exit-code, sarif-file) reach the caller — a composite action
+      # that fails does not expose outputs at all. Set fail-on-findings: true
+      # to make findings block the build instead.
       env:
         CODE: ${{ steps.vexes.outputs.exit-code }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
       run: |
-        if [ "$CODE" != "0" ]; then
+        if [ "$FAIL_ON_FINDINGS" = "true" ] && [ "$CODE" != "0" ]; then
           echo "::error title=vexes::scan exited $CODE (1 = findings, 2 = incomplete/error)" >&2
           exit "$CODE"
         fi

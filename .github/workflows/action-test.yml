@@ -17,9 +17,9 @@ jobs:
       - name: Run vexes action on demo/
         id: scan
         uses: ./
-        # The demo fixtures contain known vulnerabilities, so vexes exits 1.
-        # We assert on the action's OUTPUTS, not on step success.
-        continue-on-error: true
+        # Default (fail-on-findings: false) → the action succeeds and exposes
+        # outputs even though the demo fixtures contain vulnerabilities. We
+        # assert on those outputs.
         with:
           command: scan
           path: demo

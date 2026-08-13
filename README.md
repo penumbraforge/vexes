@@ -198,10 +198,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: penumbraforge/vexes@v0
+        id: vexes
         with:
           command: scan
           severity: high
+          sarif-file: vexes.sarif     # optional: surface in the Security tab
+          fail-on-findings: 'true'     # optional: block the build on findings
+      # Pair with upload-sarif to see results in GitHub code scanning:
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: vexes.sarif
 ```
+
+By default the action **succeeds and exposes outputs** (`vulnerabilities`, `critical`, `high`, `moderate`, `exit-code`, `sarif-file`) so you can branch on them. Set `fail-on-findings: 'true'` to make it a hard gate instead.
 
 **Or run directly:**
 ```yaml
