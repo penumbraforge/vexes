@@ -136,5 +136,21 @@ runs:
           echo "sarif-file=$INPUT_SARIF_FILE" >> "$GITHUB_OUTPUT"
         fi
 
-        # Propagate vexes's exit code so the step fails on findings / errors.
-        exit $CODE
+        # IMPORTANT: this step must exit 0. A composite-action step that exits
+        # non-zero aborts the action and DISCARDS the outputs written above.
+        # The exit code is surfaced as an output; the next step turns it into
+        # a build failure so callers still fail on findings.
+
+    - name: Fail on findings
+      shell: bash
+      # Turn vexes's exit code into the action's outcome, AFTER outputs are set.
+      # 1 = findings present, 2 = incomplete/error. Callers who want findings to
+      # be non-blocking can set continue-on-error on their `uses:` step and read
+      # the outputs instead.
+      env:
+        CODE: ${{ steps.vexes.outputs.exit-code }}
+      run: |
+        if [ "$CODE" != "0" ]; then
+          echo "::error title=vexes::scan exited $CODE (1 = findings, 2 = incomplete/error)" >&2
+          exit "$CODE"
+        fi
