@@ -360,6 +360,54 @@ function prompt() {
   });
 }
 
+// Shell rc markers that delimit the vexes-managed block. Shared by setup and
+// uninstall so the two can never drift apart.
+const GUARD_MARKER = '# --- vexes guard start ---';
+const GUARD_END_MARKER = '# --- vexes guard end ---';
+
+/**
+ * Remove the vexes-managed block from shell rc content \u2014 PURE, no I/O.
+ *
+ * Returns one of:
+ *   { status: 'absent' }               \u2014 start marker not present
+ *   { status: 'corrupt', reason }      \u2014 end marker missing or before start;
+ *                                        splicing here would corrupt the file
+ *   { status: 'ok', cleaned }          \u2014 content with the block removed
+ *
+ * The corrupt case is the bug this guards against: with `endIdx === -1`,
+ * `content.slice(endIdx + endMarker.length + 1)` splices at a garbage offset
+ * and shreds the user's rc file.
+ */
+export function stripGuardBlock(content, marker = GUARD_MARKER, endMarker = GUARD_END_MARKER) {
+  const startIdx = content.indexOf(marker);
+  if (startIdx === -1) return { status: 'absent' };
+
+  const endIdx = content.indexOf(endMarker);
+  if (endIdx === -1) {
+    return { status: 'corrupt', reason: `end marker "${endMarker}" is missing` };
+  }
+  if (endIdx < startIdx) {
+    return { status: 'corrupt', reason: 'markers are inverted (end appears before start)' };
+  }
+
+  const after = endIdx + endMarker.length;
+  // Consume a single trailing newline if present so we don't leave a blank line;
+  // never over-read into following content when the newline is absent.
+  const tail = content[after] === '\n' ? after + 1 : after;
+  const cleaned = content.slice(0, startIdx) + content.slice(tail);
+  return { status: 'ok', cleaned };
+}
+
+/**
+ * Write a one-shot backup of an rc file before we touch it. If the backup
+ * can't be written, the caller aborts rather than risk an unrecoverable edit.
+ */
+function backupRc(rcFile, content) {
+  const backupPath = `${rcFile}.vexes-backup`;
+  writeFileSync(backupPath, content);
+  return backupPath;
+}
+
 /**
  * Install shell wrappers that intercept npm/pip install.
  */
@@ -369,25 +417,31 @@ function runSetup(flags) {
                : shell === 'fish' ? join(homedir(), '.config', 'fish', 'config.fish')
                : join(homedir(), '.bashrc');
 
-  const marker = '# --- vexes guard start ---';
-  const endMarker = '# --- vexes guard end ---';
+  const existingContent = existsSync(rcFile) ? readFileSync(rcFile, 'utf8') : '';
 
   // Check if already installed
-  if (existsSync(rcFile)) {
-    const content = readFileSync(rcFile, 'utf8');
-    if (content.includes(marker)) {
-      out(`  ${C.yellow}Guard is already installed in ${rcFile}${C.reset}`);
-      out(`  ${C.dim}Run vexes guard --uninstall to remove.${C.reset}\n`);
-      return EXIT.OK;
-    }
+  if (existingContent.includes(GUARD_MARKER)) {
+    out(`  ${C.yellow}Guard is already installed in ${rcFile}${C.reset}`);
+    out(`  ${C.dim}Run vexes guard --uninstall to remove.${C.reset}\n`);
+    return EXIT.OK;
   }
 
   const wrapperCode = shell === 'fish' ? buildFishWrapper() : buildBashWrapper();
-  const block = `\n${marker}\n${wrapperCode}\n${endMarker}\n`;
+  const block = `\n${GUARD_MARKER}\n${wrapperCode}\n${GUARD_END_MARKER}\n`;
+
+  // Back up the rc file BEFORE any modification, so a bad append is recoverable.
+  let backupPath;
+  try {
+    backupPath = backupRc(rcFile, existingContent);
+  } catch (err) {
+    log.error(`could not write backup for ${rcFile}: ${err.message} \u2014 aborting to avoid an unrecoverable edit`);
+    return EXIT.ERROR;
+  }
 
   try {
     appendFileSync(rcFile, block);
     out(`\n  ${C.green}\u2713 Guard installed in ${rcFile}${C.reset}`);
+    out(`  ${C.dim}Backup saved to ${backupPath}${C.reset}`);
     out(`  ${C.dim}Restart your shell or run: source ${rcFile}${C.reset}`);
     out(`\n  When active, ${C.bold}npm install${C.reset} will automatically run ${C.bold}vexes guard${C.reset} first.\n`);
     return EXIT.OK;
@@ -409,20 +463,37 @@ function runUninstall(flags) {
   }
 
   const content = readFileSync(rcFile, 'utf8');
-  const marker = '# --- vexes guard start ---';
-  const endMarker = '# --- vexes guard end ---';
+  const result = stripGuardBlock(content);
 
-  const startIdx = content.indexOf(marker);
-  const endIdx = content.indexOf(endMarker);
-
-  if (startIdx === -1) {
+  if (result.status === 'absent') {
     out(`  ${C.dim}Guard is not installed in ${rcFile}.${C.reset}`);
     return EXIT.OK;
   }
 
-  const cleaned = content.slice(0, startIdx) + content.slice(endIdx + endMarker.length + 1);
-  writeFileSync(rcFile, cleaned);
-  out(`  ${C.green}\u2713 Guard removed from ${rcFile}${C.reset}\n`);
+  if (result.status === 'corrupt') {
+    // Refuse to splice \u2014 a bad offset would shred the rc file.
+    log.error(`cannot safely remove guard from ${rcFile}: ${result.reason}`);
+    out(`  ${C.red}! Refusing to edit ${rcFile} \u2014 ${result.reason}.${C.reset}`);
+    out(`  ${C.dim}Remove the block manually: delete everything from${C.reset}`);
+    out(`  ${C.dim}  ${GUARD_MARKER}${C.reset}`);
+    out(`  ${C.dim}down to${C.reset}`);
+    out(`  ${C.dim}  ${GUARD_END_MARKER}${C.reset}`);
+    out(`  ${C.dim}(restore the missing marker first if it was deleted).${C.reset}\n`);
+    return EXIT.ERROR;
+  }
+
+  // Back up BEFORE writing, so the removal is recoverable.
+  let backupPath;
+  try {
+    backupPath = backupRc(rcFile, content);
+  } catch (err) {
+    log.error(`could not write backup for ${rcFile}: ${err.message} \u2014 aborting to avoid an unrecoverable edit`);
+    return EXIT.ERROR;
+  }
+
+  writeFileSync(rcFile, result.cleaned);
+  out(`  ${C.green}\u2713 Guard removed from ${rcFile}${C.reset}`);
+  out(`  ${C.dim}Backup saved to ${backupPath}${C.reset}\n`);
   return EXIT.OK;
 }
 
