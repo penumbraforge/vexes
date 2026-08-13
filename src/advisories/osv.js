@@ -216,7 +216,9 @@ async function fetchVulnDetails(ids) {
 /**
  * Normalize an OSV vulnerability response into our internal format.
  */
-function normalizeVuln(osvVuln, pkg) {
+// Exported for tests: severity extraction must be verifiable against real
+// OSV records (PYSEC/RUSTSEC/GO advisories carry only CVSS vector strings).
+export function normalizeVuln(osvVuln, pkg) {
   const severity = extractSeverity(osvVuln);
   const fixed = extractFixedVersion(osvVuln, pkg);
   const aliases = osvVuln.aliases || [];
@@ -253,15 +255,19 @@ function extractSeverity(osvVuln) {
     if (normalized) return normalized;
   }
 
-  // Check CVSS scores
+  // Check CVSS scores.
+  // OSV puts the CVSS *vector string* in severity[].score (there is no
+  // .vector field), so every entry must be shape-dispatched: numeric values
+  // pass through, vector strings go through the CVSS math. Only finite
+  // numbers may reach highestScore — NaN would make every threshold below
+  // false and misreport the advisory.
   const severities = osvVuln.severity || [];
   let highestScore = 0;
 
   for (const s of severities) {
-    if (s.score) {
-      highestScore = Math.max(highestScore, s.score);
-    } else if (s.type === 'CVSS_V3' && s.vector) {
-      highestScore = Math.max(highestScore, parseCvssScore(s.vector));
+    const score = parseSeverityEntry(s);
+    if (score !== null) {
+      highestScore = Math.max(highestScore, score);
     }
   }
 
@@ -281,6 +287,33 @@ function extractSeverity(osvVuln) {
 
   // Unknown severity on a security tool = assume worst case
   return 'CRITICAL';
+}
+
+/**
+ * Parse one OSV severity[] entry into a finite base score, or null.
+ * Handles: numeric scores, numeric strings, CVSS v3.x vectors (exact spec
+ * math), and CVSS v2/v4 vectors (attack-vector heuristic inside
+ * parseCvssScore). Returns null for anything unparseable so the caller
+ * never sees NaN.
+ */
+function parseSeverityEntry(s) {
+  const raw = s?.score ?? s?.vector;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+
+  const str = String(raw).trim();
+  if (str === '') return null;
+
+  const numeric = Number(str);
+  if (Number.isFinite(numeric)) return numeric;
+
+  // CVSS v3/v4 vectors are prefixed; v2 vectors start bare at "AV:".
+  if (/^CVSS:\d/i.test(str) || /^AV:/i.test(str)) {
+    const score = parseCvssScore(str);
+    return Number.isFinite(score) ? score : null;
+  }
+
+  return null;
 }
 
 /**

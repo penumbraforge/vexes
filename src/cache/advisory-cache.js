@@ -4,6 +4,12 @@ import { join } from 'node:path';
 import { CACHE_DIR, ADVISORY_TTL_MS, METADATA_TTL_MS } from '../core/constants.js';
 import { log } from '../core/logger.js';
 
+// Bump whenever the *shape or meaning* of cached rows changes, not just the
+// table DDL. Cached advisories store normalized severities — v2 invalidates
+// caches written before the CVSS vector-parsing fix, which recorded false
+// CRITICALs for every PYSEC/RUSTSEC/GO advisory.
+const CACHE_SCHEMA_VERSION = 2;
+
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS advisories (
     ecosystem TEXT NOT NULL,
@@ -58,6 +64,16 @@ export class AdvisoryCache {
 
     const dbPath = join(cacheDir, 'cache.db');
     this.#db = new DatabaseSync(dbPath);
+
+    const { user_version: storedVersion } = this.#db.prepare('PRAGMA user_version').get();
+    if (storedVersion !== CACHE_SCHEMA_VERSION) {
+      this.#db.exec('DROP TABLE IF EXISTS advisories; DROP TABLE IF EXISTS metadata; DROP TABLE IF EXISTS signals;');
+      this.#db.exec(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
+      if (storedVersion > 0) {
+        log.debug(`cache schema ${storedVersion} → ${CACHE_SCHEMA_VERSION}, stale entries dropped`);
+      }
+    }
+
     this.#db.exec(SCHEMA);
     this.#prepareStatements();
     log.debug(`cache opened at ${dbPath}`);
