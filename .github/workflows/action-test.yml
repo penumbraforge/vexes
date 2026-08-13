@@ -1,0 +1,74 @@
+name: Action self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  action:
+    name: Run the composite action against the demo fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run vexes action on demo/
+        id: scan
+        uses: ./
+        # The demo fixtures contain known vulnerabilities, so vexes exits 1.
+        # We assert on the action's OUTPUTS, not on step success.
+        continue-on-error: true
+        with:
+          command: scan
+          path: demo
+          severity: moderate
+          sarif-file: vexes-demo.sarif
+
+      - name: Assert on action outputs
+        shell: bash
+        env:
+          VULNS: ${{ steps.scan.outputs.vulnerabilities }}
+          CRITICAL: ${{ steps.scan.outputs.critical }}
+          EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+          SARIF: ${{ steps.scan.outputs.sarif-file }}
+        run: |
+          set -euo pipefail
+          echo "outputs: vulnerabilities=$VULNS critical=$CRITICAL exit-code=$EXIT_CODE sarif=$SARIF"
+
+          # A non-zero vulnerability count proves the scan actually ran and parsed.
+          test -n "$VULNS"
+          test "$VULNS" -gt 0
+
+          # vexes exits 1 when findings are present.
+          test "$EXIT_CODE" = "1"
+
+          # The SARIF file must exist and be a valid SARIF 2.1.0 document with results.
+          test -f "$SARIF"
+          node -e '
+            const fs = require("fs");
+            const doc = JSON.parse(fs.readFileSync(process.env.SARIF, "utf8"));
+            if (doc.version !== "2.1.0") throw new Error("SARIF version is " + doc.version);
+            const results = doc.runs?.[0]?.results;
+            if (!Array.isArray(results) || results.length < 1) throw new Error("no SARIF results");
+            console.log("SARIF OK:", results.length, "results,", doc.runs[0].tool.driver.rules.length, "rules");
+          '
+
+      - name: Action rejects guard command
+        id: guard
+        uses: ./
+        continue-on-error: true
+        with:
+          command: guard
+          path: demo
+
+      - name: Assert guard was rejected
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.guard.outcome }}
+        run: |
+          set -euo pipefail
+          echo "guard step outcome: $OUTCOME"
+          # The allowlist must fail the step (exit 2) rather than run guard.
+          test "$OUTCOME" = "failure"

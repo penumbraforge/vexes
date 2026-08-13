@@ -8,7 +8,7 @@ branding:
 
 inputs:
   command:
-    description: 'Command to run: scan, analyze, or monitor'
+    description: 'Command to run: scan, analyze, or monitor (guard is rejected — it performs real installs)'
     required: false
     default: 'scan'
   severity:
@@ -19,10 +19,47 @@ inputs:
     description: 'Path to scan'
     required: false
     default: '.'
-  args:
-    description: 'Additional arguments to pass to vexes'
+  sarif-file:
+    description: >-
+      If set, also write a SARIF 2.1.0 report to this path. Pair it with
+      github/codeql-action/upload-sarif to surface findings in the Security tab:
+
+        - uses: penumbraforge/vexes@<ref>
+          with:
+            sarif-file: vexes.sarif
+        - uses: github/codeql-action/upload-sarif@v3
+          with:
+            sarif_file: vexes.sarif
     required: false
     default: ''
+  node-version:
+    description: 'Node.js version to run vexes with'
+    required: false
+    default: '24'
+  args:
+    description: 'Additional arguments passed through to vexes (space-split; use only trusted values)'
+    required: false
+    default: ''
+
+outputs:
+  vulnerabilities:
+    description: 'Total vulnerabilities (or flagged packages) found at or above the severity threshold'
+    value: ${{ steps.vexes.outputs.vulnerabilities }}
+  critical:
+    description: 'Number of CRITICAL findings'
+    value: ${{ steps.vexes.outputs.critical }}
+  high:
+    description: 'Number of HIGH findings'
+    value: ${{ steps.vexes.outputs.high }}
+  moderate:
+    description: 'Number of MODERATE findings'
+    value: ${{ steps.vexes.outputs.moderate }}
+  exit-code:
+    description: 'vexes exit code (0 clean, 1 findings, 2 incomplete/error)'
+    value: ${{ steps.vexes.outputs.exit-code }}
+  sarif-file:
+    description: 'Path to the written SARIF file, if sarif-file was requested'
+    value: ${{ steps.vexes.outputs.sarif-file }}
 
 runs:
   using: composite
@@ -30,12 +67,74 @@ runs:
     - name: Setup Node.js
       uses: actions/setup-node@v5
       with:
-        node-version: '22'
+        node-version: ${{ inputs.node-version }}
 
     - name: Run vexes
+      id: vexes
       shell: bash
+      # Every input is passed through env and referenced below as a quoted shell
+      # variable — NOTHING is interpolated into the run body with ${{ }}, so this
+      # step is not a template-injection sink (the old `npx @latest ${{ inputs.* }}`
+      # was). VEXES_BIN points at the PINNED action code shipped in this ref, so
+      # the action honors `uses:` and never fetches from the registry at runtime.
+      env:
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_SEVERITY: ${{ inputs.severity }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
+        INPUT_ARGS: ${{ inputs.args }}
+        VEXES_BIN: ${{ github.action_path }}/bin/vexes.js
       run: |
-        npx --yes @penumbraforge/vexes@latest ${{ inputs.command }} \
-          --path ${{ inputs.path }} \
-          --severity ${{ inputs.severity }} \
-          ${{ inputs.args }}
+        set -uo pipefail
+
+        # Allowlist the command. guard performs real package installs and is
+        # never permitted from CI.
+        case "$INPUT_COMMAND" in
+          scan|analyze|monitor) ;;
+          *)
+            echo "::error title=vexes::command '$INPUT_COMMAND' is not allowed — use scan, analyze, or monitor." >&2
+            exit 2
+            ;;
+        esac
+
+        # monitor only produces machine output in --ci mode.
+        EXTRA=()
+        if [ "$INPUT_COMMAND" = "monitor" ]; then EXTRA+=(--ci); fi
+
+        RESULT="$(mktemp)"
+
+        # Primary run: JSON, so we can parse structured outputs.
+        node "$VEXES_BIN" "$INPUT_COMMAND" "${EXTRA[@]}" \
+          --path "$INPUT_PATH" \
+          --severity "$INPUT_SEVERITY" \
+          --format json \
+          $INPUT_ARGS > "$RESULT"
+        CODE=$?
+
+        # Parse counts with node (no jq dependency) and write to $GITHUB_OUTPUT.
+        node -e '
+          const fs = require("fs");
+          let data = {};
+          try { data = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+          const s = data.summary || {};
+          const out = process.env.GITHUB_OUTPUT;
+          const w = (k, v) => fs.appendFileSync(out, k + "=" + v + "\n");
+          w("vulnerabilities", s.vulnerable ?? s.flagged ?? 0);
+          w("critical", s.critical ?? 0);
+          w("high", s.high ?? 0);
+          w("moderate", s.moderate ?? 0);
+        ' "$RESULT"
+        echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+
+        # Optional SARIF report for github/codeql-action/upload-sarif.
+        if [ -n "$INPUT_SARIF_FILE" ]; then
+          node "$VEXES_BIN" "$INPUT_COMMAND" "${EXTRA[@]}" \
+            --path "$INPUT_PATH" \
+            --severity "$INPUT_SEVERITY" \
+            --sarif "$INPUT_SARIF_FILE" \
+            $INPUT_ARGS || true
+          echo "sarif-file=$INPUT_SARIF_FILE" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Propagate vexes's exit code so the step fails on findings / errors.
+        exit $CODE

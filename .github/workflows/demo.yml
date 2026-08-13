@@ -13,11 +13,20 @@ jobs:
         with:
           node-version: 22
 
+      # No `|| true`: a real tool error (exit 2) must fail the job. The demo
+      # fixtures contain known vulnerabilities, so exit 1 (findings) is
+      # expected and tolerated; anything worse is a genuine regression.
       - name: "Step 1: Vulnerability scan across 3 ecosystems"
-        run: node bin/vexes.js scan --path demo || true
+        run: |
+          node bin/vexes.js scan --path demo || code=$?
+          test "${code:-0}" -le 1
 
       - name: "Step 2: Deep behavioral analysis (4-layer engine)"
-        run: node bin/vexes.js analyze --path demo || true
+        run: |
+          node bin/vexes.js analyze --path demo || code=$?
+          test "${code:-0}" -le 1
 
       - name: "Step 3: Verified fix recommendations"
-        run: node bin/vexes.js fix --path demo || true
+        run: |
+          node bin/vexes.js fix --path demo || code=$?
+          test "${code:-0}" -le 1
