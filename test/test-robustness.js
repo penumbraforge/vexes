@@ -127,8 +127,31 @@ describe('Config security', () => {
     assert.equal(config.__proto__, Object.prototype);
   });
 
-  it('loadConfig returns frozen object', () => {
-    const config = loadConfig('/tmp', {});
-    assert.ok(Object.isFrozen(config));
+  it('loadConfig isolates calls — flag writes never leak into DEFAULTS', () => {
+    // Call once with --json (mutates config.output.format), then plain.
+    const jsonConfig = loadConfig('/tmp', { json: true });
+    assert.equal(jsonConfig.output.format, 'json');
+
+    // A subsequent call with no flags must NOT see the previous json format.
+    const plainConfig = loadConfig('/tmp', {});
+    assert.equal(plainConfig.output.format, 'text',
+      'DEFAULTS.output was mutated by the previous call — isolation broken');
+
+    // The two configs must not share nested object references.
+    assert.notEqual(jsonConfig.output, plainConfig.output);
+    assert.notEqual(jsonConfig.cache, plainConfig.cache);
+  });
+
+  it('loadConfig does not mutate DEFAULTS across calls with different flags', () => {
+    // The cache-dir ~ expansion previously mutated the shared DEFAULTS.cache.dir.
+    const first = loadConfig('/tmp', { json: true });
+    const firstCacheDir = first.cache.dir;
+    // Mutate the returned config aggressively.
+    first.output.format = 'mutated';
+    first.cache.dir = '/somewhere/else';
+    // A fresh call must be pristine.
+    const second = loadConfig('/tmp', {});
+    assert.equal(second.output.format, 'text');
+    assert.equal(second.cache.dir, firstCacheDir);
   });
 });

@@ -89,7 +89,11 @@ export function loadConfig(dir, flags = {}) {
   const userConf = loadUserConfig();
   const projConf = findProjectConfig(dir);
 
-  let config = merge(DEFAULTS, userConf);
+  // Deep-clone DEFAULTS so nested objects (output, cache) are never aliased to
+  // the shared template. Without this, flag writes like `config.output.format`
+  // and the cache-dir `~` expansion below would mutate DEFAULTS in place and
+  // leak across every subsequent loadConfig() call in the same process.
+  let config = merge(structuredClone(DEFAULTS), userConf);
   config = merge(config, projConf);
 
   // CLI flag overrides with validation
@@ -155,7 +159,10 @@ export function loadConfig(dir, flags = {}) {
     }
   }
 
-  return Object.freeze(config);
+  // Not frozen: isolation now comes from the structuredClone above, not from
+  // immutability. Freezing only the top level gave false confidence — nested
+  // objects stayed mutable, which is exactly how the DEFAULTS leak happened.
+  return config;
 }
 
 /**
