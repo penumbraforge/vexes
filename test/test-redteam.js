@@ -27,6 +27,12 @@ import { POPULAR_NPM, POPULAR_PYPI } from '../src/core/allowlists.js';
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('RED TEAM: axios RAT (March 2026)', () => {
+  // Analyze "as of" the day after the attack. Fixtures keep the real historical
+  // dates; the injected clock keeps time-decay assertions stable forever.
+  // NEVER assert on time-decayed severities without injecting `now` — a
+  // wall-clock default turns the fixture into a time bomb.
+  const AS_OF = new Date('2026-03-31T00:00:00Z').getTime();
+
   // Simulate the compromised axios package metadata
   const axiosMetadata = {
     name: 'axios',
@@ -76,7 +82,7 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
   `;
 
   it('Layer 4: detects maintainer account change', async () => {
-    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm' });
+    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm', now: AS_OF });
     const maintainerSignal = result.signals.find(s => s.signal === 'MAINTAINER_CHANGE');
     assert.ok(maintainerSignal, 'MAINTAINER_CHANGE must be detected');
     assert.equal(maintainerSignal.severity, 'CRITICAL');
@@ -86,7 +92,7 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
     // The dep graph analysis would need to fetch metadata for plain-crypto-js
     // In the real pipeline, this triggers PHANTOM_DEPENDENCY because the dep is <7 days old
     // Here we test that the NEW_DEPENDENCY signal fires from the metadata
-    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm' });
+    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm', now: AS_OF });
     const depSignals = result.signals.filter(s =>
       s.signal === 'PHANTOM_DEPENDENCY' || s.signal === 'NEW_DEPENDENCY' ||
       s.signal === 'CIRCULAR_STAGING' || s.signal === 'NEW_DEP_HAS_INSTALL_SCRIPTS'
@@ -104,7 +110,7 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
   });
 
   it('composite risk score is CRITICAL or HIGH', async () => {
-    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm' });
+    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm', now: AS_OF });
     assert.ok(result.riskScore >= 15, `risk score ${result.riskScore} should be >= 15 (HIGH threshold)`);
     assert.ok(result.riskLevel === 'CRITICAL' || result.riskLevel === 'HIGH',
       `risk level ${result.riskLevel} must be CRITICAL or HIGH`);
@@ -818,5 +824,75 @@ describe('RED TEAM: False positive resistance', () => {
     const result = await analyzePackage(normalMeta, null, { ecosystem: 'npm' });
     assert.equal(result.riskLevel, 'NONE',
       `lodash should have NONE risk level, got ${result.riskLevel} with signals: ${result.signals.map(s => s.signal)}`);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// META: MAINTAINER_CHANGE time-decay boundary
+//
+// Pins the 90-day cliff in signals.js so it can never silently move, and
+// proves the injected clock controls it (the wall clock must not).
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('MAINTAINER_CHANGE time decay boundary', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const AS_OF = new Date('2026-01-01T00:00:00Z').getTime();
+
+  const transferMeta = (daysAgo) => ({
+    name: 'boundary-pkg',
+    latestVersion: '2.0.0',
+    previousVersion: '1.9.0',
+    maintainers: [{ name: 'new-owner' }],
+    latestPublisher: 'new-owner',
+    previousPublisher: 'old-owner',
+    maintainerChanged: true,
+    hasInstallScripts: false,
+    installScripts: {},
+    scripts: {},
+    dependencies: [],
+    addedDeps: [],
+    removedDeps: [],
+    latestPublishTime: new Date(AS_OF - daysAgo * DAY),
+    previousPublishTime: new Date(AS_OF - (daysAgo + 30) * DAY),
+    publishIntervalMs: 30 * DAY,
+    packageAgeMs: 5 * 365 * DAY,
+    majorJump: 0,
+    dormancyMs: null,
+    versionCount: 40,
+    repository: 'https://github.com/example/boundary-pkg',
+    license: 'MIT',
+  });
+
+  it('transfer 89 days ago is still CRITICAL (recent)', async () => {
+    const result = await analyzePackage(transferMeta(89), null, { ecosystem: 'npm', now: AS_OF });
+    const signal = result.signals.find(s => s.signal === 'MAINTAINER_CHANGE');
+    assert.ok(signal, 'MAINTAINER_CHANGE must fire');
+    assert.equal(signal.severity, 'CRITICAL');
+    assert.equal(signal.evidence.recentTransfer, true);
+  });
+
+  it('transfer 91 days ago decays to MODERATE (small team)', async () => {
+    const result = await analyzePackage(transferMeta(91), null, { ecosystem: 'npm', now: AS_OF });
+    const signal = result.signals.find(s => s.signal === 'MAINTAINER_CHANGE');
+    assert.ok(signal, 'MAINTAINER_CHANGE must fire');
+    assert.equal(signal.severity, 'MODERATE');
+    assert.equal(signal.evidence.recentTransfer, false);
+  });
+
+  it('old transfer in an org-managed package decays to LOW', async () => {
+    const meta = transferMeta(91);
+    meta.maintainers = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
+    const result = await analyzePackage(meta, null, { ecosystem: 'npm', now: AS_OF });
+    const signal = result.signals.find(s => s.signal === 'MAINTAINER_CHANGE');
+    assert.equal(signal.severity, 'LOW');
+  });
+
+  it('injected clock, not the wall clock, drives the decay', async () => {
+    // Same fixture, two different "now" values → two different severities.
+    const meta = transferMeta(89);
+    const recent = await analyzePackage(meta, null, { ecosystem: 'npm', now: AS_OF });
+    const later = await analyzePackage(meta, null, { ecosystem: 'npm', now: AS_OF + 10 * DAY });
+    assert.equal(recent.signals.find(s => s.signal === 'MAINTAINER_CHANGE').severity, 'CRITICAL');
+    assert.equal(later.signals.find(s => s.signal === 'MAINTAINER_CHANGE').severity, 'MODERATE');
   });
 });

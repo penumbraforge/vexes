@@ -28,10 +28,11 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
  * @param {Object} options
  * @param {string} options.ecosystem — 'npm' or 'pypi'
  * @param {Object} [options.config] — from .vexesrc.json (for signal overrides)
+ * @param {number} [options.now] — reference timestamp for time-decay math (defaults to Date.now(); inject in tests so date-sensitive assertions can't rot)
  * @returns {Promise<{ signals: Signal[], riskScore: number, riskLevel: string }>}
  */
 export async function analyzePackage(metadata, osvResult, options = {}) {
-  const { ecosystem = 'npm', config } = options;
+  const { ecosystem = 'npm', config, now = Date.now() } = options;
   const signals = [];
   const warnings = [];
 
@@ -68,7 +69,7 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
   // Also downweight if the package has many maintainers (org-managed)
   if (isEnabled('MAINTAINER_CHANGE') && metadata.maintainerChanged) {
     const daysSincePublish = metadata.latestPublishTime
-      ? (Date.now() - new Date(metadata.latestPublishTime).getTime()) / (24 * 60 * 60 * 1000)
+      ? (now - new Date(metadata.latestPublishTime).getTime()) / (24 * 60 * 60 * 1000)
       : 0;
     const isRecent = daysSincePublish < 90;
     const isOrgManaged = (metadata.maintainers?.length || 0) >= 3;
@@ -303,7 +304,10 @@ function computeRiskScore(signals, metadata) {
   return Math.round(score * 10) / 10;
 }
 
-function scoreToLevel(score) {
+// Exported: any consumer that mutates riskScore after analyzePackage()
+// (provenance checks, deep tarball findings) must re-derive riskLevel with
+// this, or the added signals silently don't count toward filtering/exit codes.
+export function scoreToLevel(score) {
   if (score >= 30) return 'CRITICAL';
   if (score >= 15) return 'HIGH';
   if (score >= 5)  return 'MODERATE';
