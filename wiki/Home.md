@@ -2,6 +2,8 @@
 
 Welcome to the vexes wiki -- the complete reference for the cross-ecosystem dependency security scanner.
 
+> Canonical home: [penumbraforge.com/vexes/wiki](https://penumbraforge.com/vexes/wiki/). This in-repo copy ships with the code; the site version is kept current with each release.
+
 ## Pages
 
 - **[Getting Started](Getting-Started.md)** -- Installation, first scan, understanding output

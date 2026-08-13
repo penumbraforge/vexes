@@ -7,6 +7,8 @@
 
 Zero dependencies. Pure Node.js. Catches real supply chain attacks.
 
+**Full documentation:** [penumbraforge.com/vexes/wiki](https://penumbraforge.com/vexes/wiki/)
+
 ![vexes scanning npm, PyPI, and Cargo dependencies](demo/vexes.gif)
 
 ```bash
