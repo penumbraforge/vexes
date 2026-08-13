@@ -3,6 +3,55 @@
 All notable changes to vexes are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-08-12
+
+The hardening release. SARIF output for GitHub code scanning, a rewritten
+Action that can't be injection-attacked, and a batch of correctness fixes.
+
+### Added
+- **SARIF 2.1.0 output** — `vexes scan --format sarif` (or `--sarif <file>`
+  to write a report) emits a SARIF document for
+  github/codeql-action/upload-sarif and any SARIF consumer: one rule per
+  advisory with `properties.security-severity`, results mapped to
+  error/warning/note by severity, and `partialFingerprints` for cross-run
+  dedup. `monitor --ci --sarif` shares the same generator (`src/cli/sarif.js`).
+- **`ignore` config implemented** — the documented `ignore` key was never
+  read. Entries may be advisory IDs (`GHSA-…`, `CVE-…`), package names, or
+  `pkg@version`; matched findings are suppressed from `scan`/`analyze` and
+  counted (a `suppressed` count in JSON, an "N suppressed by ignore config"
+  line in text).
+
+### Fixed
+- **Config isolation** — `loadConfig()` deep-clones DEFAULTS
+  (`structuredClone`) so nested `output`/`cache` objects no longer alias the
+  shared template; flag writes and the cache-dir `~` expansion can no longer
+  leak across calls in the same process.
+- **guard rc-file safety** — `guard --uninstall` no longer splices at a
+  garbage offset when the end marker is missing (which corrupted the user's
+  shell rc). Missing/inverted markers now abort with manual-removal steps,
+  and both setup and uninstall write a `<rcfile>.vexes-backup` before any edit.
+- **Fix-command version selection** — `scan` ranked fix versions with string
+  comparison, so `9.0.0` sorted above `10.0.0`. Numeric semver comparison is
+  now shared from `src/core/semver.js` by both `scan` and `fix`.
+- **Large output no longer truncates** — the CLI called `process.exit()`
+  before large piped stdout drained, silently cutting JSON/SARIF output at
+  the ~64KB OS pipe buffer. stdout/stderr are now flushed before exit.
+
+### Changed
+- **Hardened GitHub Action** — `action.yml` runs the pinned action code
+  (`$GITHUB_ACTION_PATH/bin/vexes.js`) instead of `npx @latest`, passes all
+  inputs through `env:` as quoted shell vars (kills the template-injection
+  sink), allowlists `command` to scan/analyze/monitor (rejects `guard`), and
+  exposes `vulnerabilities`/`critical`/`high`/`moderate`/`exit-code`/`sarif-file`
+  outputs. New `action-test.yml` exercises it against the demo fixtures;
+  `demo.yml` no longer swallows failures with `|| true`.
+- **Hermetic tests** — the red-team suite no longer touches the network
+  (dep-graph registry lookups are stubbed and asserted), making good on its
+  "no network calls" claim. CI Node matrix moved to 22/24/26 (23 was EOL).
+- **Homebrew removed** — OSV has no Homebrew ecosystem, so brew scans only
+  produced advisory-free noise. `src/parsers/brew.js` and the `brew`
+  ecosystem were removed (restorable from git if a real data source appears).
+
 ## [0.2.0] — 2026-08-12
 
 The accuracy release. Severity reporting, version attribution, and PyPI
