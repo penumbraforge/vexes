@@ -1,10 +1,48 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { inspectJS, inspectPython } from '../src/analysis/ast-inspector.js';
 import { analyzePackage } from '../src/analysis/signals.js';
 import { detectTyposquat } from '../src/analysis/dep-graph.js';
 import { buildProfile, diffProfiles } from '../src/analysis/behavioral.js';
 import { POPULAR_NPM, POPULAR_PYPI } from '../src/core/allowlists.js';
+import { NPM_REGISTRY_URL } from '../src/core/constants.js';
+
+// ─── Hermetic network guard ────────────────────────────────────────────
+// The file header CLAIMS "no network calls" — this makes it true. The only
+// outbound path is dep-graph's profileDependency() hitting the npm registry
+// for newly-added deps (via analyzePackage → analyzeNewDeps). We stub fetch to
+// return 404 for those (so the fake malicious deps resolve to "unknown",
+// exactly as offline), record every call, and hard-fail on any other host so a
+// future real network call can't sneak back in.
+let originalFetch;
+const fetchCalls = [];
+
+before(() => {
+  originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    const u = String(url);
+    fetchCalls.push(u);
+    if (u.startsWith(NPM_REGISTRY_URL)) {
+      return {
+        ok: false,
+        status: 404,
+        async json() { return {}; },
+        async text() { return 'Not Found'; },
+      };
+    }
+    throw new Error(`RED TEAM tests must be hermetic — unexpected network call to ${u}`);
+  };
+});
+
+after(() => {
+  global.fetch = originalFetch;
+  // Every recorded call must have been to the mocked registry endpoint; no
+  // call ever left the process.
+  for (const u of fetchCalls) {
+    assert.ok(u.startsWith(NPM_REGISTRY_URL),
+      `red-team suite made a non-registry network call: ${u}`);
+  }
+});
 
 /**
  * RED TEAM TEST SUITE
