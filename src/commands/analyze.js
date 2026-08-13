@@ -12,7 +12,7 @@ import { queryBatch } from '../advisories/osv.js';
 import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { fetchPypiMetadata } from '../advisories/pypi-registry.js';
 import { checkProvenance } from '../analysis/provenance.js';
-import { analyzePackage } from '../analysis/signals.js';
+import { analyzePackage, scoreToLevel } from '../analysis/signals.js';
 import { inspectTarball, getTarballUrl, getPypiTarballUrl } from '../analysis/tarball-inspector.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 
@@ -254,7 +254,17 @@ export async function runAnalyze(flags, args) {
       tarSpinner?.stop(`Deep code inspection complete for ${tarballCandidates.length} packages`);
     }
 
-    // 6. Sort by risk score descending
+    // 6. Re-derive risk levels: provenance and deep-tarball steps above
+    // mutate riskScore after analyzePackage() computed riskLevel. Without
+    // this pass, a package pushed over a threshold by --deep findings keeps
+    // its old level and can be filtered out of the report and the exit code.
+    for (const r of results) {
+      if (r.riskLevel !== 'UNKNOWN') {
+        r.riskLevel = scoreToLevel(r.riskScore);
+      }
+    }
+
+    // Then sort by risk score descending
     results.sort((a, b) => b.riskScore - a.riskScore);
 
     // 7. Surface packages where any analysis step was incomplete
@@ -395,7 +405,7 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
   // Fetch registry metadata
   let metadata = null;
   if (dep.ecosystem === 'npm') {
-    metadata = await fetchNpmMetadata(dep.name);
+    metadata = await fetchNpmMetadata(dep.name, dep.version);
   } else if (dep.ecosystem === 'pypi' || dep.ecosystem === 'PyPI') {
     metadata = await fetchPypiMetadata(dep.name, dep.version);
   }

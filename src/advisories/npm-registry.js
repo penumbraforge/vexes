@@ -18,15 +18,22 @@ function encodeNpmName(name) {
  * Fetch full package metadata from the npm registry.
  * Returns structured data about maintainers, scripts, publish history, and dependencies.
  *
+ * When `version` is given, every signal-feeding field (publisher, scripts,
+ * dependency diff, publish timing) is anchored to THAT version — the one
+ * actually installed — not dist-tags.latest. Analyzing `latest` while
+ * reporting on the installed version attributes someone else's signals to
+ * the artifact in the user's tree.
+ *
  * @param {string} packageName
+ * @param {string} [version] — installed version to anchor the analysis to
  * @returns {Promise<NpmMetadata|null>}
  */
-export async function fetchNpmMetadata(packageName) {
+export async function fetchNpmMetadata(packageName, version = null) {
   const url = `${NPM_REGISTRY_URL}/${encodeNpmName(packageName)}`;
 
   try {
     const data = await fetchJSON(url);
-    return normalizeMetadata(data, packageName);
+    return normalizeMetadata(data, packageName, version);
   } catch (err) {
     log.debug(`npm registry fetch failed for ${packageName}: ${err.message}`);
     return null;
@@ -54,7 +61,9 @@ export async function fetchNpmProvenance(packageName, version) {
   }
 }
 
-function normalizeMetadata(data, packageName) {
+// Exported for tests: version anchoring must be verifiable against packument
+// fixtures without network access.
+export function normalizeMetadata(data, packageName, requestedVersion = null) {
   const latestTag = data['dist-tags']?.latest;
   const timeMap = data.time || {};
   const versions = data.versions || {};
@@ -64,9 +73,18 @@ function normalizeMetadata(data, packageName) {
     .filter(v => v !== 'created' && v !== 'modified' && versions[v])
     .sort((a, b) => new Date(timeMap[a]) - new Date(timeMap[b]));
 
-  const latestVersion = latestTag || versionList[versionList.length - 1];
+  const latestAvailable = latestTag || versionList[versionList.length - 1];
+
+  // Anchor to the installed version when the packument knows it; otherwise
+  // fall back to latest (and say so via anchoredToInstalled).
+  const anchoredToInstalled = requestedVersion !== null && versions[requestedVersion] !== undefined;
+  const latestVersion = anchoredToInstalled ? requestedVersion : latestAvailable;
+  const anchorIdx = versionList.indexOf(latestVersion);
+
   const latestData = versions[latestVersion] || {};
-  const previousVersion = versionList.length >= 2 ? versionList[versionList.length - 2] : null;
+  const previousVersion = anchorIdx > 0
+    ? versionList[anchorIdx - 1]
+    : (anchorIdx === -1 && versionList.length >= 2 ? versionList[versionList.length - 2] : null);
   const previousData = previousVersion ? versions[previousVersion] : null;
 
   // Extract maintainer info
@@ -128,11 +146,14 @@ function normalizeMetadata(data, packageName) {
     majorJump = currMajor - prevMajor;
   }
 
-  // Dormancy: max gap between any consecutive versions in the last 5 releases
+  // Dormancy: max gap between any consecutive versions in the 5 releases up
+  // to and including the anchor — releases published *after* the installed
+  // version can't say anything about how it arrived.
   // This detects packages that were abandoned then suddenly reactivated
   let dormancyMs = null;
-  if (versionList.length >= 2) {
-    const recentVersions = versionList.slice(-5);
+  const historyUpToAnchor = anchorIdx >= 0 ? versionList.slice(0, anchorIdx + 1) : versionList;
+  if (historyUpToAnchor.length >= 2) {
+    const recentVersions = historyUpToAnchor.slice(-5);
     for (let i = 1; i < recentVersions.length; i++) {
       const prev = new Date(timeMap[recentVersions[i - 1]]);
       const curr = new Date(timeMap[recentVersions[i]]);
@@ -145,7 +166,9 @@ function normalizeMetadata(data, packageName) {
 
   return {
     name: packageName,
-    latestVersion,
+    latestVersion,       // the analyzed (anchor) version — installed when known
+    latestAvailable,     // dist-tags.latest, for outdated-version signals
+    anchoredToInstalled,
     previousVersion,
     maintainers,
     latestPublisher,

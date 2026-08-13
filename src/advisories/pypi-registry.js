@@ -5,15 +5,25 @@ import { log } from '../core/logger.js';
 /**
  * Fetch package metadata from the PyPI JSON API.
  *
+ * ALWAYS fetches the unversioned endpoint: only that one returns the
+ * `releases` map, and without it every publish-history signal
+ * (previousVersion, publish timing, package age, dormancy) is null. The
+ * versioned endpoint — used here before this fix — silently returned none
+ * of that, leaving PyPI analysis running on one layer instead of four.
+ * `version` is used to ANCHOR the analysis, mirroring npm-registry.js.
+ *
+ * PyPI API limitations (documented, not bugs): there is no per-release
+ * publisher, so `maintainerChanged` is structurally unavailable (npm-only),
+ * and install-script detection comes from tarball inspection (--deep), not
+ * metadata.
+ *
  * @param {string} packageName
- * @param {string} [version] — specific version, or omit for latest
+ * @param {string} [version] — installed version to anchor the analysis to
  * @returns {Promise<PypiMetadata|null>}
  */
 export async function fetchPypiMetadata(packageName, version) {
   const normalized = packageName.toLowerCase().replace(/[._]/g, '-');
-  const url = version
-    ? `${PYPI_JSON_URL}/${encodeURIComponent(normalized)}/${encodeURIComponent(version)}/json`
-    : `${PYPI_JSON_URL}/${encodeURIComponent(normalized)}/json`;
+  const url = `${PYPI_JSON_URL}/${encodeURIComponent(normalized)}/json`;
 
   try {
     const data = await fetchJSON(url);
@@ -24,7 +34,9 @@ export async function fetchPypiMetadata(packageName, version) {
   }
 }
 
-function normalizeMetadata(data, packageName, requestedVersion) {
+// Exported for tests: PyPI signal fields must be verifiable against saved
+// API fixtures without network access.
+export function normalizeMetadata(data, packageName, requestedVersion) {
   const info = data.info || {};
   const releases = data.releases || {};
   const vulnerabilities = data.vulnerabilities || [];
@@ -38,10 +50,16 @@ function normalizeMetadata(data, packageName, requestedVersion) {
       return aTime.localeCompare(bTime);
     });
 
-  const latestVersion = info.version || versionList[versionList.length - 1];
-  const previousVersion = versionList.length >= 2
-    ? versionList[versionList.indexOf(latestVersion) - 1] || versionList[versionList.length - 2]
-    : null;
+  const latestAvailable = info.version || versionList[versionList.length - 1];
+
+  // Anchor to the installed version when the release history knows it.
+  const anchoredToInstalled = requestedVersion != null && (releases[requestedVersion]?.length > 0);
+  const latestVersion = anchoredToInstalled ? requestedVersion : latestAvailable;
+  const anchorIdx = versionList.indexOf(latestVersion);
+
+  const previousVersion = anchorIdx > 0
+    ? versionList[anchorIdx - 1]
+    : (anchorIdx === -1 && versionList.length >= 2 ? versionList[versionList.length - 2] : null);
 
   // Author / maintainer info
   const author = info.author || null;
@@ -69,6 +87,30 @@ function normalizeMetadata(data, packageName, requestedVersion) {
   const created = firstRelease?.[0]?.upload_time_iso_8601
     ? new Date(firstRelease[0].upload_time_iso_8601) : null;
   const packageAgeMs = created ? (Date.now() - created) : null;
+
+  // Version jump between the previous release and the anchor
+  let majorJump = 0;
+  if (previousVersion && latestVersion) {
+    const prevMajor = parseInt(previousVersion.split('.')[0], 10) || 0;
+    const currMajor = parseInt(latestVersion.split('.')[0], 10) || 0;
+    majorJump = currMajor - prevMajor;
+  }
+
+  // Dormancy: max gap between consecutive releases in the 5 up to the anchor
+  // — detects packages abandoned then suddenly reactivated (event-stream shape)
+  let dormancyMs = null;
+  const historyUpToAnchor = anchorIdx >= 0 ? versionList.slice(0, anchorIdx + 1) : versionList;
+  if (historyUpToAnchor.length >= 2) {
+    const recentVersions = historyUpToAnchor.slice(-5);
+    for (let i = 1; i < recentVersions.length; i++) {
+      const prev = new Date(recentVersions[i - 1] ? releases[recentVersions[i - 1]][0]?.upload_time_iso_8601 : 0);
+      const curr = new Date(recentVersions[i] ? releases[recentVersions[i]][0]?.upload_time_iso_8601 : 0);
+      const gap = curr - prev;
+      if (gap > 0 && (dormancyMs === null || gap > dormancyMs)) {
+        dormancyMs = gap;
+      }
+    }
+  }
 
   // Dependencies (requires_dist)
   const dependencies = (info.requires_dist || []).map(dep => {
@@ -98,7 +140,9 @@ function normalizeMetadata(data, packageName, requestedVersion) {
 
   return {
     name: packageName,
-    latestVersion,
+    latestVersion,       // the analyzed (anchor) version — installed when known
+    latestAvailable,     // newest release on PyPI
+    anchoredToInstalled,
     previousVersion,
     author,
     authorEmail,
@@ -108,6 +152,8 @@ function normalizeMetadata(data, packageName, requestedVersion) {
     previousPublishTime,
     publishIntervalMs,
     packageAgeMs,
+    majorJump,
+    dormancyMs,
     dependencies,
     versionCount: versionList.length,
     yankedVersions,
@@ -115,5 +161,8 @@ function normalizeMetadata(data, packageName, requestedVersion) {
     license: info.license || null,
     knownVulns,
     requiresPython: info.requires_python || null,
+    // Structurally unavailable on PyPI (no per-release publisher in the JSON
+    // API): maintainerChanged. Install scripts come from --deep tarball
+    // inspection, not metadata. Deliberately NOT faked here.
   };
 }
