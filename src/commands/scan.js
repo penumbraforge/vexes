@@ -14,6 +14,7 @@ import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from 
 import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { compareSemver } from '../core/semver.js';
+import { partitionByIgnore } from '../core/ignore.js';
 
 /**
  * `vexes scan` — Enumerate dependencies, query OSV, report vulnerabilities.
@@ -337,13 +338,21 @@ export async function runScan(flags, args) {
 
     // 7. Filter by severity
     const minSeverity = config.severity?.toUpperCase() || 'MODERATE';
-    const filtered = filterBySeverity(allVulns, minSeverity);
+    const severityFiltered = filterBySeverity(allVulns, minSeverity);
 
-    filtered.sort((a, b) => {
+    severityFiltered.sort((a, b) => {
       const aOrder = SEVERITY[a.severity]?.order ?? 99;
       const bOrder = SEVERITY[b.severity]?.order ?? 99;
       return bOrder - aOrder;
     });
+
+    // 7b. Apply the `ignore` config — suppress by advisory ID, package name,
+    // or pkg@version. Suppressed findings are counted, not silently dropped.
+    const { kept: filtered, suppressed } = partitionByIgnore(
+      severityFiltered,
+      config.ignore,
+      v => ({ pkg: v.package, version: v.version, ids: [v.id, v.displayId, ...(v.aliases || [])] }),
+    );
 
     // 8. Determine completeness — did all queries succeed?
     const isComplete = queryComplete && parseFailures === 0;
@@ -359,7 +368,7 @@ export async function runScan(flags, args) {
         timestamp: new Date().toISOString(),
         command: 'scan',
         complete: isComplete,
-        summary: { total: uniqueDeps.length, vulnerable: filtered.length, ...counts },
+        summary: { total: uniqueDeps.length, vulnerable: filtered.length, suppressed: suppressed.length, ...counts },
         warnings,
         vulnerabilities: filtered,
       }, null, 2));
@@ -414,6 +423,10 @@ export async function runScan(flags, args) {
 
       const counts = countBySeverity(filtered);
       out(summary(counts, uniqueDeps.length, ecoList, elapsed));
+
+      if (suppressed.length > 0) {
+        out(`  ${C.dim}${suppressed.length} suppressed by ignore config${C.reset}`);
+      }
 
       if (!isComplete) {
         out(`\n  ${C.red}${C.bold}! SCAN INCOMPLETE${C.reset} ${C.red}— some packages could not be checked. Results may be missing vulnerabilities.${C.reset}\n`);

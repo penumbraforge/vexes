@@ -15,6 +15,7 @@ import { checkProvenance } from '../analysis/provenance.js';
 import { analyzePackage, scoreToLevel } from '../analysis/signals.js';
 import { inspectTarball, getTarballUrl, getPypiTarballUrl } from '../analysis/tarball-inspector.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
+import { partitionByIgnore } from '../core/ignore.js';
 
 /**
  * `vexes analyze` — Deep behavioral analysis of dependency supply chain.
@@ -281,12 +282,20 @@ export async function runAnalyze(flags, args) {
     // 8. Filter — default shows only packages with signals
     const minSeverity = config.severity?.toUpperCase() || 'MODERATE';
     const minOrder = SEVERITY[minSeverity]?.order ?? 2;
-    const flaggedResults = results.filter(r => {
+    const preIgnoreFlagged = results.filter(r => {
       if (r.riskLevel === 'NONE') return false;
       if (r.riskLevel === 'UNKNOWN') return verbose; // Show UNKNOWN in verbose mode
       const order = SEVERITY[r.riskLevel]?.order ?? 0;
       return verbose || order >= minOrder;
     });
+
+    // 8b. Apply the `ignore` config — suppress by package name, pkg@version, or
+    // any advisory ID carried on the package's KNOWN_COMPROMISED signal.
+    const { kept: flaggedResults, suppressed } = partitionByIgnore(
+      preIgnoreFlagged,
+      config.ignore,
+      r => ({ pkg: r.name, version: r.version, ids: collectAdvisoryIds(r) }),
+    );
 
     // 8. Format output
     if (isJSON) {
@@ -298,6 +307,7 @@ export async function runAnalyze(flags, args) {
         summary: {
           total: uniqueDeps.length,
           flagged: flaggedResults.length,
+          suppressed: suppressed.length,
           critical: flaggedResults.filter(r => r.riskLevel === 'CRITICAL').length,
           high: flaggedResults.filter(r => r.riskLevel === 'HIGH').length,
         },
@@ -368,6 +378,9 @@ export async function runAnalyze(flags, args) {
         out(`  ${C.yellow}!${C.reset} ${uniqueDeps.length} packages analyzed — one or more checks were incomplete`);
       } else {
         out(`  ${C.green}\u2713${C.reset} ${uniqueDeps.length} packages analyzed — no concerning signals`);
+      }
+      if (suppressed.length > 0) {
+        out(`  ${C.dim}${suppressed.length} suppressed by ignore config${C.reset}`);
       }
       out(`  ${C.dim}${line}${C.reset}\n`);
 
@@ -489,6 +502,18 @@ function printExplain(result) {
     }
     out('');
   }
+}
+
+/**
+ * Collect advisory IDs attached to an analyze result so the `ignore` config can
+ * suppress by ID. IDs live on the KNOWN_COMPROMISED signal's evidence.ids.
+ */
+function collectAdvisoryIds(result) {
+  const ids = [];
+  for (const s of result.signals || []) {
+    if (Array.isArray(s.evidence?.ids)) ids.push(...s.evidence.ids);
+  }
+  return ids;
 }
 
 function riskBar(score) {
