@@ -145,10 +145,12 @@ runs:
           echo "sarif-file=$INPUT_SARIF_FILE" >> "$GITHUB_OUTPUT"
         fi
 
-        # IMPORTANT: this step must exit 0. A composite-action step that exits
-        # non-zero aborts the action and DISCARDS the outputs written above.
-        # The exit code is surfaced as an output; the next step turns it into
-        # a build failure so callers still fail on findings.
+        # This step's job is to WRITE OUTPUTS — it must always succeed. A
+        # composite-action step that exits non-zero aborts the action and
+        # discards the outputs it wrote. vexes's own exit code is surfaced as
+        # the exit-code output; the next step turns it into a build failure
+        # only when fail-on-findings is set.
+        exit 0
 
     - name: Fail on findings
       shell: bash
