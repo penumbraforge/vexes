@@ -1,7 +1,7 @@
 const COMMANDS = new Set(['scan', 'analyze', 'fix', 'guard', 'monitor', 'help', 'version']);
 
 const FLAGS_WITH_VALUE = new Set([
-  'path', 'ecosystem', 'severity', 'format', 'config', 'explain', 'interval', 'shell',
+  'path', 'ecosystem', 'severity', 'format', 'config', 'explain', 'interval', 'shell', 'sarif',
 ]);
 
 /**

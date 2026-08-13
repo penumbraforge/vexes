@@ -6,6 +6,7 @@ import { log } from '../core/logger.js';
 
 const VALID_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEMS));
 const VALID_SEVERITIES = new Set(['critical', 'high', 'moderate', 'low']);
+const VALID_FORMATS = new Set(['text', 'json', 'sarif']);
 
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -118,7 +119,20 @@ export function loadConfig(dir, flags = {}) {
       config.severity = sev;
     }
   }
+  if (flags.format) {
+    const fmt = String(flags.format).toLowerCase();
+    if (VALID_FORMATS.has(fmt)) {
+      config.output.format = fmt;
+    } else {
+      log.warn(`unknown format "${flags.format}" — valid options: ${[...VALID_FORMATS].join(', ')}. Using ${config.output.format}.`);
+    }
+  }
   if (flags.json) config.output.format = 'json';
+  // --sarif [file]: selects SARIF format; a string value writes to that file.
+  if (flags.sarif) {
+    config.output.format = 'sarif';
+    if (typeof flags.sarif === 'string') config.output.sarifFile = flags.sarif;
+  }
   if (flags.color === false) config.output.color = 'never';
   if (flags.path) config.targetPath = flags.path;
   if (flags.cached) config.useCache = true;

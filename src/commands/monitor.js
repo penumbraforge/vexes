@@ -13,6 +13,7 @@ import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from 
 import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { diffSnapshots, toSnapshot } from '../analysis/diff.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
+import { toSarif } from '../cli/sarif.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MIN_POLL_INTERVAL_MS = 60 * 1000;           // 1 minute
@@ -79,7 +80,7 @@ async function runCI(flags) {
   if (allDeps.length === 0) {
     const complete = parseResult.parseFailures === 0;
     if (isSARIF) {
-      out(JSON.stringify(buildSARIF([], 0, warnings), null, 2));
+      out(JSON.stringify(toSarif({ complete, summary: { total: 0, vulnerable: 0 }, warnings, vulnerabilities: [] }), null, 2));
     } else if (isJSON) {
       out(JSON.stringify({
         version: VERSION,
@@ -115,7 +116,12 @@ async function runCI(flags) {
   filtered.sort((a, b) => (SEVERITY[b.severity]?.order ?? 0) - (SEVERITY[a.severity]?.order ?? 0));
 
   if (isSARIF) {
-    out(JSON.stringify(buildSARIF(filtered, allDeps.length, warnings), null, 2));
+    out(JSON.stringify(toSarif({
+      complete,
+      summary: { total: allDeps.length, vulnerable: filtered.length },
+      warnings,
+      vulnerabilities: filtered,
+    }), null, 2));
   } else if (isJSON) {
     out(JSON.stringify({
       version: VERSION, command: 'monitor', mode: 'ci',
@@ -423,103 +429,5 @@ function findDependencyFiles(dir, ecosystems) {
   return [...paths].filter(path => existsSync(path));
 }
 
-/**
- * Build a SARIF 2.1.0 document from vulnerability results.
- * Conforms to the OASIS SARIF specification for GitHub Code Scanning.
- *
- * @param {Array} vulns — filtered vulnerability list
- * @param {number} totalPackages — total packages scanned
- * @param {Array<string>} warnings — scan warnings
- * @returns {Object} SARIF document
- */
-function buildSARIF(vulns, totalPackages, warnings) {
-  const SARIF_SEVERITY_MAP = {
-    CRITICAL: 'error',
-    HIGH: 'error',
-    MODERATE: 'warning',
-    LOW: 'note',
-  };
-
-  // Build unique rules (one per vuln ID)
-  const rulesMap = new Map();
-  for (const v of vulns) {
-    if (!rulesMap.has(v.id)) {
-      rulesMap.set(v.id, {
-        id: v.id,
-        name: v.displayId,
-        shortDescription: { text: `${v.displayId}: ${v.summary}` },
-        fullDescription: { text: v.summary },
-        helpUri: v.url,
-        properties: {
-          severity: v.severity,
-          ecosystem: v.ecosystem,
-          ...(v.fixed ? { fixAvailable: v.fixed } : {}),
-        },
-      });
-    }
-  }
-
-  const results = vulns.map(v => ({
-    ruleId: v.id,
-    level: SARIF_SEVERITY_MAP[v.severity] || 'warning',
-    message: {
-      text: `${v.package}@${v.version} has vulnerability ${v.displayId}: ${v.summary}${v.fixed ? ` (fix: ${v.fixed})` : ''}`,
-    },
-    locations: [{
-      physicalLocation: {
-        artifactLocation: {
-          uri: resolveVulnLockfile(v.ecosystem),
-          uriBaseId: '%SRCROOT%',
-        },
-      },
-      logicalLocations: [{
-        name: `${v.package}@${v.version}`,
-        kind: 'module',
-      }],
-    }],
-    ...(v.references?.length > 0 ? {
-      relatedLocations: v.references.slice(0, 5).map((ref, i) => ({
-        id: i,
-        message: { text: ref },
-      })),
-    } : {}),
-  }));
-
-  return {
-    $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',
-    version: '2.1.0',
-    runs: [{
-      tool: {
-        driver: {
-          name: 'vexes',
-          version: VERSION,
-          informationUri: 'https://github.com/penumbraforge/vexes',
-          rules: [...rulesMap.values()],
-        },
-      },
-      results,
-      invocations: [{
-        executionSuccessful: warnings.length === 0,
-        toolExecutionNotifications: warnings.map(w => ({
-          level: 'warning',
-          message: { text: w },
-        })),
-        properties: {
-          totalPackagesScanned: totalPackages,
-        },
-      }],
-    }],
-  };
-}
-
-/**
- * Map ecosystem to the most likely lockfile path for SARIF locations.
- */
-function resolveVulnLockfile(ecosystem) {
-  switch (ecosystem) {
-    case 'npm': return 'package-lock.json';
-    case 'pypi': return 'requirements.txt';
-    case 'cargo': return 'Cargo.lock';
-    default: return 'package-lock.json';
-  }
-}
+// SARIF generation lives in src/cli/sarif.js (toSarif) — the single source of
+// truth shared by `scan` and `monitor --ci`.

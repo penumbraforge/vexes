@@ -96,6 +96,8 @@ function printHelp() {
     --fix                Show fix commands for each vulnerability
     --cached             Use cached results without freshness check
     --json               Output JSON to stdout
+    --format <fmt>       Output format: text, json, sarif ${C.dim}(default: text)${C.reset}
+    --sarif [file]       SARIF 2.1.0 output ${C.dim}(to stdout, or to <file>)${C.reset}
     --verbose, -v        Show debug output
     --no-color           Disable ANSI colors
 
@@ -135,4 +137,21 @@ function printHelp() {
 }
 
 const exitCode = await main();
+await flushStdio();
 process.exit(exitCode);
+
+/**
+ * Drain stdout/stderr before exiting.
+ *
+ * process.exit() discards buffered pipe writes larger than the OS pipe buffer
+ * (~64KB), silently truncating large JSON/SARIF output. Wait for both streams
+ * to flush first. A zero-length write's callback fires only after all prior
+ * writes on that stream have been handled, which is the flush we need.
+ */
+function flushStdio() {
+  const drain = (stream) => new Promise((res) => {
+    if (stream.writableLength === 0) return res();
+    stream.write('', res);
+  });
+  return Promise.all([drain(process.stdout), drain(process.stderr)]);
+}

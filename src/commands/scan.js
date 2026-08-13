@@ -1,6 +1,7 @@
 import { resolve, basename } from 'node:path';
-import { statSync } from 'node:fs';
+import { statSync, writeFileSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
+import { toSarif } from '../cli/sarif.js';
 import { C, createSpinner, header, formatVuln, summary, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, SEVERITY, ECOSYSTEMS } from '../core/constants.js';
@@ -25,6 +26,27 @@ export async function runScan(flags, args) {
   const targetDir = resolve(flags.path || process.cwd());
   const config = loadConfig(targetDir, flags);
   const isJSON = config.output?.format === 'json';
+  const isSARIF = config.output?.format === 'sarif';
+  // Any structured format must keep stdout clean of progress/header chatter.
+  const quietStdout = isJSON || isSARIF;
+
+  // Emit a scan-result object in whichever structured format is active. SARIF
+  // may target a file (--sarif <file>); otherwise everything goes to stdout via
+  // out(), the flush-safe write path.
+  const emitStructured = (scanResult) => {
+    if (isSARIF) {
+      const doc = JSON.stringify(toSarif(scanResult), null, 2);
+      if (config.output?.sarifFile) {
+        writeFileSync(config.output.sarifFile, doc + '\n');
+        // Confirmation to stderr so stdout/the SARIF file stay uncontaminated.
+        log.info(`SARIF written to ${config.output.sarifFile}`);
+      } else {
+        out(doc);
+      }
+    } else {
+      out(JSON.stringify(scanResult, null, 2));
+    }
+  };
 
   // Validate target path exists and is a directory
   try {
@@ -38,7 +60,7 @@ export async function runScan(flags, args) {
     return EXIT.ERROR;
   }
 
-  if (!isJSON) {
+  if (!quietStdout) {
     out(`\n  ${C.bold}vexes${C.reset} v${VERSION} ${C.dim}\u2500\u2500 scanning dependencies${C.reset}\n`);
   }
 
@@ -108,7 +130,7 @@ export async function runScan(flags, args) {
             ecosystemsFound.add('npm');
             dependencyFileCount++;
             const msg = 'no lockfile found — scanning package.json (version ranges, lower confidence)';
-            if (!isJSON) out(`  ${C.yellow}! ${msg}${C.reset}`);
+            if (!quietStdout) out(`  ${C.yellow}! ${msg}${C.reset}`);
             warnings.push(msg);
           } catch (err) {
             const msg = `failed to parse ${basename(mf)}: ${err.message}`;
@@ -161,7 +183,7 @@ export async function runScan(flags, args) {
         const manifestList = files.map(file => basename(file.path)).join(', ');
         const msg = `no lockfile found — scanning ${manifestList} (best-effort manifest fallback, lower confidence)`;
         warnings.push(msg);
-        if (!isJSON) out(`  ${C.yellow}! ${msg}${C.reset}`);
+        if (!quietStdout) out(`  ${C.yellow}! ${msg}${C.reset}`);
       }
 
       for (const file of files) {
@@ -183,12 +205,12 @@ export async function runScan(flags, args) {
 
   // Distinguish "no dependency files found" from "files found but parsing failed"
   if (allDeps.length === 0 && parseFailures > 0) {
-    if (isJSON) {
-      out(JSON.stringify({
-        version: VERSION, command: 'scan', complete: false,
+    if (quietStdout) {
+      emitStructured({
+        version: VERSION, timestamp: new Date().toISOString(), command: 'scan', complete: false,
         summary: { total: 0, vulnerable: 0 },
-        errors: warnings, vulnerabilities: [],
-      }, null, 2));
+        warnings, vulnerabilities: [],
+      });
     } else {
       out(`\n  ${C.red}! Dependency files were found but all failed to parse — cannot determine vulnerability status${C.reset}\n`);
     }
@@ -196,12 +218,12 @@ export async function runScan(flags, args) {
   }
 
   if (allDeps.length === 0) {
-    if (isJSON) {
-      out(JSON.stringify({
-        version: VERSION, command: 'scan', complete: true,
+    if (quietStdout) {
+      emitStructured({
+        version: VERSION, timestamp: new Date().toISOString(), command: 'scan', complete: true,
         summary: { total: 0, vulnerable: 0 },
         warnings: [], vulnerabilities: [],
-      }, null, 2));
+      });
     } else {
       out(`  ${C.dim}No dependencies found in ${targetDir}${C.reset}\n`);
     }
@@ -216,7 +238,7 @@ export async function runScan(flags, args) {
   }
   const uniqueDeps = [...dedupMap.values()];
 
-  if (!isJSON) {
+  if (!quietStdout) {
     out(`  ${C.dim}Found ${uniqueDeps.length} unique packages across ${dependencyFileCount} dependency file(s)${C.reset}`);
   }
 
@@ -263,7 +285,7 @@ export async function runScan(flags, args) {
     const startTime = Date.now();
 
     if (needsFetch.length > 0) {
-      const spinner = isJSON ? null : createSpinner(`Querying OSV.dev for ${needsFetch.length} packages...`);
+      const spinner = quietStdout ? null : createSpinner(`Querying OSV.dev for ${needsFetch.length} packages...`);
 
       const osvResult = await queryBatch(needsFetch);
       fetchedVulns = osvResult.results;
@@ -295,7 +317,7 @@ export async function runScan(flags, args) {
       if (droppedVulns.length > 0) {
         warnings.push(`${droppedVulns.length} vulnerability detail(s) could not be fetched — reported with reduced detail`);
       }
-    } else if (!isJSON) {
+    } else if (!quietStdout) {
       out(`  ${C.green}\u2713${C.reset} ${uniqueDeps.length} packages checked (all cached)`);
     }
 
@@ -329,9 +351,9 @@ export async function runScan(flags, args) {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
     const ecoList = [...ecosystemsFound];
 
-    if (isJSON) {
+    if (quietStdout) {
       const counts = countBySeverity(filtered);
-      out(JSON.stringify({
+      emitStructured({
         version: VERSION,
         timestamp: new Date().toISOString(),
         command: 'scan',
@@ -339,7 +361,7 @@ export async function runScan(flags, args) {
         summary: { total: uniqueDeps.length, vulnerable: filtered.length, suppressed: suppressed.length, ...counts },
         warnings,
         vulnerabilities: filtered,
-      }, null, 2));
+      });
     } else {
       // Group by severity
       const groups = {};
