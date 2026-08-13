@@ -3,6 +3,10 @@ name: Publish
 on:
   release:
     types: [published]
+  # Manual re-run path: release-triggered runs execute the workflow file at
+  # the tag's commit, so a workflow fix on main can't rescue a failed
+  # release publish without this.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -11,7 +15,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
       - run: npm test
 
   publish:
@@ -24,6 +28,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
+      # npm's OIDC trusted publishing needs npm >= 11.5; runners can lag.
+      - run: npm install -g npm@latest
       - run: npm publish --provenance --access public
