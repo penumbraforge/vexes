@@ -94,7 +94,12 @@ runs:
         INPUT_ARGS: ${{ inputs.args }}
         VEXES_BIN: ${{ github.action_path }}/bin/vexes.js
       run: |
-        set -uo pipefail
+        # Disable errexit: GitHub's composite `shell: bash` defaults to
+        # `-e`, but vexes intentionally exits non-zero on findings and this
+        # script captures and handles that code itself. With -e left on, the
+        # first `node ... scan` (exit 1 on findings) would abort the step
+        # before any output was written.
+        set +e -o pipefail
 
         # Allowlist the command. guard performs real package installs and is
         # never permitted from CI.
