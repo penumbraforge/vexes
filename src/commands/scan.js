@@ -13,6 +13,7 @@ import { discover as discoverBrew, parseLockfile as parseBrewLock, parseManifest
 import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from '../parsers/generic.js';
 import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
+import { compareSemver } from '../core/semver.js';
 
 /**
  * `vexes scan` — Enumerate dependencies, query OSV, report vulnerabilities.
@@ -386,7 +387,9 @@ export async function runScan(flags, args) {
           if (!v.fixed) continue;
           const ver = v.fixed.replace(/^>=\s*/, '');
           const key = `${v.ecosystem}:${v.package}`;
-          if (!fixable.has(key) || ver > fixable.get(key).ver) {
+          // Pick the highest fix version via numeric semver compare — string
+          // '>' would rank '9.0.0' above '10.0.0' and recommend a stale fix.
+          if (!fixable.has(key) || compareSemver(ver, fixable.get(key).ver) > 0) {
             fixable.set(key, { pkg: v.package, ver, ecosystem: v.ecosystem });
           }
         }

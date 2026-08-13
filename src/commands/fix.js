@@ -7,6 +7,7 @@ import { VERSION, EXIT, NPM_REGISTRY_URL } from '../core/constants.js';
 import { discover as discoverNpm, parseLockfile as parseNpmLock } from '../parsers/npm.js';
 import { queryBatch, isQueryComplete } from '../advisories/osv.js';
 import { fetchJSON } from '../core/fetcher.js';
+import { compareSemver } from '../core/semver.js';
 
 /**
  * `vexes fix` — Generate verified, safe upgrade commands for vulnerabilities.
@@ -319,16 +320,3 @@ function generateCommand(pkgName, version, ecosystem) {
   }
 }
 
-/**
- * Basic semver comparison (major.minor.patch).
- * Returns negative if a < b, positive if a > b, 0 if equal.
- */
-function compareSemver(a, b) {
-  const pa = a.split('.').map(Number);
-  const pb = b.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
-    const diff = (pa[i] || 0) - (pb[i] || 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
