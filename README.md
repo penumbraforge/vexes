@@ -3,9 +3,11 @@
 [![CI](https://github.com/penumbraforge/vexes/actions/workflows/ci.yml/badge.svg)](https://github.com/penumbraforge/vexes/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@penumbraforge/vexes)](https://www.npmjs.com/package/@penumbraforge/vexes)
 
-**Cross-ecosystem dependency security scanner. Shakes the tree to see what falls.**
+**Cross-ecosystem dependency security scanner.**
 
-Zero dependencies. Pure Node.js. Catches real supply chain attacks.
+It reads package code, dependency graphs, version history, and registry metadata, then flags typosquat names, maintainer changes, capability escalation, and risky code patterns for review. Zero dependencies, pure Node.js.
+
+> **Experimental and pre-1.0.** It runs and finds things, but it is unproven against live attacks. Detection is heuristic, so expect false positives and misses. Findings are signals for a human to review, not verdicts. The `guard` and `monitor` commands are the least exercised parts and should be treated as early work.
 
 **Full documentation:** [penumbraforge.com/vexes/wiki](https://penumbraforge.com/vexes/wiki/)
 
@@ -16,7 +18,7 @@ Zero dependencies. Pure Node.js. Catches real supply chain attacks.
 npx @penumbraforge/vexes scan
 ```
 
-> **[See it in action](https://github.com/penumbraforge/vexes/actions/workflows/demo.yml)** — click "Run workflow" to watch vexes scan a demo project with real vulnerabilities across npm, PyPI, and Cargo. No install needed.
+> **[See it run](https://github.com/penumbraforge/vexes/actions/workflows/demo.yml)** — click "Run workflow" to watch vexes scan a demo project with known-vulnerable packages across npm, PyPI, and Cargo. No install needed.
 
 ```
 $ vexes scan
@@ -46,9 +48,9 @@ $ vexes scan
 
 ## What it does
 
-vexes is a dependency security scanner that goes beyond vulnerability databases. It uses a **4-layer detection engine** to catch supply chain attacks that signature-based tools miss:
+vexes checks dependencies against vulnerability databases and adds four layers of heuristic analysis on top. Each layer produces signals, not conclusions — they are starting points for a person to look at:
 
-| Layer | Detection Method | What it catches |
+| Layer | Detection Method | What it flags |
 |-------|-----------------|----------------|
 | **1. AST Analysis** | Parses JS/Python source via acorn AST | `eval()`, `child_process.exec()`, credential harvesting, obfuscated code, dynamic imports, `WebAssembly`, `setTimeout(string)`, DNS exfiltration, prototype chain escapes |
 | **2. Dependency Graph** | Profiles newly added dependencies | Phantom dependencies (brand-new packages), circular staging, typosquatting, Unicode homoglyph attacks |
@@ -57,7 +59,7 @@ vexes is a dependency security scanner that goes beyond vulnerability databases.
 
 ## Detection testing
 
-The red team test suite reconstructs known supply chain attacks and checks that vexes flags each one:
+The red team test suite contains hand-built, offline fixtures modeled on published write-ups of past supply chain attacks. Each fixture is a synthetic package assembled from the behaviors those write-ups describe — not a copy of the original malware — and the tests assert that vexes raises a signal on it:
 
 - **axios RAT** (March 2026) -- Hijacked maintainer account, hidden dependency with RAT dropper
 - **Shai-Hulud worm** (September 2025) -- Phished credentials, self-replicating worm via chalk/debug
@@ -66,6 +68,8 @@ The red team test suite reconstructs known supply chain attacks and checks that 
 - **litellm/TeamPCP** (March 2026) -- CI/CD compromise, 3-stage payload with K8s lateral movement
 - **Typosquatting** -- `expresss`, `loadash`, `reqeusts` and similar name confusion attacks
 - **Novel/hypothetical attacks** -- WASM-based payloads, DNS exfiltration, capability escalation
+
+Passing these tests shows that vexes flags these particular fixtures. It does not show that it would flag the original attacks as they were actually published, or that it would catch a new one. There is also a false-positive suite that checks common benign patterns are not flagged, but neither suite is a substitute for evidence from real-world use, which vexes does not yet have.
 
 ## Installation
 
@@ -103,9 +107,9 @@ vexes scan --cached                 # Use cached results (skip freshness check)
 
 **Exit codes:** `0` = clean, `1` = vulnerabilities found, `2` = error/incomplete scan
 
-### `vexes analyze` -- Deep behavioral analysis
+### `vexes analyze` -- Behavioral analysis
 
-Goes beyond vulnerability databases. Downloads registry metadata, runs AST analysis on install scripts, profiles behavioral changes between versions.
+Downloads registry metadata, runs AST analysis on install scripts, and profiles behavioral changes between versions. The output is a list of signals to review; expect some of them to be benign.
 
 ```bash
 vexes analyze                       # Analyze direct dependencies
@@ -132,18 +136,18 @@ vexes analyze --json                # Machine-readable JSON output
 - `MISSING_PROVENANCE` -- No Sigstore provenance attestation
 - `NO_REPOSITORY` -- No source repository link
 
-### `vexes fix` -- Verified fix recommendations
+### `vexes fix` -- Fix recommendations
 
-Finds vulnerabilities and generates **verified** upgrade commands. Every recommended version is cross-checked against OSV to ensure it isn't itself vulnerable.
+Finds vulnerabilities and suggests upgrade commands. Each recommended version is cross-checked against OSV first, so it should not carry an advisory OSV already knows about.
 
 ```bash
 vexes fix                           # Show fix recommendations
 vexes fix --json                    # Machine-readable output
 ```
 
-### `vexes guard` -- Pre-install protection
+### `vexes guard` -- Pre-install check
 
-Intercepts `npm install` and analyzes new/changed packages **before** they execute. Works by diffing lockfiles -- no network proxy needed.
+Intercepts `npm install` and analyzes new or changed packages before they execute. Works by diffing lockfiles -- no network proxy needed. This is the least exercised command; it sits in the path of your installs, so try it on a throwaway project first.
 
 ```bash
 vexes guard -- npm install axios    # Guard a specific install
@@ -178,7 +182,7 @@ vexes monitor --watch --interval 5  # Poll every 5 minutes
 
 ### `vexes explain` -- AI-assisted triage
 
-Turns a wall of CVEs into a prioritized, plain-English action plan: what to fix first, why it matters (blast radius), and the upgrade sequence. **Opt-in and privacy-preserving** -- it calls the Claude API only when `ANTHROPIC_API_KEY` is set. The scanner itself stays fully deterministic and offline; this is a layer on top, not in the middle.
+Summarizes a long list of CVEs into a plain-English suggested order of work: what to look at first, why, and the upgrade sequence. Opt-in -- it calls the Claude API only when `ANTHROPIC_API_KEY` is set. The rest of the scanner does not use a model; this is a layer on top, not in the middle. Treat its prioritization as a draft to check, since it is a model's read of the findings.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -266,7 +270,7 @@ Same format. Project config overrides user config.
 
 ### Allowlists
 
-vexes ships with built-in allowlists for packages with legitimate postinstall scripts (esbuild, sharp, puppeteer, etc.). Signals from these packages are **downweighted, not suppressed** -- a compromised version still triggers if new dangerous patterns appear.
+vexes ships with built-in allowlists for packages with legitimate postinstall scripts (esbuild, sharp, puppeteer, etc.). Signals from these packages are downweighted rather than suppressed, so a version that introduces new dangerous patterns can still surface.
 
 ## Architecture
 
@@ -328,11 +332,11 @@ test/
 
 ## Security design principles
 
-1. **Fail loud, not clean.** A security scanner that silently reports clean on failure is worse than useless. If queries fail, vexes exits with code 2 and prints `SCAN INCOMPLETE`. Invalid ecosystems are rejected outright instead of silently scanning nothing.
+1. **Fail loud, not clean.** A scanner that reports clean when it actually failed is misleading. If queries fail, vexes exits with code 2 and prints `SCAN INCOMPLETE`. Invalid ecosystems are rejected instead of silently scanning nothing.
 
 2. **Zero dependencies.** The dependency chain is the attack surface. vexes has none. Acorn is vendored. SQLite is Node.js built-in.
 
-3. **Terminal injection protection.** All external data is sanitized with a comprehensive filter covering CSI sequences (with intermediate bytes), OSC (BEL and ST terminators), DCS/APC/PM/SOS sequences, C1 control codes (0x80-0x9F), and bare ESC bytes.
+3. **Terminal injection protection.** External data is sanitized before display, covering CSI sequences (with intermediate bytes), OSC (BEL and ST terminators), DCS/APC/PM/SOS sequences, C1 control codes (0x80-0x9F), and bare ESC bytes.
 
 4. **Prototype pollution protection.** Config file merging rejects `__proto__`, `constructor`, and `prototype` keys.
 
@@ -340,17 +344,17 @@ test/
 
 6. **Gzip bomb + SSRF protection.** Tarball downloads enforce streaming size limits, HTTPS-only URLs, and a registry host allowlist to prevent memory exhaustion and SSRF attacks.
 
-7. **Cache integrity.** Corrupted entries are auto-deleted. Degraded results are never cached. TTL is clamped to prevent config-based stale data attacks (max 7 days advisory, 30 days metadata).
+7. **Cache integrity.** Corrupted entries are auto-deleted. Degraded results are not cached. TTL is clamped to prevent config-based stale data attacks (max 7 days advisory, 30 days metadata).
 
-8. **Never recommend vulnerable fixes.** The `fix` command cross-checks every recommended version against OSV before presenting it.
+8. **Don't recommend a known-vulnerable fix.** The `fix` command cross-checks each recommended version against OSV before presenting it.
 
-9. **Critical signals are undisableable.** `KNOWN_COMPROMISED`, `PHANTOM_DEPENDENCY`, `CIRCULAR_STAGING`, and `CAPABILITY_ESCALATION` cannot be turned off via config -- they detect active attacks.
+9. **Critical signals cannot be disabled.** `KNOWN_COMPROMISED`, `PHANTOM_DEPENDENCY`, `CIRCULAR_STAGING`, and `CAPABILITY_ESCALATION` cannot be turned off via config -- they are the signals most worth a second look, even when noisy.
 
 10. **Allowlisted packages are still inspected.** Known-good packages (esbuild, sharp, etc.) have their signals downweighted, not suppressed. AST analysis runs on all packages regardless of allowlist status.
 
 11. **Unicode homoglyph detection.** Package names are checked for invisible characters (zero-width spaces, BIDI overrides) and non-ASCII homoglyphs that could disguise malicious packages.
 
-12. **Integrity-aware lockfile diffing.** Guard detects when a package tarball changes without a version bump by comparing integrity hashes.
+12. **Integrity-aware lockfile diffing.** Guard flags when a package tarball changes without a version bump by comparing integrity hashes.
 
 ## License
 
