@@ -9,7 +9,7 @@ import { VERSION, SEVERITY } from '../core/constants.js';
  *
  *   {
  *     schemaVersion: "1.0",
- *     generator: { name: "vexes", version: "0.3.0" },
+ *     generator: { name: "vexes", version: "0.4.0" },
  *     timestamp, command,
  *     target: { dir, lockfiles, ecosystems },
  *     complete,            // top-level bool (backward compat with pre-schema output)

@@ -23,7 +23,7 @@ npx @penumbraforge/vexes scan
 ```
 $ vexes scan --path demo
 
-  vexes v0.3.0 -- scanning dependencies
+  vexes v0.4.0 -- scanning dependencies
 
   Found 33 unique packages across 3 dependency file(s)
 
@@ -205,8 +205,15 @@ vexes analyze --json                # Machine-readable JSON output
 ### Dynamic sandbox (experimental)
 
 `src/analysis/sandbox/` runs lifecycle scripts inside an OS isolation
-primitive — macOS `sandbox-exec` (Seatbelt), Linux `bwrap`/`unshare`/`firejail`
-— with network denied and writes scoped to a throwaway temp dir.
+primitive — macOS `sandbox-exec` (Seatbelt), Linux `bwrap`/`unshare`/`firejail`.
+**Capability is verified, not assumed:** `detectSandboxHost()` live-probes a
+benign command under each candidate before claiming a host exists, so a
+seccomp-blocked `unshare` on a hardened box/CI container is *refused*, never
+reported as isolated. Write scoping differs by host — seatbelt and `bwrap`
+bind a read-only root with a writable workdir, so **file writes cannot escape
+the workdir**; `unshare`/`firejail` isolate process and network only and run on
+the host filesystem (the recorder still logs write attempts, and the JSON
+reports `writeIsolation` truthfully).
 **Refuse-by-default:** nothing executes unless an isolation host exists *and*
 the caller opts in, so a hostless or non-opted-in request returns a `refused`
 status instead of a fake clean. Err on the side of "no quarantine" rather than
@@ -429,7 +436,7 @@ needed. Every machine command emits the same envelope:
 ```json
 {
   "schemaVersion": "1.0",
-  "generator": { "name": "vexes", "version": "0.3.0" },
+  "generator": { "name": "vexes", "version": "0.4.0" },
   "timestamp": "...", "command": "scan",
   "target": { "dir": "...", "lockfiles": [...], "ecosystems": [...] },
   "complete": true,              // false ⇒ NEVER treat as clean

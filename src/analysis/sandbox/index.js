@@ -18,7 +18,9 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import os from 'node:os';
 import { log } from '../../core/logger.js';
 
 // Per-platform isolation primitives, ordered by preference. Existence probe
@@ -29,6 +31,17 @@ const HOSTS = {
   linux: ['bwrap', 'unshare', 'firejail'],
 };
 
+// What the user can actually count on, per host. sandbox-exec (Seatbelt) and
+// bwrap ro-bind root + writable workdir ⇒ FILE WRITES CANNOT ESCAPE the
+// workdir. unshare/firejail isolate process/net namespaces only — they run on
+// the host filesystem, so writes are NOT contained (and we say so out loud).
+const HOST_CAP = {
+  'sandbox-exec': { writeIsolation: true },
+  bwrap: { writeIsolation: true },
+  unshare: { writeIsolation: false },
+  firejail: { writeIsolation: false },
+};
+
 function probe(host) {
   // Cheap pre-check: sandbox-exec lives at a fixed path on macOS.
   if (host === 'sandbox-exec' && existsSync('/usr/bin/sandbox-exec')) return { host, argv: [] };
@@ -37,17 +50,63 @@ function probe(host) {
   return { host, argv: [] };
 }
 
+// Cache shorthand so per-process consumers (doctor, analyze, inspect, tests)
+// agree on one answer without re-probing.
+let cachedHost = { done: false, value: null };
+
 /**
- * Detect an isolation primitive on THIS host. Never executes untrusted code.
- * @returns {{ host: string|null, profile: string|null }|null}
+ * Detect an isolation primitive on THIS host — and prove it works.
+ *
+ * Existence is not capability: on CI containers (and hardened boxes) the
+ * namespace syscalls unshare/bwrap rely on are seccomp-blocked even though the
+ * binaries exist. Claiming a sandbox there would mean executing untrusted code
+ * bare while reporting "isolated" — the one lie this module must never tell.
+ * So each candidate is live-verified with a benign `node -e` under the
+ * primitive; candidates that cannot run yield NO host (refuse, warn, keep the
+ * scan complete). Verification result is cached for the process lifetime.
+ *
+ * @param {object} [opts] — { live: false } skips the probe (for pure callers)
+ * @returns {{ host: string, writeIsolation: boolean }|null}
  */
-export function detectSandboxHost() {
-  const candidates = HOSTS[process.platform] || [];
-  for (const c of candidates) {
-    const hit = probe(c);
-    if (hit) return hit;
+export function detectSandboxHost({ live = true } = {}) {
+  if (cachedHost.done) return cachedHost.value;
+  let value = null;
+  for (const c of HOSTS[process.platform] || []) {
+    if (!probe(c)) continue;
+    if (live && !verifyPrimitive(c)) continue; // binary exists, can't isolate
+    value = { host: c, writeIsolation: !!HOST_CAP[c]?.writeIsolation };
+    break;
   }
-  return null;
+  cachedHost = { done: true, value };
+  return value;
+}
+
+/**
+ * Run a benign `node -e 'vexes-p'` under the candidate primitive. True only if
+ * the command actually executes under isolation and its output comes back.
+ */
+function verifyPrimitive(hostName) {
+  let workdir;
+  try { workdir = mkdtempSync(join(os.tmpdir(), 'vexes-probe-')); } catch { return false; }
+  try {
+    const argv = buildSandboxCmd({
+      host: hostName,
+      workdir,
+      command: ['node', '-e', 'process.stdout.write("vexes-p")'],
+    });
+    if (!argv) return false;
+    const r = spawnSync(argv[0], argv.slice(1), { cwd: workdir, timeout: 8000, encoding: 'utf8' });
+    return !!(r.stdout && r.stdout.includes('vexes-p'));
+  } catch {
+    return false;
+  } finally {
+    try { rmSync(workdir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
+// Test hook: forget the cached detection so a fresh probe can run.
+export function __resetSandboxHostCache() {
+  cachedHost = { done: false, value: null };
 }
 
 /**
@@ -143,24 +202,25 @@ export function runSandboxed(opts = {}) {
   // to force the refusal path.
   const host = forcedHost !== undefined ? forcedHost : detectSandboxHost();
   const hostName = host?.host || null;
+  const writeIsolation = !!host?.writeIsolation;
 
   if (!hostName) {
     return {
       status: 'refused', host: null, stdout: '', stderr: '',
-      spawns: [], code: null,
+      spawns: [], code: null, writeIsolation: false,
       reason: 'no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)',
     };
   }
   if (!allow) {
     return {
       status: 'refused', host: hostName, stdout: '', stderr: '',
-      spawns: [], code: null,
+      spawns: [], code: null, writeIsolation,
       reason: 'sandbox is experimental and not opted in (pass --sandbox explicitly)',
     };
   }
 
   const argv = buildSandboxCmd({ host: hostName, command, workdir });
-  if (!argv) return { status: 'failed', host: hostName, reason: 'no handler for host' };
+  if (!argv) return { status: 'failed', host: hostName, reason: 'no handler for host', writeIsolation, spawns: [], code: null, stdout: '', stderr: '' };
 
   log.debug(`sandbox exec: ${argv.join(' ')}`);
   try {
@@ -174,6 +234,7 @@ export function runSandboxed(opts = {}) {
     return {
       status: spawnFailed ? 'failed' : 'ran',
       host: hostName,
+      writeIsolation,
       stdout: r.stdout || '',
       stderr: r.stderr || '',
       code: typeof r.status === 'number' ? r.status : (spawnFailed ? null : (timedOut ? 124 : null)),
@@ -182,7 +243,7 @@ export function runSandboxed(opts = {}) {
     };
   } catch (err) {
     log.warn(`sandbox run failed: ${err.message}`);
-    return { status: 'failed', host: hostName, reason: err.message, spawns: [], code: null, stdout: '', stderr: '' };
+    return { status: 'failed', host: hostName, reason: err.message, spawns: [], code: null, stdout: '', stderr: '', writeIsolation };
   }
 }
 

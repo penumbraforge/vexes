@@ -3,6 +3,57 @@
 All notable changes to vexes are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-08-22
+
+The live-AI and dynamic-sandbox release. Tier B AI lands against a **local
+claude-cluster** (nothing leaves home), lifecycle scripts run inside an OS
+sandbox under a recorder instead of just being read, and guard is hardened.
+All three keep the honesty bar: capability-verified sandboxing, refuse-by-default,
+and a shared JSON envelope for every machine command.
+
+### Added
+- **Local-first AI against the claude-cluster** — `scan --ai`/`explain` detect an
+  `ANTHROPIC_BASE_URL` and authenticate with a Bearer `ANTHROPIC_AUTH_TOKEN`,
+  mirroring the hosted path (`ANTHROPIC_API_KEY` is still supported). The model
+  is **auto-discovered** from `GET /v1/models` — no `ANTHROPIC_MODEL` needed —
+  and any provider failure degrades to a per-finding error verdict without
+  ever flipping the scan's `complete`. Provider precedence:
+  `VEXES_AI_BASE` → `ANTHROPIC_BASE_URL` → `ANTHROPIC_API_KEY`.
+- **Dynamic sandbox evidence** — `analyze --sandbox` and `inspect --sandbox`
+  extract CRITICAL/HIGH candidates (npm/pyPI, top-N by risk score) to a
+  throwaway dir, run their entry script inside the OS isolation primitive under
+  a recorder shim (`node --require`, fd-based so it can't self-recursively
+  patch), and attach a `SANDBOX_BEHAVIOR` signal plus `sandboxEvidence`
+  (spawns / network attempts / outside writes) to the record. New
+  `src/analysis/sandbox/harness.js` + tarball extraction to disk with a tar
+  traversal guard.
+- **Capability-verified sandbox detection** — `detectSandboxHost()` no longer
+  trusts that a binary exists; it live-probes a benign command under each
+  candidate. A seccomp-blocked `unshare` (hardened boxes, CI containers) is
+  **refused**, not reported as isolated. Hosts that can't contain file writes
+  (`unshare`/`firejail`) are labeled `writeIsolation: false` in the JSON;
+  seatbelt and bwrap carry the full write-containment guarantee.
+- **`vexes doctor`** — 14 built-in self-checks: provider reachability, model
+  discovery, scan determinism, sandbox host, privilege test, internet gate.
+  Reads all the config plumbing (`IGNORE_FILE`, `VEXES_*`, proxy) and answers
+  "is this install trustworthy?" with a pass/fail list.
+- **Shared agent envelope** (`src/cli/schema.js`, `SCHEMA_VERSION 1.0`) —
+  scan, analyze, fix, monitor --ci, inspect, triage, doctor all emit the same
+  `buildEnvelope` shape: `complete` (false ⇒ never "clean"), warnings,
+  summary, findings-preserved verbatim. `guard` now emits through it too.
+
+### Changed
+- **Guard hardening** — manager-correct dry-run flags (`pnpm --lockfile-only`,
+  `yarn --mode=update-lockfile --ignore-scripts`; npx adds none), and a
+  lockfile tamper guard that verifies the post-dry-run lockfile still parses
+  and any diff is reachable from the requested install; on any violation the
+  backup is restored and the install is *not* executed (exit error).
+- **Help-text honesty** — every formerly "needs `ANTHROPIC_API_KEY`" line now
+  names the pluggable local-first reality (`VEXES_AI_BASE`, or
+  `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`, or `ANTHROPIC_API_KEY`).
+- **`inspect`** — dependency+file inspection with `--deep` AST scan and the
+  same `--sandbox` dynamic run as analyze.
+
 ## [0.3.0] — 2026-08-12
 
 The hardening release. SARIF output for GitHub code scanning, a rewritten
