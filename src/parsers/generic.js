@@ -3,6 +3,8 @@ import { discover as discoverRuby, parseLockfile as parseGemLock, parseManifest 
 import { discover as discoverPhp, parseLockfile as parseComposerLock, parseManifest as parseComposerJson } from './php.js';
 import { discover as discoverNuget, parseLockfile as parseNugetLock, parseManifest as parseCsproj } from './dotnet.js';
 import { discover as discoverJava, parseLockfile as parseGradleLock, parseManifest as parsePom } from './java.js';
+import { discover as discoverHex, parseLockfile as parseMixLock } from './hex.js';
+import { discover as discoverPub, parseLockfile as parsePubspecLock } from './pub.js';
 
 export const GENERIC_ECOSYSTEM_PARSERS = Object.freeze({
   go: {
@@ -29,6 +31,16 @@ export const GENERIC_ECOSYSTEM_PARSERS = Object.freeze({
     discover: discoverJava,
     parseLockfile: parseGradleLock,
     parseManifest: parsePom,
+  },
+  hex: {
+    discover: discoverHex,
+    parseLockfile: parseMixLock,
+    parseManifest: null, // mix.lock only — no generic manifest parser yet
+  },
+  pub: {
+    discover: discoverPub,
+    parseLockfile: parsePubspecLock,
+    parseManifest: null,
   },
 });
 

@@ -48,6 +48,10 @@ function levelFor(severity) {
   return LEVEL_BY_SEVERITY[String(severity).toUpperCase()] || 'warning';
 }
 
+function reachabilityFor(v) {
+  return v.reachability || 'unknown';
+}
+
 function securitySeverityFor(severity) {
   return SECURITY_SEVERITY[String(severity).toUpperCase()] || '0.0';
 }
@@ -110,6 +114,11 @@ export function toSarif(scanResult = {}) {
       // Stable across runs so the same finding dedupes in code scanning.
       partialFingerprints: {
         'vexes/packageVulnerability/v1': `${v.ecosystem}:${v.package}:${v.id}`,
+      },
+      // Tier A reachability grade flows into SARIF properties so CI triage
+      // rules can branch on it (e.g. ignore `dead` in auto-PR decoration).
+      properties: {
+        reachability: reachabilityFor(v),
       },
     };
   });

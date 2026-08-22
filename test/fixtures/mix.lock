@@ -1,0 +1,6 @@
+%{
+  "jason": {:hex, :jason, "1.4.4", "6a4b2c....", [:mix], [], "hexpm", "hash....", 1714839488, %{}, []},
+  "plug": {:hex, :plug, "1.16.0", "b6ec17....", [:mix], [], "hexpm", "hash....", 1715000000, %{}, []},
+  "phoenix": {:hex, :phoenix, "1.7.14", "d4d4cd....", [:mix], [], "hexpm", "hash....", 1715200000, %{}, []},
+  "gitdep": {:git, "https://github.com/example/gitdep.git", "abcdef01", []},
+}

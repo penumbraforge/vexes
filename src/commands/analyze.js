@@ -1,6 +1,7 @@
 import { resolve, basename } from 'node:path';
 import { statSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
+import { buildEnvelope } from '../cli/schema.js';
 import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, SEVERITY, ANALYZE_CONCURRENCY } from '../core/constants.js';
@@ -11,8 +12,8 @@ import { discover as discoverPypi, parseFile as parsePypiFile } from '../parsers
 import { queryBatch } from '../advisories/osv.js';
 import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { fetchPypiMetadata } from '../advisories/pypi-registry.js';
-import { checkProvenance } from '../analysis/provenance.js';
-import { analyzePackage, scoreToLevel } from '../analysis/signals.js';
+import { checkProvenance, detectProvenanceSpoof } from '../analysis/provenance.js';
+import { analyzePackage, scoreToLevel, SIGNAL_CONFIDENCE } from '../analysis/signals.js';
 import { inspectTarball, getTarballUrl, getPypiTarballUrl } from '../analysis/tarball-inspector.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { partitionByIgnore } from '../core/ignore.js';
@@ -91,7 +92,14 @@ export async function runAnalyze(flags, args) {
 
   if (allDeps.length === 0) {
     if (!isJSON) out(`  ${C.dim}No dependencies found to analyze in ${targetDir}${C.reset}\n`);
-    else out(JSON.stringify({ version: VERSION, command: 'analyze', results: [], warnings }, null, 2));
+    else out(JSON.stringify(buildEnvelope({
+      command: 'analyze',
+      target: { dir: targetDir, lockfiles: [], ecosystems: [...config.ecosystems] },
+      complete: true,
+      warnings,
+      findings: [],
+      extra: { version: VERSION, results: [] },
+    }), null, 2));
     return EXIT.OK;
   }
 
@@ -187,6 +195,7 @@ export async function runAnalyze(flags, args) {
             pkg.signals.push({
               signal: 'MISSING_PROVENANCE',
               severity,
+              confidence: SIGNAL_CONFIDENCE.MISSING_PROVENANCE,
               description: 'No Sigstore provenance attestation — package was not verifiably built from source',
               evidence: { standalone: !hasOtherSignals },
               layer: 4,
@@ -194,6 +203,20 @@ export async function runAnalyze(flags, args) {
             pkg.riskScore += SEVERITY[severity].weight;
           } else if (prov?.hasProvenance === true) {
             pkg.provenance = { sourceRepo: prov.sourceRepo, buildType: prov.buildType };
+
+            // 5a. Provenance ≠ trust: xref the attestation's certified artifact
+            // names (and claimed build repo) against the package's actual
+            // identity + declared repo. Replay and repo-mismatch → signal.
+            const spoof = detectProvenanceSpoof({
+              packageName: pkg.name,
+              subjects: prov.subjects,
+              sourceRepo: prov.sourceRepo,
+              declaredRepo: pkg.declaredRepository,
+            });
+            if (spoof) {
+              pkg.signals.push(spoof);
+              pkg.riskScore += SEVERITY[spoof.severity].weight;
+            }
           }
         }
       }
@@ -237,6 +260,7 @@ export async function runAnalyze(flags, args) {
               pkg.signals.push({
                 signal: 'TARBALL_DANGEROUS_PATTERN',
                 severity: finding.severity,
+                confidence: SIGNAL_CONFIDENCE.TARBALL_DANGEROUS_PATTERN,
                 description: finding.description,
                 evidence: { file: finding.file, pattern: finding.pattern },
                 layer: 1,
@@ -299,11 +323,15 @@ export async function runAnalyze(flags, args) {
 
     // 8. Format output
     if (isJSON) {
-      out(JSON.stringify({
-        version: VERSION,
-        timestamp: new Date().toISOString(),
+      // Analyze carries its own rich result records (signals, riskScore,
+      // per-signal evidence). They stay in `results` verbatim — the envelope's
+      // `findings` array is reserved for OSV-style normalized records, so
+      // agents that iterate findings uniformly never mis-parse analyze's shape.
+      out(JSON.stringify(buildEnvelope({
         command: 'analyze',
+        target: { dir: targetDir, lockfiles: [], ecosystems: [...config.ecosystems] },
         complete,
+        warnings,
         summary: {
           total: uniqueDeps.length,
           flagged: flaggedResults.length,
@@ -311,9 +339,9 @@ export async function runAnalyze(flags, args) {
           critical: flaggedResults.filter(r => r.riskLevel === 'CRITICAL').length,
           high: flaggedResults.filter(r => r.riskLevel === 'HIGH').length,
         },
-        warnings,
-        results: flaggedResults,
-      }, null, 2));
+        findings: [],
+        extra: { version: VERSION, results: flaggedResults },
+      }), null, 2));
     } else {
       // Explain mode: detailed breakdown for a single package
       if (config.explain) {
@@ -438,6 +466,7 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
     version: dep.version,
     ecosystem: dep.ecosystem,
     isDirect: dep.isDirect,
+    declaredRepository: metadata?.repository || null,
     signals: result.signals,
     riskScore: result.riskScore,
     riskLevel: result.riskLevel,

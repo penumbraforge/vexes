@@ -12,8 +12,10 @@ import { discover as discoverCargo, parseLockfile as parseCargoLock } from '../p
 import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from '../parsers/generic.js';
 import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { diffSnapshots, toSnapshot } from '../analysis/diff.js';
+import { checkFreshness } from '../analysis/freshness.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { toSarif } from '../cli/sarif.js';
+import { buildEnvelope, normalizeFinding, REACHABILITY } from '../cli/schema.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MIN_POLL_INTERVAL_MS = 60 * 1000;           // 1 minute
@@ -49,6 +51,9 @@ export async function runMonitor(flags, args) {
   ${C.bold}WATCH OPTIONS${C.reset}
     --path <dir>         Target directory ${C.dim}(default: cwd)${C.reset}
     --interval <min>     OSV poll interval in minutes ${C.dim}(default: 60)${C.reset}
+    --freshness <min>    Registry poll interval — detects suspicious NEW
+                         releases within minutes (default: off). Combine with
+                         --interval for the full real-time layer.
 
   ${C.bold}CI EXAMPLE${C.reset}
     ${C.dim}# GitHub Actions workflow step${C.reset}
@@ -82,15 +87,15 @@ async function runCI(flags) {
     if (isSARIF) {
       out(JSON.stringify(toSarif({ complete, summary: { total: 0, vulnerable: 0 }, warnings, vulnerabilities: [] }), null, 2));
     } else if (isJSON) {
-      out(JSON.stringify({
-        version: VERSION,
+      out(JSON.stringify(buildEnvelope({
         command: 'monitor',
-        mode: 'ci',
+        target: { dir: targetDir, lockfiles: [], ecosystems: [...config.ecosystems] },
         complete,
-        summary: { total: 0, vulnerable: 0, scanned: 0, failed: parseResult.parseFailures },
         warnings,
-        vulnerabilities: [],
-      }, null, 2));
+        summary: { total: 0, vulnerable: 0, scanned: 0, failed: parseResult.parseFailures, unreachable: 0 },
+        findings: [],
+        extra: { mode: 'ci', version: VERSION, vulnerabilities: [] },
+      }), null, 2));
     } else if (complete) {
       out('::notice::No dependencies found to scan');
     } else {
@@ -123,18 +128,21 @@ async function runCI(flags) {
       vulnerabilities: filtered,
     }), null, 2));
   } else if (isJSON) {
-    out(JSON.stringify({
-      version: VERSION, command: 'monitor', mode: 'ci',
+    out(JSON.stringify(buildEnvelope({
+      command: 'monitor',
+      target: { dir: targetDir, lockfiles: [], ecosystems: [...config.ecosystems] },
       complete,
+      warnings,
       summary: {
         total: allDeps.length,
         vulnerable: filtered.length,
         scanned: osvResult.queriedCount,
         failed: osvResult.failedCount,
+        unreachable: 0,
       },
-      warnings,
-      vulnerabilities: filtered,
-    }, null, 2));
+      findings: filtered.map(v => normalizeFinding(v, { reachability: REACHABILITY.UNKNOWN })),
+      extra: { mode: 'ci', version: VERSION, vulnerabilities: filtered },
+    }), null, 2));
   } else {
     // GitHub Actions annotation format
     for (const v of filtered) {
@@ -274,9 +282,28 @@ async function runWatch(flags) {
     await runPollCycle(currentDeps, config);
   }, intervalMs);
 
+  // Freshness poll — detects suspicious NEW releases before any CVE exists.
+  // Polls the registry (visible within minutes of publish), not OSV (which
+  // lags whole attack windows). Alerts only fire on NEW versions with
+  // attacker-shaped deltas.
+  let freshnessInterval = null;
+  const freshnessMin = flags.freshness ? parseInt(flags.freshness, 10) : 0;
+  if (freshnessMin > 0) {
+    const freshnessMs = Math.max(freshnessMin * 60 * 1000, MIN_POLL_INTERVAL_MS);
+    out(`  ${C.cyan}Freshness enabled: polling registry every ${freshnessMin} min for new releases${C.reset}`);
+    freshnessInterval = setInterval(async () => {
+      out(`\n  ${C.dim}[${new Date().toISOString().slice(11, 19)}] Freshness poll: checking ${currentDeps.length} packages for new releases...${C.reset}`);
+      await runFreshnessCycle(currentDeps, config);
+    }, freshnessMs);
+    // Kick it off immediately too — the initial baseline is minutes of lead
+    // time the attacker may have already burned.
+    setTimeout(() => runFreshnessCycle(currentDeps, config), 1500);
+  }
+
   // Keep process alive until Ctrl+C
   process.on('SIGINT', () => {
     clearInterval(pollInterval);
+    if (freshnessInterval) clearInterval(freshnessInterval);
     for (const w of watchers) w.close();
     out(`\n  ${C.dim}Monitor stopped.${C.reset}\n`);
     process.exit(EXIT.OK);
@@ -320,6 +347,40 @@ export async function runPollCycle(deps, config) {
     log.error(`poll cycle failed: ${err.message}`);
     return { complete: false, vulnerabilities: [], warnings: [err.message] };
   }
+}
+
+/**
+ * Run a single freshness cycle — checks the tracked package set for new
+ * releases with attacker-shaped deltas and emits alerts. Emits the same
+ * shared envelope as everything else when --json is active so agents can
+ * consume the alerts directly.
+ */
+export async function runFreshnessCycle(deps, config) {
+  const events = await checkFreshness(deps);
+  const alerts = events.filter(e => e.isNew);
+  if (alerts.length === 0) return;
+
+  const isJSON = config.output?.format === 'json';
+  if (isJSON) {
+    out(JSON.stringify(buildEnvelope({
+      command: 'monitor',
+      target: { dir: config.targetPath || '.', lockfiles: [], ecosystems: [...config.ecosystems] },
+      complete: true,
+      warnings: [],
+      summary: { total: deps.length, vulnerable: 0, fresh: alerts.filter(a => a.isNew).length },
+      findings: [],
+      extra: { mode: 'freshness', version: VERSION, alerts },
+    }), null, 2));
+    return;
+  }
+
+  out(`\n  ${C.red}${C.bold}⚠ Fresh release(s) detected:${C.reset}`);
+  for (const a of alerts) {
+    const tag = a.level === 'high' ? C.red : C.yellow;
+    out(`  ${tag}${C.bold}${sanitize(a.name)}${C.reset} ${C.dim}${sanitize(a.installed)} → ${sanitize(a.latest)}${C.reset}`);
+    for (const reason of a.reasons) out(`    ${tag}▸ ${sanitize(reason)}${C.reset}`);
+  }
+  out('');
 }
 
 /**

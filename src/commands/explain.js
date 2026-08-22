@@ -4,7 +4,10 @@
  * Turns the wall of CVEs a scan produces into a prioritized, plain-English
  * action plan: what to fix first, why it matters (blast radius), and the
  * upgrade sequence. The scanner stays deterministic and offline; this is an
- * opt-in layer that calls the Claude API only when ANTHROPIC_API_KEY is set.
+ * opt-in layer on top of the pluggable provider (local OpenAI-compatible
+ * endpoint by default, Anthropic when ANTHROPIC_API_KEY is set — see
+ * src/ai/provider.js). Nothing leaves the machine unless a provider is
+ * configured, and only the sanitized extracted-findings payload is sent.
  *
  * Input, in order of preference:
  *   --input <file>   a scan JSON report (`vexes scan --format json > f.json`)
@@ -21,7 +24,7 @@ import { spawn } from 'node:child_process';
 import { C, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT } from '../core/constants.js';
-import { hasApiKey, complete } from '../ai/claude.js';
+import { complete, detectProvider, providerLabel } from '../ai/provider.js';
 
 const MAX_FINDINGS_IN_PROMPT = 60;
 
@@ -102,18 +105,23 @@ function scanToJson(path) {
 /**
  * Build a compact prompt payload from a scan report — small enough to send,
  * complete enough to prioritize. Caps the finding list and notes truncation.
+ *
+ * Every field is sanitized because a package name, summary, or advisory can
+ * carry attacker-controlled text (package descriptions, typosqatted names,
+ * malicious maintainer metadata). We never pass raw untrusted content to the
+ * model — only this sanitized, spec-shaped payload crosses the boundary.
  */
 function buildPayload(report) {
   const vulns = Array.isArray(report.vulnerabilities) ? report.vulnerabilities : [];
   const capped = vulns.slice(0, MAX_FINDINGS_IN_PROMPT);
   const findings = capped.map(v => ({
-    id: v.displayId || v.id,
-    package: v.package,
-    version: v.version,
-    ecosystem: v.ecosystem,
-    severity: v.severity,
-    fixed: v.fixed || null,
-    summary: (v.summary || '').slice(0, 200),
+    id: sanitize(v.displayId || v.id).slice(0, 64),
+    package: sanitize(v.package || '??'),
+    version: sanitize(String(v.version ?? '')).slice(0, 32),
+    ecosystem: sanitize(String(v.ecosystem ?? '')).slice(0, 32),
+    severity: sanitize(String(v.severity ?? '')).slice(0, 16),
+    fixed: sanitize(String(v.fixed ?? '')).slice(0, 64) || null,
+    summary: sanitize(String(v.summary ?? '')).slice(0, 200),
   }));
 
   return {
@@ -125,16 +133,23 @@ function buildPayload(report) {
 }
 
 export async function runExplain(flags, args) {
-  if (!hasApiKey()) {
+  const provider = detectProvider();
+  if (!provider) {
     out(`
-  ${C.bold}vexes explain${C.reset} needs an Anthropic API key.
+  ${C.bold}vexes explain${C.reset} needs an AI provider. AI triage is opt-in.
 
-  AI triage is opt-in. Set ${C.cyan}ANTHROPIC_API_KEY${C.reset} to enable it:
+  Point it at a local endpoint (recommended — nothing leaves your machine):
+
+    ${C.dim}export VEXES_AI_BASE=http://localhost:11434${C.reset}   ${C.dim}# Ollama${C.reset}
+    ${C.dim}export VEXES_AI_MODEL=qwen2.5-coder:7b${C.reset}${C.dim}   # or your Spark endpoint${C.reset}
+    ${C.dim}vexes scan --format json | vexes explain${C.reset}
+
+  or use Anthropic:
 
     ${C.dim}export ANTHROPIC_API_KEY=sk-ant-...${C.reset}
     ${C.dim}vexes scan --format json | vexes explain${C.reset}
 
-  vexes never sends data to any AI service unless this key is set.
+  vexes never sends data to any AI service unless a provider is configured.
 `);
     return EXIT.ERROR;
   }
@@ -149,7 +164,7 @@ export async function runExplain(flags, args) {
     return EXIT.OK;
   }
 
-  const spinnerText = `Triaging ${payload.findings.length} findings with AI...`;
+  const spinnerText = `Triaging ${payload.findings.length} findings (${providerLabel()})...`;
   if (!flags.quiet) log.info(spinnerText);
 
   let answer;
@@ -159,8 +174,8 @@ export async function runExplain(flags, args) {
       user: `Here is a vexes scan result. Produce the prioritized triage.\n\n${JSON.stringify(payload, null, 2)}`,
     });
   } catch (err) {
-    if (err.code === 'NO_API_KEY') {
-      log.error('ANTHROPIC_API_KEY is not set');
+    if (err.code === 'NO_PROVIDER') {
+      log.error('No AI provider configured — set VEXES_AI_BASE or ANTHROPIC_API_KEY');
     } else {
       log.error(`AI triage failed (${err.code || 'error'}): ${err.message}`);
     }
@@ -168,7 +183,7 @@ export async function runExplain(flags, args) {
   }
 
   const s = payload.summary;
-  out(`\n  ${C.bold}vexes${C.reset} v${VERSION} ${C.dim}— AI triage${C.reset}`);
+  out(`\n  ${C.bold}vexes${C.reset} v${VERSION} ${C.dim}— AI triage via ${providerLabel()}${C.reset}`);
   out(`  ${C.dim}${s.vulnerable ?? payload.findings.length} findings · ${s.critical ?? 0} critical · ${s.high ?? 0} high${payload.truncated ? ` · +${payload.truncated} more not sent` : ''}${C.reset}\n`);
 
   // The model's answer is untrusted-ish text; run it through the same ANSI

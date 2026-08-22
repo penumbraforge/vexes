@@ -67,6 +67,21 @@ async function main() {
       return await runMonitor(flags, args);
     }
 
+    case 'inspect': {
+      const { runInspect } = await import('../src/commands/inspect.js');
+      return await runInspect(flags, args);
+    }
+
+    case 'doctor': {
+      const { runDoctor } = await import('../src/commands/doctor.js');
+      return await runDoctor(flags, args);
+    }
+
+    case 'licenses': {
+      const { runLicenses } = await import('../src/commands/licenses.js');
+      return await runLicenses(flags, args);
+    }
+
     case 'explain':
     case 'triage': {
       const { runExplain } = await import('../src/commands/explain.js');
@@ -93,6 +108,9 @@ function printHelp() {
     guard      Pre-install protection via lockfile diffing
     monitor    CI integration (GitHub Actions) + continuous watch
     explain    AI-assisted triage of findings ${C.dim}(needs ANTHROPIC_API_KEY)${C.reset}
+    inspect    Assess a single package ${C.dim}(e.g. vexes inspect lodash@4.17.21)${C.reset}
+    doctor     Self-test parsers, cache, and network
+    licenses   Declared license bill of materials via deps.dev ${C.dim}(npm/pypi/cargo/go/nuget/java)${C.reset}
     help       Show this help
     version    Show version
 
@@ -101,6 +119,10 @@ function printHelp() {
     --ecosystem <name>   Filter: npm, pypi, cargo, go, ruby, php, nuget, java
     --severity <level>   Minimum: critical, high, moderate, low ${C.dim}(default: moderate)${C.reset}
     --fix                Show fix commands for each vulnerability
+    --min-reachability <bar>  Only report findings at/above this reachability
+                          bar: reachable, lazy, dead ${C.dim}(default: dead = all)${C.reset}
+    --ai                 Tier B: LLM exploitability verdict per finding
+                          ${C.dim}(advisory; uses local provider, see --explain; never filters)${C.reset}
     --cached             Use cached results without freshness check
     --json               Output JSON to stdout
     --format <fmt>       Output format: text, json, sarif ${C.dim}(default: text)${C.reset}
@@ -134,6 +156,16 @@ function printHelp() {
     --severity <level>   CI fail threshold ${C.dim}(default: high)${C.reset}
     --interval <min>     Watch poll interval in minutes ${C.dim}(default: 60)${C.reset}
     --sarif              SARIF output for GitHub Advanced Security
+
+  ${C.bold}INSPECT OPTIONS${C.reset} ${C.dim}(single-package on-demand assessment)${C.reset}
+    vexes inspect lodash@4.17.21    Assess a package spec (defaults to latest)
+    --ecosystem <name>   npm (default) or pypi
+    --deep               Download + AST-inspect the package tarball
+    --json               Output JSON to stdout
+
+  ${C.bold}DOCTOR OPTIONS${C.reset} ${C.dim}(self test)${C.reset}
+    vexes doctor         Verify parsers, cache, and registry reachability
+    --json               Machine-readable JSON output
 
   ${C.bold}EXPLAIN OPTIONS${C.reset} ${C.dim}(AI triage — opt-in, needs ANTHROPIC_API_KEY)${C.reset}
     vexes scan --format json | vexes explain   Triage a piped scan

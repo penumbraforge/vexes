@@ -18,9 +18,23 @@ const ECOSYSTEM_MAP = {
   'NuGet':     'NuGet',
   'java':      'Maven',
   'Maven':     'Maven',
+  'hex':       'Hex',
+  'Hex':       'Hex',
+  'pub':       'Pub',
+  'Pub':       'Pub',
 };
 
 const KNOWN_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEM_MAP));
+
+/**
+ * Map an internal ecosystem key to the OSV ecosystem identifier.
+ * Exported for parsers/tests; queryBatch uses it too.
+ * @param {string} ecosystem
+ * @returns {string} OSV ecosystem id, or the input when unmapped
+ */
+export function ecosystemToOsv(ecosystem) {
+  return ECOSYSTEM_MAP[ecosystem] || ecosystem;
+}
 
 // Normalize non-standard severity strings from various advisory sources
 const SEVERITY_NORMALIZE = {
@@ -65,7 +79,7 @@ export async function queryBatch(packages) {
       return {
         package: {
           name: pkg.name,
-          ecosystem: mappedEco || pkg.ecosystem,
+          ecosystem: ecosystemToOsv(pkg.ecosystem),
         },
         version: pkg.version,
       };

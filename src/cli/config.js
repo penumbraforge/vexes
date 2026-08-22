@@ -11,7 +11,7 @@ const VALID_FORMATS = new Set(['text', 'json', 'sarif']);
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 const DEFAULTS = Object.freeze({
-  ecosystems: ['npm', 'pypi', 'cargo', 'go', 'ruby', 'php', 'nuget', 'java'],
+  ecosystems: ['npm', 'pypi', 'cargo', 'go', 'ruby', 'php', 'nuget', 'java', 'hex', 'pub'],
   severity: 'moderate',
   ignore: [],
   analyze: {
@@ -141,6 +141,18 @@ export function loadConfig(dir, flags = {}) {
   if (flags.deep) config.deep = true;
   if (flags.fix) config.fix = true;
   if (flags.explain) config.explain = flags.explain;
+  // --min-reachability: only report findings whose reachability grades at/above
+  // this bar. Valid: reachable, lazy, dead (dead = report everything), or unset.
+  if (flags['min-reachability']) {
+    const r = String(flags['min-reachability']).toLowerCase();
+    if (!['reachable', 'lazy', 'dead'].includes(r)) {
+      throw new Error(`unknown min-reachability "${flags['min-reachability']}" — valid options: reachable, lazy, dead`);
+    }
+    config.minReachability = r;
+  }
+  // --ai: opt-in Tier B exploitability triage on scan findings via the pluggable
+  // provider (local by default). Advisory metadata only — see exploitability.js.
+  if (flags.ai) config.ai = true;
 
   // Expand ~ in cache dir
   if (typeof config.cache?.dir === 'string' && config.cache.dir.startsWith('~')) {

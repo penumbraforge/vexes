@@ -19,29 +19,25 @@ npx @penumbraforge/vexes scan
 > **[See it in action](https://github.com/penumbraforge/vexes/actions/workflows/demo.yml)** — click "Run workflow" to watch vexes scan a demo project with real vulnerabilities across npm, PyPI, and Cargo. No install needed.
 
 ```
-$ vexes scan
+$ vexes scan --path demo
 
-  vexes v0.1.0 -- scanning dependencies
+  vexes v0.3.0 -- scanning dependencies
 
-  Found 847 unique packages across 3 lockfile(s)
-  ~ 847 packages checked in 2.1s (0 cached)
+  Found 33 unique packages across 3 dependency file(s)
 
   -- CRITICAL --------------------------------------------------
-  axios 1.14.1 (npm)
-    GHSA-xxxx -- Remote code execution via compromised dependency
-    Fixed in: >= 1.14.2
-    https://osv.dev/vulnerability/GHSA-xxxx
+  tar 6.1.0 (npm)
+    GHSA-23hp-3jrh-7fpw -- node-tar: Decompression/parse DoS via unlimited input
+    Fixed in: >= 7.5.19
+    https://osv.dev/vulnerability/GHSA-23hp-3jrh-7fpw
+  minimist 1.2.5 (npm)
+    GHSA-xvch-5gv4-984h -- Prototype Pollution in minimist
+    Fixed in: >= 1.2.6
+    https://osv.dev/vulnerability/GHSA-xvch-5gv4-984h
+  ...
 
-  -- HIGH ------------------------------------------------------
-  lodash 4.17.20 (npm)
-    GHSA-yyyy -- Prototype pollution in lodash
-    Fixed in: >= 4.17.21
-
-  --------------------------------------------------
-  2 vulnerabilities . 1 critical . 1 high
-  in 847 packages across npm, pypi, cargo
-  completed in 2.1s
-  --------------------------------------------------
+  (real output, trimmed for the README — the demo tree carries 219 findings:
+   27 critical . 108 high . 84 moderate across npm, pypi, cargo)
 ```
 
 ## What it does
@@ -54,6 +50,22 @@ vexes is a dependency security scanner that goes beyond vulnerability databases.
 | **2. Dependency Graph** | Profiles newly added dependencies | Phantom dependencies (brand-new packages), circular staging, typosquatting, Unicode homoglyph attacks |
 | **3. Behavioral Fingerprinting** | Diffs capability profiles between versions | A utility library that suddenly gains network+exec capabilities |
 | **4. Registry Metadata** | Analyzes publish history, maintainers, timing | Account takeovers, rapid publishes, dormant package reactivation |
+
+**Two kinds of signal, weighted differently:**
+
+- **Vulnerability layer (OSV)** — hard proof. `scan` queries OSV.dev and reports
+  known-vulnerable versions with `confidence: proven`. Direct and transitive
+  dependency resolution, SARIF, verified `fix` upgrades — all built on this.
+- **Heuristic supply-chain signals** — `analyze` and `inspect` grade each
+  signal (`deterministic` / `heuristic` / `inferred`). OSV findings (`KNOWN_COMPROMISED`)
+  are `proven`; metadata facts (maintainer change, install scripts, publish
+  timing) are `deterministic`; pattern/AST matches are `heuristic` and can
+  false-positive. **Deep tarball analysis is npm/PyPI only** — other
+  ecosystems are OSV-and-metadata only, today.
+
+Every machine-readable command (`scan --json`, `analyze --json`,
+`fix --json`, `monitor --ci --json`, `inspect --json`, `triage`, `doctor`)
+emits through one versioned JSON envelope — the stable agent contract.
 
 ## Detection testing
 
@@ -97,9 +109,46 @@ vexes scan --severity critical      # Only show critical vulnerabilities
 vexes scan --fix                    # Show upgrade commands for each vuln
 vexes scan --json                   # Machine-readable JSON output
 vexes scan --cached                 # Use cached results (skip freshness check)
+vexes scan --min-reachability reachable  # Only report live, imported findings
+vexes scan --ai --json                   # + Tier B: LLM exploitability verdicts per finding
 ```
 
-**Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.sum), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml)
+**Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.sum), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml), Hex (mix.lock), Dart/pub (pubspec.lock)
+
+**Reachability (`--min-reachability`):** Tier A builds an import graph over the
+project's own source (acorn for JS, light `import`/`use` scanning for Python and
+Rust) and grades every dependency `reachable | lazy | dead | unknown` —
+**dead** means no project code imports it (dev/test leftovers, abandoned
+lockfile entries), which is the single biggest source of false positives in SCA
+tools. The default keeps everything, graded; `--min-reachability reachable`
+drops alarming-but-unreachable findings. Grades flow into JSON findings, the
+`llmSummary`, and SARIF `properties.reachability`, so agents and CI can
+prioritize by what the app can actually load. Unscannable ecosystems (Go, Ruby,
+PHP, NuGet, Java) are honestly graded `unknown`, never mislabeled dead.
+
+**Ecosystem reachability:** only `npm`/`pypi`/`cargo` have source scanners today.
+A lockfile-only repo (or `--path` pointing at one with no source) grades
+everything `dead` — that is correct: there is no app code importing anything.
+Add app source before trusting the grade.
+
+**Tier B exploitability (`--ai`):** the same reachability foundation, upgraded
+with an optional LLM judge (reuses the pluggable local-first provider — see
+`vexes explain`). Per finding, vexes sends the sanitized import evidence plus a
+truncated advisory summary and asks one question: *is the vulnerable path
+plausibly exploitable HERE?* The model answers `reachable | plausible | unclear`
+plus a one-line reason, attached as `findings[].exploitability` with summary
+roll-ups (`.exploitable`/`.plausible`/`.unclear`/`.aiError`).
+
+```bash
+vexes scan --ai --json                 # find vulns AND ask the local LLM which matter
+```
+
+Advisory metadata is untrusted, so the system prompt treats it as data and
+ignores embedded instructions, and nothing but extracted facts ever leaves home.
+Verdicts are **advisory metadata, never a filter**: a deterministic finding is
+never silenced by an AI opinion, and an AI failure never flips `complete` to
+false — it degrades to a warning. If no provider is configured, `--ai` is a
+transparent no-op you can keep in an agent's default loop.
 
 **Exit codes:** `0` = clean, `1` = vulnerabilities found, `2` = error/incomplete scan
 
@@ -130,7 +179,22 @@ vexes analyze --json                # Machine-readable JSON output
 - `TARBALL_DANGEROUS_PATTERN` -- Dangerous patterns in actual package source code
 - `HOMOGLYPH` -- Package name contains suspicious Unicode (zero-width chars, RTL override, non-ASCII)
 - `MISSING_PROVENANCE` -- No Sigstore provenance attestation
+- `SIGNATURE_SPOOF` -- Provenance **present and cryptographically valid** but
+  the attestation certifies a *different package's artifact* (replay) or claims
+  a *different source repo* than the package declares. Provenance ≠ trust: the
+  TanStack worm shipped valid SLSA L3 provenance; vexes is the tool that xrefs
+  what a signature actually says against who the package claims to be.
 - `NO_REPOSITORY` -- No source repository link
+
+### Dynamic sandbox (experimental)
+
+`src/analysis/sandbox/` runs lifecycle scripts inside an OS isolation
+primitive — macOS `sandbox-exec` (Seatbelt), Linux `bwrap`/`unshare`/`firejail`
+— with network denied and writes scoped to a throwaway temp dir.
+**Refuse-by-default:** nothing executes unless an isolation host exists *and*
+the caller opts in, so a hostless or non-opted-in request returns a `refused`
+status instead of a fake clean. Err on the side of "no quarantine" rather than
+"quarantine, trust us." `vexes doctor` reports whether a host is available.
 
 ### `vexes fix` -- Verified fix recommendations
 
@@ -174,6 +238,74 @@ vexes monitor --ci --json           # Machine-readable JSON
 # Watch mode -- continuous local monitoring
 vexes monitor --watch               # Watch lockfiles + poll OSV hourly
 vexes monitor --watch --interval 5  # Poll every 5 minutes
+vexes monitor --watch --freshness 5 # + poll registry metadata every 5 min
+```
+
+**Freshness layer (`--freshness <minutes>`):** the 2026 supply-chain race is
+measured in *hours* — axios was malicious ~3h, Mastra republished 140+
+packages in 88 minutes. CVE databases structurally lag those windows. The
+freshness layer polls the **registry**, where a new release is visible within
+minutes, and runs the signal engine on every new publish: publisher/account
+change (`HIGH`), new install lifecycle scripts (`HIGH`), newly added deps
+(`MODERATE`), rapid re-publish (`MODERATE`), and dormancy-then-activity
+(`MODERATE`). Last-seen version hashes persist in SQLite so each release is
+graded once. Alerts emit in the same JSON envelope an agent can read; the
+watcher never re-downloads or executes anything, it only grades metadata.
+
+### `vexes inspect` -- Single-package assessment (agent tool)
+
+Assess one package spec on demand — "is it safe to add this dependency?"
+No project required. Combines OSV history + registry metadata + all detection
+layers + Sigstore provenance in one call.
+
+```bash
+vexes inspect lodash@4.17.21 --json    # JSON envelope (agent-ready)
+vexes inspect express                  # latest version
+vexes inspect requests --ecosystem pypi
+vexes inspect axios@1.14.1 --deep      # + AST-inspect the real tarball
+```
+
+### `vexes doctor` -- Self test
+
+Verifies the scanner is trustworthy before an agent trusts its output:
+parsers round-trip real fixtures, the SQLite cache survives a write/read,
+and registries are reachable (network is a reported status, never a hard fail).
+
+```bash
+vexes doctor            # human output
+vexes doctor --json     # machine output
+```
+
+### `vexes licenses` -- Declared license SBOM (deps.dev)
+
+A license bill of materials — informational, never a security verdict. Uses
+Google's deps.dev API (no key) for SPDX license IDs across
+`npm` / `pypi` / `cargo` / `go` / `nuget` / `java`. Ecosystems deps.dev doesn't
+cover (`ruby`, `php`, `hex`, `pub`) are skipped with a visible warning, not an
+error — for those, `vexes scan` remains the vulnerability answer.
+
+```bash
+vexes licenses --path ./my-project
+vexes licenses --json
+```
+
+Fail-loud by contract: if any lookup fails, `complete: false` and exit 2 — a
+partial SBOM is never passed off as complete. A package with **no declared
+license** exits 1 (`VULNS_FOUND` equivalent) so CI notices; it is a flagged
+row, not an error. Requests are throttled under deps.dev's ~20 req/min
+unauthenticated limit, and 429/5xx responses are retried with backoff.
+
+```json
+{
+  "schemaVersion": "1.0",
+  "command": "licenses",
+  "complete": true,
+  "summary": { "total": 33, "withLicenses": 33, "missing": 0, "skipped": 0 },
+  "licenses": [
+    { "package": "express", "version": "4.17.1", "ecosystem": "npm",
+      "licenses": ["MIT"], "url": "https://api.deps.dev/..." }
+  ]
+}
 ```
 
 ### `vexes explain` -- AI-assisted triage
@@ -267,6 +399,41 @@ Same format. Project config overrides user config.
 ### Allowlists
 
 vexes ships with built-in allowlists for packages with legitimate postinstall scripts (esbuild, sharp, puppeteer, etc.). Signals from these packages are **downweighted, not suppressed** -- a compromised version still triggers if new dangerous patterns appear.
+
+## Agent contract (JSON CLI)
+
+Vexes is callable by agents via a **stable, versioned JSON CLI** — no MCP server
+needed. Every machine command emits the same envelope:
+
+```json
+{
+  "schemaVersion": "1.0",
+  "generator": { "name": "vexes", "version": "0.3.0" },
+  "timestamp": "...", "command": "scan",
+  "target": { "dir": "...", "lockfiles": [...], "ecosystems": [...] },
+  "complete": true,              // false ⇒ NEVER treat as clean
+  "result": { "complete": true, "warnings": [] },
+  "summary": { "total": 33, "vulnerable": 219, "critical": 27, "high": 108, "moderate": 84, "low": 0, "suppressed": 0,
+    "reachable": 0, "lazy": 0, "dead": 33, "unreachable": 33 },
+  "findings": [ { "id": "GHSA-23hp-3jrh-7fpw", "package": "tar", "version": "6.1.0", "ecosystem": "npm",
+    "severityLevel": { "level": "CRITICAL", "order": 4 },
+    "confidence": "proven", "reachability": "dead",
+    "signal": "KNOWN_COMPROMISED", "advisories": ["GHSA-23hp-3jrh-7fpw", "CVE-2026-59873"],
+    "fixed": ">= 7.5.19", "fixCommand": "npm install tar@7.5.21",
+    "llmSummary": "[CRITICAL] tar@6.1.0 (npm) — CVE-2026-59873: node-tar: Decompression/parse DoS via unlimited input. Fixed in >= 7.5.19. Not reachable from this project's code (dead in the lockfile). Blocker: yes." } ]
+}
+```
+
+The values above are a **real** `vexes scan --json --path demo` run —
+`demo/` is lockfiles-only, so every dep grades `dead` (no app source imports
+anything). That is correct honesty, not noise; point vexes at a real source
+tree to get live `reachable`/`lazy` grades. **Rules agents rely on:** stdout is
+always the JSON document (logs go to stderr); `complete: false` means fail
+loud; findings preserve every internal field plus new contract fields
+(additive — old consumers keep working); `schemaVersion` bumps only on
+breaking shape changes. Exit codes: `0` clean, `1` findings, `2`
+error/incomplete. **Run `vexes doctor` first** to confirm the tool is
+trustworthy. Full contract: `wiki/Agent-Integration.md`.
 
 ## Architecture
 

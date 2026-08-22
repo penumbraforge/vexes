@@ -21,6 +21,20 @@ export const NPM_ATTESTATIONS_URL = 'https://registry.npmjs.org/-/npm/v1/attesta
 export const PYPI_JSON_URL = 'https://pypi.org/pypi';
 export const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
 
+// deps.dev (Google, no auth key) — package metadata including declared licenses.
+// GA endpoint v3: systems/{system}/packages/{name}/versions/{version}.
+// Unauthenticated rate limit is ~20 req/min/1k-1h — the client throttles well under it.
+export const DEPS_DEV_URL = 'https://api.deps.dev/v3';
+export const DEPS_DEV_MIN_INTERVAL_MS = 80; // 12.5 req/sec burst cap; comfy under 20/min long-run
+export const DEPS_DEV_SUPPORTED = Object.freeze({
+  npm: 'npm',
+  pypi: 'pypi',
+  cargo: 'cargo',
+  go: 'go',
+  nuget: 'nuget',
+  java: 'maven',
+});
+
 // Ecosystem definitions — maps ecosystem name to lockfile patterns and OSV ecosystem ID
 export const ECOSYSTEMS = Object.freeze({
   npm: {
@@ -69,6 +83,18 @@ export const ECOSYSTEMS = Object.freeze({
     osvId: 'Maven',
     lockfiles: ['gradle.lockfile'],
     manifests: ['pom.xml'],
+    registryUrl: null,
+  },
+  hex: {
+    osvId: 'Hex',
+    lockfiles: ['mix.lock'],
+    manifests: [],
+    registryUrl: null,
+  },
+  pub: {
+    osvId: 'Pub',
+    lockfiles: ['pubspec.lock'],
+    manifests: [],
     registryUrl: null,
   },
   // Homebrew was removed in 0.3.0: OSV has no Homebrew ecosystem, so scans

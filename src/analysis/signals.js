@@ -21,6 +21,33 @@ const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
+ * Confidence grade per signal — how strongly the evidence backs the claim.
+ * (grades defined in src/cli/schema.js CONFIDENCE)
+ *   proven        — registry/OSV-confirmed fact (active compromise, known vuln)
+ *   deterministic — derived purely from first-party registry data (publish
+ *                   times, maintainer identity, script presence, Unicode)
+ *   heuristic     — tuned heuristic with thresholds that can false-positive
+ *   (anything unmapped defaults to 'inferred' — a lead, not a verdict)
+ */
+export const SIGNAL_CONFIDENCE = Object.freeze({
+  KNOWN_COMPROMISED: 'proven',
+  MAINTAINER_CHANGE: 'deterministic',
+  POSTINSTALL_SCRIPT: 'deterministic',
+  RAPID_PUBLISH: 'deterministic',
+  VERSION_ANOMALY: 'deterministic',
+  HOMOGLYPH: 'deterministic',
+  NO_REPOSITORY: 'deterministic',
+  MISSING_PROVENANCE: 'deterministic',
+  SIGNATURE_SPOOF: 'heuristic', // replay (subject mismatch) is deterministic, repo mismatch may false-positive on forks
+  TYPOSQUAT: 'heuristic',
+  PHANTOM_DEPENDENCY: 'heuristic',
+  CIRCULAR_STAGING: 'heuristic',
+  CAPABILITY_ESCALATION: 'heuristic',
+  AST_DANGEROUS_PATTERN: 'heuristic',
+  TARBALL_DANGEROUS_PATTERN: 'heuristic',
+});
+
+/**
  * Run all detection layers for a single package.
  *
  * @param {Object} metadata — from npm-registry.js or pypi-registry.js
@@ -266,6 +293,13 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
   }
 
   // ─── Composite scoring ─────────────────────────────────────────────
+
+  // Attach confidence grades after all layers finished, so dep-graph and
+  // behavioral signals (pushed via spread) get graded too. Every consumer
+  // (analyze, inspect, watch) sees the same grading without duplicating it.
+  for (const s of signals) {
+    s.confidence = SIGNAL_CONFIDENCE[s.signal] || 'inferred';
+  }
 
   const riskScore = computeRiskScore(signals, metadata);
   const riskLevel = scoreToLevel(riskScore);

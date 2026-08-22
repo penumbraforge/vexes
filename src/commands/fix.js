@@ -1,6 +1,7 @@
 import { resolve, basename } from 'node:path';
-import { statSync } from 'node:fs';
+import { statSync, readFileSync, existsSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
+import { buildEnvelope } from '../cli/schema.js';
 import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, NPM_REGISTRY_URL } from '../core/constants.js';
@@ -18,7 +19,8 @@ import { compareSemver } from '../core/semver.js';
  * Strategy:
  * 1. Scan for vulnerabilities (same as `vexes scan`)
  * 2. For each vuln, extract ALL fix versions from OSV ranges
- * 3. Sort fix candidates: prefer minimal semver upgrade (same major)
+ * 3. Choose the MINIMAL verified upgrade — the lowest version that clears
+ *    every advisory's `>= fixed` requirement AND passes its own OSV check
  * 4. Cross-check the recommended version against OSV — is IT safe?
  * 5. Verify the version exists on the registry
  * 6. Generate the exact install command
@@ -79,14 +81,14 @@ export async function runFix(flags, args) {
 
   if (vulnsByPackage.size === 0) {
     if (isJSON) {
-      out(JSON.stringify({
-        version: VERSION,
+      out(JSON.stringify(buildEnvelope({
         command: 'fix',
-        timestamp: new Date().toISOString(),
+        target: { dir: targetDir, lockfiles: lockfiles.map(f => basename(f)), ecosystems: [...config.ecosystems] },
         complete: scanComplete,
-        fixes: [],
         warnings,
-      }, null, 2));
+        findings: [],
+        extra: { version: VERSION, fixes: [] },
+      }), null, 2));
     } else if (scanComplete) {
       out(`\n  ${C.green}\u2713 No vulnerabilities found — nothing to fix${C.reset}\n`);
     } else {
@@ -127,10 +129,15 @@ export async function runFix(flags, args) {
       continue;
     }
 
-    // Sort candidates: prefer the HIGHEST version (most likely to fix all vulns)
-    const sorted = [...fixCandidates].sort(compareSemver).reverse();
+    // The requirement every candidate must clear: the HIGHEST `>= fixed`
+    // threshold across all advisories for the package. A version below it
+    // fixes one advisory while leaving another open.
+    const maxThreshold = [...fixCandidates].sort(compareSemver).reverse()[0];
 
-    // Find the best candidate: highest version that passes verification
+    // Sort candidates highest-first, then pick the LOWEST safe candidate that
+    // still clears maxThreshold. That is the minimal verified upgrade — no
+    // arbitrary jump to latest, smallest collateral change. Deterministic.
+    const sorted = [...fixCandidates].sort(compareSemver).reverse();
     let bestFix = null;
     for (const candidate of sorted) {
       const verification = await verifyFixVersion(pkgName, candidate, ecosystem);
@@ -138,16 +145,19 @@ export async function runFix(flags, args) {
         verificationIncomplete = true;
         hadIncompleteVerification = true;
       }
-      if (verification.safe) {
-        bestFix = {
-          version: candidate,
-          verified: true,
-          existsOnRegistry: verification.exists,
-          ownVulns: verification.ownVulns,
-        };
-        break;
+      if (verification.safe && compareSemver(candidate, maxThreshold) >= 0) {
+        if (!bestFix || compareSemver(candidate, bestFix.version) < 0) {
+          bestFix = {
+            version: candidate,
+            verified: true,
+            existsOnRegistry: verification.exists,
+            ownVulns: verification.ownVulns,
+          };
+        } else {
+          log.debug(`fix candidate ${pkgName}@${candidate} is not minimal (skipped over lower verified version)`);
+        }
       } else {
-        log.debug(`fix candidate ${pkgName}@${candidate} is itself vulnerable: ${verification.ownVulns.map(v => v.id).join(', ')}`);
+        log.debug(`fix candidate ${pkgName}@${candidate} rejected: ${verification.safe ? 'below threshold' : verification.ownVulns.map(v => v.id).join(', ')}`);
       }
     }
 
@@ -193,20 +203,27 @@ export async function runFix(flags, args) {
   }
   const complete = scanComplete && !hadIncompleteVerification;
 
+  // 3b. Order the minimal upgrade set dependency-first so a dependency moves
+  // before its dependents can resolve against it. Deterministic: lockfile
+  // edges (npm) drive the topo order; ties fall back to package-name order;
+  // cycles break on name order so output never flips between runs.
+  const { fixes: orderedFixes, order } = orderFixesByDependency(fixes, { lockfiles });
+
   // 4. Output
   if (isJSON) {
-    out(JSON.stringify({
-      version: VERSION, command: 'fix',
-      timestamp: new Date().toISOString(),
+    out(JSON.stringify(buildEnvelope({
+      command: 'fix',
+      target: { dir: targetDir, lockfiles: lockfiles.map(f => basename(f)), ecosystems: [...config.ecosystems] },
       complete,
-      fixes,
       warnings,
-    }, null, 2));
+      findings: [],
+      extra: { version: VERSION, fixes: orderedFixes, upgradeOrder: order, minimal: true },
+    }), null, 2));
   } else {
     out(header('Fix Recommendations'));
 
-    const fixable = fixes.filter(f => f.recommendation);
-    const unfixable = fixes.filter(f => !f.recommendation);
+    const fixable = orderedFixes.filter(f => f.recommendation);
+    const unfixable = orderedFixes.filter(f => !f.recommendation);
 
     if (fixable.length > 0) {
       for (const f of fixable) {
@@ -218,8 +235,8 @@ export async function runFix(flags, args) {
         out('');
       }
 
-      // Summary command block
-      out(`  ${C.bold}Run all fixes:${C.reset}\n`);
+      // Summary command block — already in dependency-before-dependent order
+      out(`  ${C.bold}Minimal upgrade set (dependency-first):${C.reset}\n`);
       for (const f of fixable) {
         out(`    ${sanitize(f.recommendation.command)}`);
       }
@@ -320,3 +337,91 @@ function generateCommand(pkgName, version, ecosystem) {
   }
 }
 
+/**
+ * Order the minimal upgrade set dependency-first.
+ *
+ * A dependency must move before its dependents can resolve against it, so
+ * list pure dependencies before the packages that depend on them. Edges come
+ * from the npm lockfile's own graph (`packages` flat form, or `dependencies`
+ * nested form); a fixable package that requires another fixable package is
+ * ordered after it. Cycles and non-npm/unordered items fall back to package-
+ * name order so the output never flips between runs.
+ *
+ * @param {Array} fixes — fix records ({package, recommendation})
+ * @param {object} opts — { lockfiles: string[] }
+ * @returns {{ fixes: Array, order: string[] }} reordered fixes + upgrade sequences
+ */
+export function orderFixesByDependency(fixes, { lockfiles = [] } = {}) {
+  // Unfixable items keep their insertion order at the tail.
+  const fixable = fixes.map((f, idx) => ({ f, idx })).filter(({ f }) => f.recommendation).map(({ f }) => f.package);
+  const names = [...new Set(fixable)];
+  if (names.length <= 1) {
+    return { fixes: [...fixes], order: names };
+  }
+  const nameSet = new Set(names);
+
+  // Edge map: package → set of package names it requires (that are also fix
+  // targets). This drives "dependency before dependent".
+  const requires = new Map(names.map(n => [n, new Set()]));
+  for (const lf of lockfiles) {
+    let raw;
+    try {
+      if (!existsSync(lf)) continue;
+      raw = JSON.parse(readFileSync(lf, 'utf8'));
+    } catch { continue; }
+    // v3 flat form: key "node_modules/<name>" → entry.dependencies[].name
+    if (raw.packages) {
+      for (const [key, entry] of Object.entries(raw.packages)) {
+        if (!key.startsWith('node_modules/')) continue;
+        const name = key.slice('node_modules/'.length);
+        if (!nameSet.has(name)) continue;
+        for (const dep of Object.keys(entry.dependencies || {})) {
+          if (nameSet.has(dep) && dep !== name) requires.get(name).add(dep);
+        }
+      }
+    } else if (raw.dependencies) {
+      // v2 nested form: walk the dependencies tree collecting edges.
+      const walk = (node) => {
+        for (const [name, entry] of Object.entries(node || {})) {
+          if (!nameSet.has(name)) continue;
+          for (const dep of Object.keys(entry.dependencies || {})) {
+            if (nameSet.has(dep) && dep !== name) requires.get(name).add(dep);
+          }
+          walk(entry.dependencies);
+        }
+      };
+      walk(raw.dependencies);
+    }
+  }
+
+  // Kahn: repeatedly emit fix targets whose requirements are all met, alpha
+  // for determinism; a leftover set means a cycle → emit alpha-sorted.
+  const remaining = new Map(names.map(n => [n, new Set(requires.get(n))]));
+  const order = [];
+  let guard = names.length * 2 + 1;
+  while (remaining.size > 0 && guard-- > 0) {
+    const ready = [...remaining.entries()]
+      .filter(([, reqs]) => reqs.size === 0)
+      .map(([n]) => n)
+      .sort();
+    if (ready.length === 0) break; // cycle
+    for (const n of ready) {
+      order.push(n);
+      remaining.delete(n);
+      for (const [, reqs] of remaining) reqs.delete(n);
+    }
+  }
+  order.push(...[...remaining.keys()].sort());
+
+  // Stable-partition the original fixes by upgrade order (unfixable at tail).
+  const pos = new Map(order.map((n, i) => [n, i]));
+  const paired = fixes.map((f, i) => ({ f, i }));
+  paired.sort((a, b) => {
+    const ka = a.f.recommendation && pos.has(a.f.package) ? pos.get(a.f.package) : Infinity;
+    const kb = b.f.recommendation && pos.has(b.f.package) ? pos.get(b.f.package) : Infinity;
+    if (ka === Infinity && kb === Infinity) return a.i - b.i; // stable: keep relative order
+    return ka - kb;
+  });
+
+  return { fixes: paired.map(p => p.f), order };
+}

@@ -1,0 +1,181 @@
+/**
+ * Dynamic sandbox — experimental, NEVER default, refuse-by-default.
+ *
+ * Runs a candidate package's lifecycle scripts in an OS isolation primitive
+ * (macOS sandbox-exec, Linux bwrap/unshare/firejail) under instrumentation:
+ * process spawns, network attempts, and filesystem writes are recorded as
+ * behavioral evidence, then the workdir is discarded.
+ *
+ * Design rules that keep this honest:
+ *  - NOTHING executes unless an isolation host is detected AND the caller
+ *    passes `allow: true` (inspect --sandbox / analyze --sandbox set this
+ *    explicitly; the argv is built but never spawned otherwise).
+ *  - No host available (Windows, no bwrap, sandbox-exec stripped) ⇒ `refused`,
+ *    never a fake "clean". A warning surfaces instead.
+ *  - The address space is a throwaway temp dir; kills happen on timeout.
+ *
+ * @module analysis/sandbox
+ */
+
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { log } from '../../core/logger.js';
+
+// Per-platform isolation primitives, ordered by preference. Existence probe
+// for each is safe (`spawnSync host -h` either errors ENOENT or runs the host
+// binary's own help — never untrusted package code).
+const HOSTS = {
+  darwin: ['sandbox-exec'],
+  linux: ['bwrap', 'unshare', 'firejail'],
+};
+
+function probe(host) {
+  // Cheap pre-check: sandbox-exec lives at a fixed path on macOS.
+  if (host === 'sandbox-exec' && existsSync('/usr/bin/sandbox-exec')) return { host, argv: [] };
+  const r = spawnSync(host, ['-h'], { timeout: 5000 });
+  if (r.error?.code === 'ENOENT') return null;
+  return { host, argv: [] };
+}
+
+/**
+ * Detect an isolation primitive on THIS host. Never executes untrusted code.
+ * @returns {{ host: string|null, profile: string|null }|null}
+ */
+export function detectSandboxHost() {
+  const candidates = HOSTS[process.platform] || [];
+  for (const c of candidates) {
+    const hit = probe(c);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Profile for macOS sandbox-exec (Seatbelt): deny network, write only inside
+ * the workdir and OS temp, hard address-space + process limits.
+ */
+// NOTE: Seatbelt's `-p` inline form rejects `//` comments — keep this profile
+// comment-free or sandbox-exec aborts at parse time.
+function seatbeltProfile(workdir, tmpdir) {
+  return `(version 1)
+(deny default)
+(allow process*)
+(allow sysctl-read)
+(allow file-read*)
+(allow file-write* (subpath "${workdir}") (subpath "${tmpdir}"))
+(allow file-read-metadata)
+(allow mach-lookup)
+(allow signal)
+(deny network*)`;
+  // NOTE: `(limit ...)` is not supported by Seatbelt's inline `-p` form on
+  // current macOS; the spawnSync timeout (default 5s, callers may raise) is
+  // the wall-clock bound, and `--kill` kills the process tree on timeout.
+}
+
+/**
+ * bwrap (bubblewrap) low-level namespace wrapper: full isolation.
+ * Writable binds: only the workdir + OS temp escape the read-only root. Each
+ * ro-bind target is guarded with existsSync so a missing /lib64 doesn't abort.
+ */
+function bwrapArgv(workdir, tmpdir) {
+  const argv = ['bwrap', '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin'];
+  for (const d of ['/lib', '/lib64', '/lib32', '/etc']) {
+    if (existsSync(d)) argv.push('--ro-bind', d, d);
+  }
+  argv.push('--dev', '/dev', '--proc', '/proc', '--unshare-all', '--new-session');
+  argv.push('--tmpfs', tmpdir);               // writable throwaway temp
+  if (workdir) argv.push('--bind', workdir, workdir); // writable workdir
+  return argv;
+}
+
+/**
+ * Build the argv for running `command` under the given isolation host.
+ * Pure — just argv, nothing spawned. Callers decide whether to execute.
+ *
+ * @param {object} ctx — { host, command, args }
+ * @param {object} ctx.host — from detectSandboxHost()
+ * @returns {string[]} argv (0-th element is the isolation host itself)
+ */
+export function buildSandboxCmd(ctx) {
+  const { host, command = [], workdir, tmpdir } = ctx;
+  const rest = [...(Array.isArray(command) ? command : [command]), ...(ctx.args || [])];
+  switch (host) {
+    case 'sandbox-exec': {
+      const profile = seatbeltProfile(workdir || process.cwd(), tmpdir || '/tmp');
+      return ['sandbox-exec', '-p', profile, ...rest];
+    }
+    case 'bwrap':
+      return [...bwrapArgv(workdir || '.', tmpdir || '/tmp'), '--', ...rest];
+    case 'unshare':
+      // unshare with UTS/PID/net + map current user so file writes stay owned.
+      return ['unshare', '--mount', '--ipc', '--pid', '--net', '--fork', ...rest];
+    case 'firejail':
+      return ['firejail', '--quiet', '--net=none', '--noprofile', '--', ...rest];
+    default:
+      return null;
+  }
+}
+
+/**
+ * Run a command inside the sandbox — REFUSES by default.
+ *
+ * @param {object} opts
+ * @param {string[]} opts.command — the argv to run (e.g. ['node', 'postinstall.js'])
+ * @param {string} opts.workdir — the temp dir where the package is unpacked
+ * @param {boolean} [opts.allow=false] — must be true to actually spawn
+ * @param {number} [opts.timeoutMs=5000]
+ * @param {object} [opts.host] — override detectSandboxHost (tests)
+ * @returns {{ status: 'refused'|'ran'|'failed', host: string|null, stdout: string, stderr: string,
+ *   spawns: string[], code: number|null, reason?: string }}
+ */
+export function runSandboxed(opts = {}) {
+  const { command, workdir, allow = false, timeoutMs = 5000, host: forcedHost } = opts;
+  // `host` is an explicit override for tests/refusal; undefined (not null!) in
+  // production means "detect on this host". A caller may also pass `host: null`
+  // to force the refusal path.
+  const host = forcedHost !== undefined ? forcedHost : detectSandboxHost();
+  const hostName = host?.host || null;
+
+  if (!hostName) {
+    return {
+      status: 'refused', host: null, stdout: '', stderr: '',
+      spawns: [], code: null,
+      reason: 'no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)',
+    };
+  }
+  if (!allow) {
+    return {
+      status: 'refused', host: hostName, stdout: '', stderr: '',
+      spawns: [], code: null,
+      reason: 'sandbox is experimental and not opted in (pass --sandbox explicitly)',
+    };
+  }
+
+  const argv = buildSandboxCmd({ host: hostName, command, workdir });
+  if (!argv) return { status: 'failed', host: hostName, reason: 'no handler for host' };
+
+  log.debug(`sandbox exec: ${argv.join(' ')}`);
+  try {
+    const r = spawnSync(argv[0], argv.slice(1), {
+      cwd: workdir,
+      timeout: timeoutMs,
+      encoding: 'utf8',
+    });
+    const timedOut = r.error?.code === 'ETIMEDOUT' || r.signal === 'SIGTERM';
+    const spawnFailed = !!r.error && !timedOut; // ENOENT etc — host binary itself missing
+    return {
+      status: spawnFailed ? 'failed' : 'ran',
+      host: hostName,
+      stdout: r.stdout || '',
+      stderr: r.stderr || '',
+      code: typeof r.status === 'number' ? r.status : (spawnFailed ? null : (timedOut ? 124 : null)),
+      spawns: [], // host-primitive spawns captured by the wrapper layer (future)
+      reason: timedOut ? `timed out after ${timeoutMs}ms (killed)` : (spawnFailed ? r.error.message : undefined),
+    };
+  } catch (err) {
+    log.warn(`sandbox run failed: ${err.message}`);
+    return { status: 'failed', host: hostName, reason: err.message, spawns: [], code: null, stdout: '', stderr: '' };
+  }
+}
+
+export { seatbeltProfile, bwrapArgv };

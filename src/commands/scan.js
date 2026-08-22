@@ -2,6 +2,7 @@ import { resolve, basename } from 'node:path';
 import { statSync, writeFileSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
 import { toSarif } from '../cli/sarif.js';
+import { buildEnvelope, normalizeFinding, REACHABILITY } from '../cli/schema.js';
 import { C, createSpinner, header, formatVuln, summary, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, SEVERITY, ECOSYSTEMS } from '../core/constants.js';
@@ -15,6 +16,8 @@ import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { compareSemver } from '../core/semver.js';
 import { partitionByIgnore } from '../core/ignore.js';
+import { buildAppGraph, reachabilityOf } from '../analysis/app-graph.js';
+import { triageFindings } from '../analysis/exploitability.js';
 
 /**
  * `vexes scan` — Enumerate dependencies, query OSV, report vulnerabilities.
@@ -30,9 +33,18 @@ export async function runScan(flags, args) {
   // Any structured format must keep stdout clean of progress/header chatter.
   const quietStdout = isJSON || isSARIF;
 
+  // Track warning + discovered-file state for the shared envelope. Direct-dep
+  // keys are filled once the deduped set exists (npm parsers mark isDirect).
+  const warnings = [];
+  const seenFiles = new Set();
+  let directKeys = new Set();
+  let appGraph = null; // Tier A reachability — set post-dedup, used by emitStructured
+
   // Emit a scan-result object in whichever structured format is active. SARIF
   // may target a file (--sarif <file>); otherwise everything goes to stdout via
-  // out(), the flush-safe write path.
+  // out(), the flush-safe write path. JSON flows through the shared envelope —
+  // the existing flat fields are preserved verbatim (backward compat) while
+  // schemaVersion/generator/target/result/findings add the agent contract.
   const emitStructured = (scanResult) => {
     if (isSARIF) {
       const doc = JSON.stringify(toSarif(scanResult), null, 2);
@@ -43,9 +55,29 @@ export async function runScan(flags, args) {
       } else {
         out(doc);
       }
-    } else {
-      out(JSON.stringify(scanResult, null, 2));
+      return;
     }
+    const fixable = buildFixCommands(scanResult.vulnerabilities || []);
+    const findings = (scanResult.vulnerabilities || []).map((v) => normalizeFinding(v, {
+      direct: directKeys.has(`${v.ecosystem}:${v.package}@${v.version}`),
+      fixCommand: fixCommandFor(v, fixable),
+      reachability: reachabilityOf(appGraph, v.ecosystem, v.package),
+    }));
+    out(JSON.stringify(buildEnvelope({
+      command: 'scan',
+      target: { dir: targetDir, lockfiles: [...seenFiles], ecosystems: [...ecosystemsFound] },
+      complete: scanResult.complete,
+      warnings: scanResult.warnings,
+      summary: {
+        ...scanResult.summary,
+        reachable: appGraph?.categories?.reachable ?? 0,
+        lazy: appGraph?.categories?.lazy ?? 0,
+        dead: appGraph?.categories?.dead ?? 0,
+        unreachable: appGraph?.categories?.dead ?? 0, // legacy name for the dead bucket
+      },
+      findings,
+      extra: { version: VERSION, vulnerabilities: scanResult.vulnerabilities },
+    }), null, 2));
   };
 
   // Validate target path exists and is a directory
@@ -64,9 +96,6 @@ export async function runScan(flags, args) {
     out(`\n  ${C.bold}vexes${C.reset} v${VERSION} ${C.dim}\u2500\u2500 scanning dependencies${C.reset}\n`);
   }
 
-  // Track warnings for the final report
-  const warnings = [];
-
   // 1. Discover dependency files
   const allDeps = [];
   const ecosystemsFound = new Set();
@@ -82,6 +111,7 @@ export async function runScan(flags, args) {
           const deps = parseNpmLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
+          seenFiles.add(basename(lf));
           dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
@@ -98,6 +128,7 @@ export async function runScan(flags, args) {
           const deps = parsePnpmLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
+          seenFiles.add(basename(lf));
           dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
@@ -112,6 +143,7 @@ export async function runScan(flags, args) {
           const deps = parseYarnLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
+          seenFiles.add(basename(lf));
           dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
@@ -128,6 +160,7 @@ export async function runScan(flags, args) {
             const deps = parseNpmManifest(mf);
             allDeps.push(...deps);
             ecosystemsFound.add('npm');
+            seenFiles.add(basename(mf));
             dependencyFileCount++;
             const msg = 'no lockfile found — scanning package.json (version ranges, lower confidence)';
             if (!quietStdout) out(`  ${C.yellow}! ${msg}${C.reset}`);
@@ -150,6 +183,7 @@ export async function runScan(flags, args) {
           const deps = parsePypiFile(file.path, file.format);
           allDeps.push(...deps);
           ecosystemsFound.add('pypi');
+          seenFiles.add(basename(file.path));
           dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(file.path)}: ${err.message}`;
@@ -167,6 +201,7 @@ export async function runScan(flags, args) {
           const deps = parseCargoLock(lf);
           allDeps.push(...deps);
           ecosystemsFound.add('cargo');
+          seenFiles.add(basename(lf));
           dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(lf)}: ${err.message}`;
@@ -191,6 +226,7 @@ export async function runScan(flags, args) {
           const deps = parseGenericFile(ecoName, file);
           allDeps.push(...deps);
           ecosystemsFound.add(ecoName);
+          seenFiles.add(basename(file.path));
           dependencyFileCount++;
         } catch (err) {
           const msg = `failed to parse ${basename(file.path)}: ${err.message}`;
@@ -237,6 +273,22 @@ export async function runScan(flags, args) {
     if (!dedupMap.has(key)) dedupMap.set(key, dep);
   }
   const uniqueDeps = [...dedupMap.values()];
+
+  // Which of the scanned packages are direct (top-level) dependencies?
+  // Parsers that know (npm lockfiles) flag isDirect; the rest default false —
+  // "false" is the honest answer when we don't have a manifest to judge by.
+  directKeys = new Set(
+    uniqueDeps.filter(d => d.isDirect).map(d => `${d.ecosystem}:${d.name}@${d.version}`),
+  );
+
+  // Tier A reachability — map each dependency to reachable/lazy/dead/unknown
+  // by parsing the project's OWN source, not recursing into node_modules.
+  // This is what separates a live vuln from a dead lockfile entry.
+  appGraph = buildAppGraph(targetDir, uniqueDeps);
+  if (!quietStdout) {
+    const c = appGraph.categories;
+    out(`  ${C.dim}reachability: ${c.reachable} reachable · ${c.lazy} lazy · ${c.dead} dead${C.reset}`);
+  }
 
   if (!quietStdout) {
     out(`  ${C.dim}Found ${uniqueDeps.length} unique packages across ${dependencyFileCount} dependency file(s)${C.reset}`);
@@ -328,7 +380,7 @@ export async function runScan(flags, args) {
 
     // 7. Filter by severity
     const minSeverity = config.severity?.toUpperCase() || 'MODERATE';
-    const severityFiltered = filterBySeverity(allVulns, minSeverity);
+    let severityFiltered = filterBySeverity(allVulns, minSeverity);
 
     severityFiltered.sort((a, b) => {
       const aOrder = SEVERITY[a.severity]?.order ?? 99;
@@ -336,13 +388,51 @@ export async function runScan(flags, args) {
       return bOrder - aOrder;
     });
 
+    // 7a. Tier A reachability filter. `--min-reachability reachable` keeps only
+    // live findings; `lazy` adds dynamically/conditionally loaded ones; `dead`
+    // (default) keeps the full archive — each still graded in the output.
+    if (config.minReachability) {
+      severityFiltered = severityFiltered.filter(v =>
+        atLeast(reachabilityOf(appGraph, v.ecosystem, v.package), config.minReachability));
+    }
+
     // 7b. Apply the `ignore` config — suppress by advisory ID, package name,
     // or pkg@version. Suppressed findings are counted, not silently dropped.
-    const { kept: filtered, suppressed } = partitionByIgnore(
+    // `let` because the Tier B pass below may swap in AI-annotated copies.
+    let filtered;
+    const { kept, suppressed } = partitionByIgnore(
       severityFiltered,
       config.ignore,
       v => ({ pkg: v.package, version: v.version, ids: [v.id, v.displayId, ...(v.aliases || [])] }),
     );
+    filtered = kept;
+
+    // 7c. Annotate raw records with reachability so EVERY output path — text,
+    // JSON findings, and SARIF — carries the Tier A grade. normalizeFinding
+    // prefers this field when present.
+    for (const v of filtered) {
+      v.reachability = reachabilityOf(appGraph, v.ecosystem, v.package);
+    }
+
+    // 7d. Tier B (--ai, opt-in): LLM exploitability verdicts on TOP of the
+    // deterministic Tier A grades. Advisory metadata only — records keep their
+    // evidence, an AI failure never turns `complete` false, and verdicts never
+    // filter a finding out. When no provider is configured we warn and proceed
+    // exactly as before, so --ai is safe to bake into an agent's default loop.
+    let aiTriage;
+    if (config.ai) {
+      const onWarning = (msg) => warnings.push(msg);
+      if (quietStdout) {
+        // no spinner on structured stdout; run directly, warnings carry the story
+        aiTriage = await triageFindings(filtered, appGraph, { onWarning });
+      } else {
+        const aiSpinner = createSpinner('AI exploitability triage...');
+        aiTriage = await triageFindings(filtered, appGraph, { onWarning });
+        aiSpinner.stop(aiLabel(aiTriage));
+      }
+      filtered = aiTriage.records;
+      if (aiTriage.skipped) warnings.push(aiTriage.reason);
+    }
 
     // 8. Determine completeness — did all queries succeed?
     const isComplete = queryComplete && parseFailures === 0;
@@ -353,12 +443,13 @@ export async function runScan(flags, args) {
 
     if (quietStdout) {
       const counts = countBySeverity(filtered);
+      const aiCounts = config.ai ? countByExploitability(filtered) : {};
       emitStructured({
         version: VERSION,
         timestamp: new Date().toISOString(),
         command: 'scan',
         complete: isComplete,
-        summary: { total: uniqueDeps.length, vulnerable: filtered.length, suppressed: suppressed.length, ...counts },
+        summary: { total: uniqueDeps.length, vulnerable: filtered.length, suppressed: suppressed.length, ...counts, ...aiCounts },
         warnings,
         vulnerabilities: filtered,
       });
@@ -374,6 +465,28 @@ export async function runScan(flags, args) {
         out(header(sev));
         for (const v of groups[sev]) {
           out(formatVuln(v));
+          const reach = reachabilityOf(appGraph, v.ecosystem, v.package);
+          if (reach === 'dead') {
+            out(`    ${C.dim}not reachable from project source — dead in the lockfile${C.reset}`);
+          } else if (reach === 'lazy') {
+            out(`    ${C.dim}only dynamically imported (lazy)${C.reset}`);
+          } else if (reach === 'reachable') {
+            out(`    ${C.yellow}imported by project code${C.reset}`);
+          }
+          // Tier B (--ai): per-finding verdict, clearly advisory — it never
+          // downgrades the deterministic finding above it.
+          if (v.exploitability) {
+            const e = v.exploitability;
+            if (e.verdict === 'reachable') {
+              out(`    ${C.magenta}AI: reachable — ${sanitize(e.why)}${C.reset}`);
+            } else if (e.verdict === 'plausible') {
+              out(`    ${C.magenta}AI: plausible — ${sanitize(e.why)}${C.reset}`);
+            } else if (e.verdict === 'unclear') {
+              out(`    ${C.dim}AI: unclear — ${sanitize(e.why)}${C.reset}`);
+            } else {
+              out(`    ${C.red}AI: error — ${sanitize(e.why)}${C.reset}`);
+            }
+          }
           out('');
         }
       }
@@ -414,6 +527,11 @@ export async function runScan(flags, args) {
       const counts = countBySeverity(filtered);
       out(summary(counts, uniqueDeps.length, ecoList, elapsed));
 
+      if (config.ai && aiTriage) {
+        const aiC = countByExploitability(filtered);
+        out(`  ${C.dim}AI (advisory): ${aiC.exploitable} exploitable · ${aiC.plausible} plausible · ${aiC.unclear} unclear · ${aiC.aiError} error${C.reset}`);
+      }
+
       if (suppressed.length > 0) {
         out(`  ${C.dim}${suppressed.length} suppressed by ignore config${C.reset}`);
       }
@@ -441,4 +559,67 @@ function countBySeverity(vulns) {
     if (key in counts) counts[key]++;
   }
   return counts;
+}
+
+/**
+ * Roll up per-verdict counts for the structured summary (additive keys):
+ * exploitable / plausible / unclear / aiError (per-finding verdicts).
+ */
+function countByExploitability(vulns) {
+  const out = { exploitable: 0, plausible: 0, unclear: 0, aiError: 0 };
+  for (const v of vulns) {
+    const e = v.exploitability;
+    if (!e) continue;
+    if (e.verdict === 'reachable') out.exploitable++;
+    else if (e.verdict === 'plausible') out.plausible++;
+    else if (e.verdict === 'error') out.aiError++;
+    else out.unclear++; // verdict 'unclear', or malformed
+  }
+  return out;
+}
+
+/** One-line spinner/status label for the Tier B pass. */
+function aiLabel(t) {
+  if (t.skipped) return `AI triage unavailable — ${t.reason}`;
+  return `AI triage: ${t.total - t.errored}/${t.total} judged${t.errored ? ` · ${t.errored} errored` : ''}`;
+}
+
+// Reachability ordering for the --min-reachability filter. Unknown is treated
+// as always-passing (we don't filter out what we couldn't grade).
+const REACH_ORDER = { dead: 0, lazy: 1, reachable: 2 };
+function atLeast(actual, min) {
+  if (actual === 'unknown') return true;
+  return (REACH_ORDER[actual] ?? 0) >= (REACH_ORDER[min] ?? 0);
+}
+
+/**
+ * Highest verified fix version per package, keyed `ecosystem:name`.
+ * String '>' would rank '9.0.0' above '10.0.0' — use real semver compare.
+ */
+function buildFixCommands(vulns) {
+  const fixable = new Map();
+  for (const v of vulns) {
+    if (!v.fixed) continue;
+    const ver = v.fixed.replace(/^>=\s*/, '');
+    const key = `${v.ecosystem}:${v.package}`;
+    if (!fixable.has(key) || compareSemver(ver, fixable.get(key).ver) > 0) {
+      fixable.set(key, { pkg: v.package, ver, ecosystem: v.ecosystem });
+    }
+  }
+  return fixable;
+}
+
+/**
+ * Human-usable upgrade command for one finding, from the per-package fix map.
+ * Values go into JSON (never a terminal) so no terminal sanitization is needed;
+ * text-mode output applies `sanitize` separately before rendering.
+ */
+function fixCommandFor(v, fixable) {
+  const fix = fixable.get(`${v.ecosystem}:${v.package}`);
+  if (!fix) return undefined;
+  const { pkg, ver, ecosystem } = fix;
+  if (ecosystem === 'npm') return `npm install ${pkg}@${ver}`;
+  if (ecosystem === 'pypi') return `pip install ${pkg}==${ver}`;
+  if (ecosystem === 'cargo') return `cargo update -p ${pkg} --precise ${ver}`;
+  return `# upgrade ${pkg} to ${ver}`;
 }
