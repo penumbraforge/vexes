@@ -1,5 +1,7 @@
 import { createGunzip } from 'node:zlib';
 import { Readable } from 'node:stream';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { log } from '../core/logger.js';
 import { inspectJS, inspectPython } from './ast-inspector.js';
 import { FETCH_TIMEOUT_MS, USER_AGENT } from '../core/constants.js';
@@ -141,12 +143,11 @@ function validateTarballUrl(tarballUrl) {
 }
 
 /**
- * Download a tarball and extract JS files that match our inspection patterns.
- * Uses zero external dependencies — native gunzip + raw tar header parsing.
- *
- * Security: validates URL (SSRF prevention), streams with size limit (memory exhaustion prevention).
+ * Download + decompress a tarball in one bounded step (shared by the memory
+ * AST path and the disk extraction path). Enforces the same URL allowlist
+ * (SSRF), Content-Length cap, streamed size cap, and gzip-bomb guard.
  */
-async function downloadAndExtractJS(tarballUrl, packageName) {
+async function fetchDecompressed(tarballUrl, packageName) {
   // SSRF prevention: only fetch from known registry hosts over HTTPS
   validateTarballUrl(tarballUrl);
 
@@ -188,7 +189,61 @@ async function downloadAndExtractJS(tarballUrl, packageName) {
   const compressed = Buffer.concat(chunks);
 
   // Gunzip
-  const decompressed = await gunzip(compressed);
+  return gunzip(compressed);
+}
+
+/**
+ * Download a tarball and extract its files to a fresh directory on disk.
+ * Used by the dynamic-sandbox harness: we need real files to run, not just
+ * AST strings. Same SSRF gate + size caps as the memory path; each entry is
+ * written through `safeJoin` so a malicious tar cannot escape destDir.
+ *
+ * @param {string} tarballUrl — from registry metadata (versions[ver].dist.tarball)
+ * @param {string} packageName — for logging/errors
+ * @param {string} destDir — must already exist (caller's mkdtemp)
+ * @returns {Promise<string[]>} absolute paths written
+ */
+export async function downloadAndExtractToDisk(tarballUrl, packageName, destDir) {
+  const decompressed = await fetchDecompressed(tarballUrl, packageName);
+  const entries = parseTar(decompressed, packageName, true /* returnAll */);
+  const written = [];
+  for (const entry of entries) {
+    const target = safeJoin(destDir, entry.path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, entry.content);
+    written.push(target);
+  }
+  return written;
+}
+
+/**
+ * Join a tar entry path onto a destination root, rejecting anything that could
+ * escape it. Tar spec allows ../ and absolute paths; without this guard a
+ * malicious archive would overwrite files outside the unpack dir. Also blocks
+ * NULs and Windows drive escapes (belt-and-braces even on POSIX-only crates).
+ * @param {string} root — absolute destination dir
+ * @param {string} candidate — entry path as read from the tar header
+ * @returns {string} absolute path inside root
+ * @throws {Error} on any traversal / escape / NUL
+ */
+function safeJoin(root, candidate) {
+  if (typeof candidate !== 'string' || candidate.length === 0) throw new Error('empty tar entry path');
+  if (candidate.includes('\0')) throw new Error(`NUL byte in tar path: ${candidate}`);
+  if (candidate.startsWith('/') || /^[A-Za-z]:[\\/]/.test(candidate)) throw new Error(`absolute tar path: ${candidate}`);
+  if (candidate.split(/[/\\]+/).some(part => part === '..')) throw new Error(`traversal in tar path: ${candidate}`);
+  const out = resolve(root, candidate.replace(/^\.\/+/, ''));
+  if (!out.startsWith(`${resolve(root)}${'/'}`)) throw new Error(`escape from ${root}: ${candidate}`);
+  return out;
+}
+
+/**
+ * Download a tarball and extract JS files that match our inspection patterns.
+ * Uses zero external dependencies — native gunzip + raw tar header parsing.
+ *
+ * Security: validates URL (SSRF prevention), streams with size limit (memory exhaustion prevention).
+ */
+async function downloadAndExtractJS(tarballUrl, packageName) {
+  const decompressed = await fetchDecompressed(tarballUrl, packageName);
 
   // Parse tar — first pass extracts package.json to find entry points,
   // second pass uses those entry points plus static patterns

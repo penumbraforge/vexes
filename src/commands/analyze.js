@@ -1,5 +1,6 @@
-import { resolve, basename } from 'node:path';
-import { statSync } from 'node:fs';
+import { resolve, basename, join } from 'node:path';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { loadConfig } from '../cli/config.js';
 import { buildEnvelope } from '../cli/schema.js';
 import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
@@ -14,7 +15,9 @@ import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { fetchPypiMetadata } from '../advisories/pypi-registry.js';
 import { checkProvenance, detectProvenanceSpoof } from '../analysis/provenance.js';
 import { analyzePackage, scoreToLevel, SIGNAL_CONFIDENCE } from '../analysis/signals.js';
-import { inspectTarball, getTarballUrl, getPypiTarballUrl } from '../analysis/tarball-inspector.js';
+import { inspectTarball, getTarballUrl, getPypiTarballUrl, downloadAndExtractToDisk } from '../analysis/tarball-inspector.js';
+import { detectSandboxHost } from '../analysis/sandbox/index.js';
+import { runHarnessed, pickEntryScript, buildSandboxSignal } from '../analysis/sandbox/harness.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { partitionByIgnore } from '../core/ignore.js';
 
@@ -277,6 +280,94 @@ export async function runAnalyze(flags, args) {
       }
 
       tarSpinner?.stop(`Deep code inspection complete for ${tarballCandidates.length} packages`);
+    }
+
+    // 5c. Dynamic sandbox evidence (--sandbox, experimental, opt-in).
+    // RUNS candidate code in the OS isolation primitive under a recorder shim
+    // and attaches captured behavior (SANDBOX_BEHAVIOR + sandboxEvidence) to
+    // the record. Refuse-by-default: no isolation host / any failure pushes a
+    // warning, never a signal, never fails the deterministic pass. spawnSync
+    // is blocking, so the pass is bounded to the top-N by risk score.
+    if (config.sandbox) {
+      const TOP_N = 5;
+      const candidates = results
+        .filter(r => (r.ecosystem === 'npm' || r.ecosystem === 'pypi') && r.riskScore >= 15 && r.signals.length > 0)
+        .sort((a, b) => b.riskScore - a.riskScore)
+        .slice(0, TOP_N);
+      // Refuse-by-default pre-flight: resolve the effective isolation host
+      // before downloading/copying anything. `undefined` = auto-detect on
+      // this host; `null` (test-only injection) = forced refusal; object =
+      // forced host. No host ⇒ every candidate would refuse at run time — so
+      // don't pull ~50MB of candidate code just to refuse it.
+      let hostRefusalReported = config.sandboxHost !== undefined
+        ? !config.sandboxHost
+        : !detectSandboxHost();
+      if (hostRefusalReported) {
+        warnings.push('sandbox skipped — no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)');
+      }
+
+      for (const pkg of candidates) {
+        if (hostRefusalReported) continue; // pre-flight refusal — nothing to run or download
+        const label = `${pkg.name}@${pkg.version}`;
+        const tmp = mkdtempSync(join(tmpdir(), 'vexes-sandbox-'));
+        const sbSpinner = isJSON ? null : createSpinner(`Sandboxing ${label}...`);
+        try {
+          let tarUrl;
+          if (pkg.ecosystem === 'pypi') tarUrl = await getPypiTarballUrl(pkg.name, pkg.version);
+          else tarUrl = getTarballUrl({ name: pkg.name }, pkg.version);
+          if (!tarUrl) { warnings.push(`sandbox: no tarball URL for ${label} — skipped`); continue; }
+
+          await downloadAndExtractToDisk(tarUrl, pkg.name, tmp);
+
+          if (pkg.ecosystem === 'pypi') {
+            // v1: extraction-only. The recorder shim is Node; we never claim
+            // ran behavior we didn't execute.
+            warnings.push(`sandbox: ${label} (pypi) extracted but not executed — sandbox run is npm-only for now`);
+            continue;
+          }
+
+          const entry = pickEntryScript(tmp);
+          if (!entry) { warnings.push(`sandbox: no runnable entrypoint in ${label} — skipped`); continue; }
+
+          const child = runHarnessed({
+            workdir: tmp,
+            entryScript: entry,
+            allow: true,
+            timeoutMs: 10000,
+            host: config.sandboxHost,
+          });
+
+          if (child.status === 'refused') {
+            // Host-wide refusal (no isolation primitive) is one report, not one
+            // per candidate; an opt-in refusal is reported per candidate.
+            if (/no isolation host/.test(child.reason || '')) {
+              if (!hostRefusalReported) { hostRefusalReported = true; warnings.push(`sandbox skipped — ${child.reason}`); }
+            } else {
+              warnings.push(`sandbox: ${label} skipped — ${child.reason}`);
+            }
+            continue;
+          }
+
+          const signal = buildSandboxSignal({ name: pkg.name, version: pkg.version, evidence: child.evidence });
+          if (signal) {
+            pkg.signals.push(signal);
+            pkg.sandboxEvidence = signal.evidence.dynamic;
+            pkg.riskScore += SEVERITY[signal.severity].weight;
+          } else if (child.status === 'failed' && child.reason) {
+            // crash ≠ behavior; the sandbox still isolated it. Only surfaced
+            // verbosely so the deterministic pass stays quiet.
+            if (config.verbose) warnings.push(`sandbox: ${label} harness failed (${child.reason})`);
+          } else if (config.verbose) {
+            warnings.push(`sandbox: ${label} ran with no behavior recorded`);
+          }
+        } catch (err) {
+          log.debug(`sandbox step failed for ${label}: ${err.message}`);
+          warnings.push(`sandbox: ${label} skipped (${err.message})`);
+        } finally {
+          sbSpinner?.stop();
+          rmSync(tmp, { recursive: true, force: true });
+        }
+      }
     }
 
     // 6. Re-derive risk levels: provenance and deep-tarball steps above

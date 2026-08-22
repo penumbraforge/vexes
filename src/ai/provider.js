@@ -6,12 +6,15 @@
  * nothing breaks).
  *
  * Selection order (first match wins):
- *   1. VEXES_AI_BASE set        → OpenAI-compatible endpoint (can be local:
- *                                 Spark / Ollama / vLLM / LM Studio...).
- *   2. ANTHROPIC_API_KEY set    → Anthropic Messages API (claude.js).
- *   3. neither                  → degrade with NO_PROVIDER — vexes never calls
- *                                 out on its own. The scanner is deterministic
- *                                 and offline; AI is an opt-in layer on top.
+ *   1. VEXES_AI_BASE set            → OpenAI-compatible endpoint (can be local:
+ *                                     Spark / Ollama / vLLM / LM Studio...).
+ *   2. ANTHROPIC_BASE_URL set       → Anthropic-compatible cluster (vLLM native
+ *                                     Messages API, model auto-discovered).
+ *   3. ANTHROPIC_API_KEY set        → Anthropic Messages API (hosted claude.js).
+ *   4. neither                      → degrade with NO_PROVIDER — vexes never
+ *                                     calls out on its own. The scanner is
+ *                                     deterministic and offline; AI is an
+ *                                     opt-in layer on top.
  *
  * Nothing is ever sent to a provider except the extracted findings payload we
  * build — never raw downloaded package source, never advisory HTML. Callers
@@ -37,6 +40,9 @@ export function detectProvider() {
   if (typeof process.env.VEXES_AI_BASE === 'string' && process.env.VEXES_AI_BASE.trim() !== '') {
     return PROVIDERS.OPENAI_COMPAT;
   }
+  if (typeof process.env.ANTHROPIC_BASE_URL === 'string' && process.env.ANTHROPIC_BASE_URL.trim() !== '') {
+    return PROVIDERS.ANTHROPIC;
+  }
   if (typeof process.env.ANTHROPIC_API_KEY === 'string' && process.env.ANTHROPIC_API_KEY.length > 0) {
     return PROVIDERS.ANTHROPIC;
   }
@@ -52,6 +58,7 @@ export function hasProvider() {
 // they now resolve through the router in complete().
 export { hasApiKey } from './claude.js';
 export { complete as claudeComplete } from './claude.js';
+export { resolveAnthropicModel, __resetModelDiscovery } from './claude.js';
 
 /**
  * OpenAI-compatible chat completions client.
@@ -144,7 +151,7 @@ export async function complete(opts = {}) {
   const provider = opts.provider || detectProvider();
   if (provider === PROVIDERS.OPENAI_COMPAT) return completeOpenAI(opts);
   if (provider === PROVIDERS.ANTHROPIC) return anthropicComplete(opts);
-  const err = new Error('No AI provider configured (set VEXES_AI_BASE, or ANTHROPIC_API_KEY)');
+  const err = new Error('No AI provider configured (set VEXES_AI_BASE, or ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, or ANTHROPIC_API_KEY)');
   err.code = 'NO_PROVIDER';
   throw err;
 }
@@ -158,7 +165,16 @@ export async function complete(opts = {}) {
 export function providerLabel() {
   const p = detectProvider();
   if (p === PROVIDERS.OPENAI_COMPAT) return `local/OpenAI-compatible (${process.env.VEXES_AI_MODEL || 'model'})`;
-  if (p === PROVIDERS.ANTHROPIC) return `Anthropic (${process.env.VEXES_AI_MODEL || 'claude'})`;
+  if (p === PROVIDERS.ANTHROPIC) {
+    if (process.env.ANTHROPIC_BASE_URL) {
+      // Cluster case: env-only, no network. Host shown so agents can tell where
+      // AI ran (local cluster vs hosted).
+      let host = 'cluster';
+      try { host = new URL(process.env.ANTHROPIC_BASE_URL).host; } catch { /* malformed base — keep fallback */ }
+      return `Anthropic-compatible (${host} · ${process.env.VEXES_AI_MODEL || process.env.ANTHROPIC_MODEL || 'model'})`;
+    }
+    return `Anthropic (${process.env.VEXES_AI_MODEL || 'claude'})`;
+  }
   return 'none configured';
 }
 

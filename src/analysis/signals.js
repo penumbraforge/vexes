@@ -45,6 +45,7 @@ export const SIGNAL_CONFIDENCE = Object.freeze({
   CAPABILITY_ESCALATION: 'heuristic',
   AST_DANGEROUS_PATTERN: 'heuristic',
   TARBALL_DANGEROUS_PATTERN: 'heuristic',
+  SANDBOX_BEHAVIOR: 'heuristic', // observed at runtime under OS isolation — solid, but behavior can be staged/benign-in-context
 });
 
 /**

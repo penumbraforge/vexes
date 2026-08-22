@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   detectProvider, hasProvider, complete, completeOpenAI, providerLabel,
-  PROVIDERS, buildReachabilityPrompt,
+  PROVIDERS, buildReachabilityPrompt, __resetModelDiscovery,
 } from '../src/ai/provider.js';
 
 /**
@@ -37,11 +37,17 @@ const envTrap = (() => {
         VEXES_AI_MODEL: process.env.VEXES_AI_MODEL,
         VEXES_AI_KEY: process.env.VEXES_AI_KEY,
         ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+        ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+        ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
+        ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL,
       };
       delete process.env.VEXES_AI_BASE;
       delete process.env.VEXES_AI_MODEL;
       delete process.env.VEXES_AI_KEY;
       delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.ANTHROPIC_BASE_URL;
+      delete process.env.ANTHROPIC_AUTH_TOKEN;
+      delete process.env.ANTHROPIC_MODEL;
     },
     restore() {
       for (const [k, v] of Object.entries(saved)) {
@@ -51,6 +57,24 @@ const envTrap = (() => {
     },
   };
 })();
+
+/** Answering stub for an Anthropic-compatible cluster (name => vLLM body). */
+function clusterStub({ message = 'ok', messagesStatus = 200, modelsDown = false } = {}) {
+  const calls = [];
+  const fn = async (url, opts) => {
+    calls.push({ url: String(url), opts });
+    if (modelsDown && String(url).endsWith('/v1/models')) throw new Error('cluster unreachable');
+    if (String(url).endsWith('/v1/models')) {
+      return { ok: true, status: 200, async json() { return { data: [{ id: 'cluster-model-1' }] }; }, async text() { return ''; } };
+    }
+    if (messagesStatus !== 200) {
+      return { ok: false, status: messagesStatus, async json() { return { error: { message: 'down' } }; }, async text() { return ''; } };
+    }
+    return { ok: true, status: 200, async json() { return { content: [{ type: 'text', text: message }] }; }, async text() { return ''; } };
+  };
+  fn.calls = calls;
+  return fn;
+}
 
 describe('provider: detection', () => {
   beforeEach(() => envTrap.save());
@@ -108,6 +132,93 @@ describe('provider: complete routing', () => {
     assert.equal(body.messages[1].role, 'user');
     assert.equal(body.messages[1].content, 'U');
     assert.equal(opts.headers.authorization, undefined, 'no key ⇒ no auth header');
+  });
+});
+
+describe('provider: claude-cluster (ANTHROPIC_BASE_URL)', () => {
+  beforeEach(() => { envTrap.save(); __resetModelDiscovery(); });
+  afterEach(() => { __resetModelDiscovery(); envTrap.restore(); });
+
+  it('detects the cluster from ANTHROPIC_BASE_URL alone (no key needed)', () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    assert.equal(detectProvider(), PROVIDERS.ANTHROPIC);
+    assert.equal(hasProvider(), true);
+  });
+
+  it('keeps VEXES_AI_BASE as the explicit winner over a cluster', () => {
+    process.env.VEXES_AI_BASE = 'http://local:11434';
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    process.env.ANTHROPIC_API_KEY = 'sk-ant';
+    assert.equal(detectProvider(), PROVIDERS.OPENAI_COMPAT);
+  });
+
+  it('providerLabel names the cluster host without network', () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    process.env.ANTHROPIC_MODEL = 'deepseek';
+    assert.match(providerLabel(), /Anthropic-compatible \(cluster\.test:8888 · deepseek\)/);
+  });
+
+  it('routes messages to the cluster with Bearer auth and no x-api-key', async () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888/'; // trailing slash stripped
+    process.env.ANTHROPIC_AUTH_TOKEN = 'local';
+    process.env.VEXES_AI_MODEL = 'cluster-model-1';
+    const fetch = clusterStub();
+    const text = await complete({ system: 'S', user: 'U', fetchImpl: fetch });
+    assert.equal(text, 'ok');
+    assert.equal(fetch.calls.length, 1, 'model pinned ⇒ no discovery round trip');
+    const { url, opts } = fetch.calls[0];
+    assert.equal(url, 'http://cluster.test:8888/v1/messages');
+    assert.equal(opts.headers.authorization, 'Bearer local');
+    assert.equal(opts.headers['x-api-key'], undefined, 'cluster path sends no x-api-key');
+    assert.equal(opts.headers['anthropic-version'], '2023-06-01');
+    const body = JSON.parse(opts.body);
+    assert.equal(body.model, 'cluster-model-1');
+    assert.equal(body.system, 'S');
+    assert.equal(body.messages[0].content, 'U');
+  });
+
+  it('honours ANTHROPIC_MODEL over discovery', async () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    process.env.ANTHROPIC_AUTH_TOKEN = 'local';
+    process.env.ANTHROPIC_MODEL = 'pinned-model';
+    const fetch = clusterStub();
+    await complete({ system: 'S', user: 'U', fetchImpl: fetch });
+    assert.equal(fetch.calls.length, 1, 'ANTHROPIC_MODEL pins ⇒ no discovery');
+    assert.equal(JSON.parse(fetch.calls[0].opts.body).model, 'pinned-model');
+  });
+
+  it('auto-discovers the model from /v1/models and caches it across calls', async () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    process.env.ANTHROPIC_AUTH_TOKEN = 'local';
+    const fetch = clusterStub();
+    await complete({ system: 'S', user: 'U', fetchImpl: fetch });
+    await complete({ system: 'S', user: 'U', fetchImpl: fetch });
+    const models = fetch.calls.filter((c) => c.url.endsWith('/v1/models'));
+    const messages = fetch.calls.filter((c) => c.url.endsWith('/v1/messages'));
+    assert.equal(models.length, 1, 'discovery deduped across concurrent calls');
+    assert.equal(messages.length, 2);
+    for (const m of messages) assert.equal(JSON.parse(m.opts.body).model, 'cluster-model-1');
+  });
+
+  it('degrades to the default model when discovery fails — never throws', async () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    process.env.ANTHROPIC_AUTH_TOKEN = 'local';
+    const fetch = clusterStub({ modelsDown: true });
+    const text = await complete({ system: 'S', user: 'U', fetchImpl: fetch });
+    assert.equal(text, 'ok');
+    const msg = fetch.calls.find((c) => c.url.endsWith('/v1/messages'));
+    assert.ok(msg, 'messages still attempted after discovery failure');
+    assert.equal(JSON.parse(msg.opts.body).model, 'claude-sonnet-5', 'discovery failure ⇒ DEFAULT_MODEL');
+  });
+
+  it('surfaces an API error with status from the cluster', async () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://cluster.test:8888';
+    process.env.ANTHROPIC_AUTH_TOKEN = 'local';
+    const fetch = clusterStub({ messagesStatus: 503 });
+    await assert.rejects(
+      () => complete({ system: 'S', user: 'U', fetchImpl: fetch }),
+      (err) => err.code === 'API_ERROR' && err.status === 503 && /down/.test(err.message)
+    );
   });
 });
 

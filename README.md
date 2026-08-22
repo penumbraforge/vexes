@@ -143,8 +143,20 @@ roll-ups (`.exploitable`/`.plausible`/`.unclear`/`.aiError`).
 vexes scan --ai --json                 # find vulns AND ask the local LLM which matter
 ```
 
-Advisory metadata is untrusted, so the system prompt treats it as data and
-ignores embedded instructions, and nothing but extracted facts ever leaves home.
+Point itself at a provider with any one of:
+
+```bash
+export VEXES_AI_BASE=http://localhost:11434    # OpenAI-compatible (Ollama/Spark)
+export ANTHROPIC_BASE_URL=http://cluster:8888  # Anthropic-compatible cluster (vLLM native Messages API)
+export ANTHROPIC_AUTH_TOKEN=local              # Bearer token for the cluster (model auto-discovered via /v1/models)
+export ANTHROPIC_API_KEY=sk-ant-...            # hosted Anthropic API
+```
+
+`VEXES_AI_BASE` wins; a bare `ANTHROPIC_BASE_URL` needs no API key. Mind the
+trailing slash if you paste a URL with one — it is stripped, but the typo is
+yours to check. Advisory metadata is untrusted, so the system prompt treats it
+as data and ignores embedded instructions, and nothing but extracted facts ever
+leaves home.
 Verdicts are **advisory metadata, never a filter**: a deterministic finding is
 never silenced by an AI opinion, and an AI failure never flips `complete` to
 false — it degrades to a warning. If no provider is configured, `--ai` is a
@@ -310,9 +322,14 @@ unauthenticated limit, and 429/5xx responses are retried with backoff.
 
 ### `vexes explain` -- AI-assisted triage
 
-Turns a wall of CVEs into a prioritized, plain-English action plan: what to fix first, why it matters (blast radius), and the upgrade sequence. **Opt-in and privacy-preserving** -- it calls the Claude API only when `ANTHROPIC_API_KEY` is set. The scanner itself stays fully deterministic and offline; this is a layer on top, not in the middle.
+Turns a wall of CVEs into a prioritized, plain-English action plan: what to fix first, why it matters (blast radius), and the upgrade sequence. **Opt-in and privacy-preserving** -- it uses the same pluggable local-first provider as `scan --ai` (`VEXES_AI_BASE`, a local `ANTHROPIC_BASE_URL` cluster, or hosted `ANTHROPIC_API_KEY`). The scanner itself stays fully deterministic and offline; this is a layer on top, not in the middle.
 
 ```bash
+# local OpenAI-compatible endpoint
+export VEXES_AI_BASE=http://localhost:11434
+# or a local Anthropic-compatible cluster (vLLM native Messages API)
+export ANTHROPIC_BASE_URL=http://cluster:8888 ANTHROPIC_AUTH_TOKEN=local
+# or hosted
 export ANTHROPIC_API_KEY=sk-ant-...
 
 vexes scan --format json | vexes explain   # Triage a piped scan
@@ -320,7 +337,7 @@ vexes explain --input report.json          # Triage a saved report
 vexes explain --path ./my-project          # Scan, then triage
 ```
 
-Findings are summarized (package, version, severity, advisory, fix) before sending -- no source code leaves your machine. Set `VEXES_AI_MODEL` to override the model (default `claude-sonnet-5`).
+Findings are summarized (package, version, severity, advisory, fix) before sending -- no source code leaves your machine. Set `VEXES_AI_MODEL` (or `ANTHROPIC_MODEL`) to override the model; without either, a cluster's model is auto-discovered from `GET /v1/models`.
 
 **GitHub Action:**
 ```yaml

@@ -96,6 +96,22 @@ verdict is advisory. **Always** keep using Tier A `reachability` + severity for
 blocking decisions — AI never silences a finding, and an AI failure leaves
 `complete` untouched.
 
+## Providers (pick one, first match wins)
+
+```
+VEXES_AI_BASE        → OpenAI-compatible endpoint (/v1/chat/completions)
+ANTHROPIC_BASE_URL   → Anthropic-compatible cluster (vLLM native Messages API):
+                       Bearer auth via ANTHROPIC_AUTH_TOKEN, model auto-discovered
+                       from GET <base>/v1/models — no ANTHROPIC_API_KEY needed.
+ANTHROPIC_API_KEY    → hosted Anthropic API (x-api-key auth)
+```
+
+`VEXES_AI_MODEL` (or `ANTHROPIC_MODEL`) pins the model and skips discovery.
+Discovery is cached per process and never throws: a dead cluster degrades each
+finding to `exploitability.verdict: "error"` with `summary.aiError` counting it
+— exit path and `complete` are unaffected. An agent provisioning the cluster
+can't be sure a model answers there, so keep `reachability` for blocking.
+
 `licenses` follows the same fail-loud rules: `complete:false` / exit `2` when any
 lookup fails; missing declared license → exit `1`. License data is metadata for
 policy, not exploitability — never treat it as a security blocker verdict.

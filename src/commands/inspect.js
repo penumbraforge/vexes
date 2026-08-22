@@ -1,5 +1,6 @@
-import { resolve } from 'node:path';
-import { statSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { loadConfig } from '../cli/config.js';
 import { buildEnvelope, normalizeFinding, REACHABILITY } from '../cli/schema.js';
 import { C, createSpinner, out } from '../cli/output.js';
@@ -10,7 +11,9 @@ import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { fetchPypiMetadata } from '../advisories/pypi-registry.js';
 import { checkProvenance } from '../analysis/provenance.js';
 import { analyzePackage, scoreToLevel } from '../analysis/signals.js';
-import { inspectTarball, getTarballUrl, getPypiTarballUrl } from '../analysis/tarball-inspector.js';
+import { inspectTarball, getTarballUrl, getPypiTarballUrl, downloadAndExtractToDisk } from '../analysis/tarball-inspector.js';
+import { detectSandboxHost } from '../analysis/sandbox/index.js';
+import { runHarnessed, pickEntryScript, buildSandboxSignal } from '../analysis/sandbox/harness.js';
 
 /**
  * `vexes inspect <name>[@<version>]` — single-package on-demand assessment.
@@ -169,6 +172,63 @@ export async function runInspect(flags, args) {
       warnings.push('--deep tarball inspection failed: ' + err.message);
     }
     deepSpinner?.stop('deep inspection complete');
+  }
+
+  // 5b. --sandbox: run qualified candidates in the OS sandbox under a recorder
+  // shim and attach dynamic behavior evidence. Refuse-by-default — a missing
+  // isolation host is a warning, never a signal, and never changes the exit
+  // code outcome.
+  if (flags.sandbox) {
+    let tmp;
+    try {
+      // Refuse-by-default pre-flight (mirrors analyze step 5c): resolve the
+      // effective isolation host before downloading anything. No host ⇒ we
+      // would refuse at run time regardless — so don't pull the tarball only
+      // to refuse it. One honest warning; never a signal, never an exit change.
+      const effectiveHost = config.sandboxHost !== undefined ? config.sandboxHost : detectSandboxHost();
+      if (!effectiveHost) {
+        warnings.push('sandbox skipped — no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)');
+      } else if (assessment.riskScore < 15 || assessment.signals.length === 0) {
+        warnings.push('sandbox: package below sandbox threshold (riskScore >= 15) — skipped');
+      } else {
+        tmp = mkdtempSync(join(tmpdir(), 'vexes-inspect-sandbox-'));
+        const url = ecosystem === 'pypi'
+          ? await getPypiTarballUrl(name, version)
+          : getTarballUrl(metadata, version);
+        if (!url) {
+          warnings.push('sandbox: could not determine tarball URL — skipped');
+        } else {
+          await downloadAndExtractToDisk(url, name, tmp);
+          if (ecosystem === 'pypi') {
+            warnings.push(`sandbox: ${name} (pypi) extracted but not executed — sandbox run is npm-only for now`);
+          } else {
+            const entry = pickEntryScript(tmp);
+            if (!entry) {
+              warnings.push(`sandbox: no runnable entrypoint in ${name}@${version} — skipped`);
+            } else {
+              const child = runHarnessed({ workdir: tmp, entryScript: entry, allow: true, timeoutMs: 10000, host: config.sandboxHost });
+              if (child.status === 'refused') {
+                warnings.push(`sandbox skipped — ${child.reason}`);
+              } else {
+                const signal = buildSandboxSignal({ name, version, evidence: child.evidence });
+                if (signal) {
+                  assessment.signals.push(signal);
+                  assessment.sandboxEvidence = signal.evidence.dynamic;
+                  assessment.riskScore += SEVERITY[signal.severity].weight;
+                }
+                // No signal (no behavior recorded, or a failed/crashed harness)
+                // ⇒ nothing to attach; staying silent is honest here.
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      log.debug(`sandbox step failed for ${name}@${version}: ${err.message}`);
+      warnings.push(`sandbox step failed: ${err.message}`);
+    } finally {
+      if (tmp) rmSync(tmp, { recursive: true, force: true });
+    }
   }
 
   // Re-derive risk level — provenance/deep steps mutated riskScore after

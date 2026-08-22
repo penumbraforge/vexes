@@ -139,6 +139,11 @@ export function loadConfig(dir, flags = {}) {
   if (flags.verbose) config.verbose = true;
   if (flags.strict) config.strict = true;
   if (flags.deep) config.deep = true;
+  if (flags.sandbox) config.sandbox = true;
+  // sandboxHost is a test-only injection (host: null forces refusal). Passed
+  // through flags directly, documented nowhere — the CLI sandbox host is always
+  // auto-detected so a config file can't silently disable isolation.
+  if (flags.sandboxHost !== undefined) config.sandboxHost = flags.sandboxHost;
   if (flags.fix) config.fix = true;
   if (flags.explain) config.explain = flags.explain;
   // --min-reachability: only report findings whose reachability grades at/above

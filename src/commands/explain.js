@@ -144,7 +144,14 @@ export async function runExplain(flags, args) {
     ${C.dim}export VEXES_AI_MODEL=qwen2.5-coder:7b${C.reset}${C.dim}   # or your Spark endpoint${C.reset}
     ${C.dim}vexes scan --format json | vexes explain${C.reset}
 
-  or use Anthropic:
+  or a local Anthropic-compatible cluster (vLLM native Messages API — the
+  model is auto-discovered, no ANTHROPIC_MODEL needed):
+
+    ${C.dim}export ANTHROPIC_BASE_URL=http://cluster:8888${C.reset}
+    ${C.dim}export ANTHROPIC_AUTH_TOKEN=local${C.reset}
+    ${C.dim}vexes scan --format json | vexes explain${C.reset}
+
+  or the hosted Anthropic API:
 
     ${C.dim}export ANTHROPIC_API_KEY=sk-ant-...${C.reset}
     ${C.dim}vexes scan --format json | vexes explain${C.reset}
@@ -175,7 +182,7 @@ export async function runExplain(flags, args) {
     });
   } catch (err) {
     if (err.code === 'NO_PROVIDER') {
-      log.error('No AI provider configured — set VEXES_AI_BASE or ANTHROPIC_API_KEY');
+      log.error('No AI provider configured — set VEXES_AI_BASE, ANTHROPIC_BASE_URL(+ANTHROPIC_AUTH_TOKEN), or ANTHROPIC_API_KEY');
     } else {
       log.error(`AI triage failed (${err.code || 'error'}): ${err.message}`);
     }

@@ -107,7 +107,7 @@ function printHelp() {
     fix        Verified fix recommendations with safe upgrade commands
     guard      Pre-install protection via lockfile diffing
     monitor    CI integration (GitHub Actions) + continuous watch
-    explain    AI-assisted triage of findings ${C.dim}(needs ANTHROPIC_API_KEY)${C.reset}
+    explain    AI-assisted triage of findings ${C.dim}(opt-in: local or Anthropic provider)${C.reset}
     inspect    Assess a single package ${C.dim}(e.g. vexes inspect lodash@4.17.21)${C.reset}
     doctor     Self-test parsers, cache, and network
     licenses   Declared license bill of materials via deps.dev ${C.dim}(npm/pypi/cargo/go/nuget/java)${C.reset}
@@ -134,6 +134,9 @@ function printHelp() {
     --path <dir>         Target directory ${C.dim}(default: cwd)${C.reset}
     --ecosystem <name>   Filter: npm, pypi
     --deep               Download + AST-inspect actual package code (slower, thorough)
+    --sandbox ${C.dim}(experimental, opt-in)${C.reset} Run CRITICAL/HIGH candidate
+                          code in the OS sandbox and record dynamic behavior
+                          evidence ${C.dim}(spawns, network, writes)${C.reset}
     --explain <package>  Detailed breakdown for a specific package
     --strict             Fail on any signal (for CI)
     --verbose, -v        Show all signals including LOW
@@ -161,13 +164,16 @@ function printHelp() {
     vexes inspect lodash@4.17.21    Assess a package spec (defaults to latest)
     --ecosystem <name>   npm (default) or pypi
     --deep               Download + AST-inspect the package tarball
+    --sandbox ${C.dim}(experimental, opt-in)${C.reset} Run the package in the OS
+                          sandbox under a recorder shim; attach dynamic
+                          behavior evidence ${C.dim}(spawns, network, writes)${C.reset}
     --json               Output JSON to stdout
 
   ${C.bold}DOCTOR OPTIONS${C.reset} ${C.dim}(self test)${C.reset}
     vexes doctor         Verify parsers, cache, and registry reachability
     --json               Machine-readable JSON output
 
-  ${C.bold}EXPLAIN OPTIONS${C.reset} ${C.dim}(AI triage — opt-in, needs ANTHROPIC_API_KEY)${C.reset}
+  ${C.bold}EXPLAIN OPTIONS${C.reset} ${C.dim}(AI triage — opt-in, pluggable provider: VEXES_AI_BASE, or ANTHROPIC_BASE_URL+ANTHROPIC_AUTH_TOKEN, or ANTHROPIC_API_KEY)${C.reset}
     vexes scan --format json | vexes explain   Triage a piped scan
     --input <file>       Triage a saved scan JSON report
     --path <dir>         Or scan this dir first, then triage ${C.dim}(default: cwd)${C.reset}

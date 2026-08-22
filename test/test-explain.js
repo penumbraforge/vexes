@@ -24,22 +24,43 @@ function mockFetch(responseBody, { ok = true, status = 200 } = {}) {
   return fn;
 }
 
+// Mitigate cross-test/env leakage from the claude-cluster trio: these tests
+// exercise the HOSTED (api.anthropic.com) path, so ANTHROPIC_BASE_URL /
+// ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL must be cleared no matter what the
+// shell exports (the user's cluster config lives in ~/.zshrc).
+const TRIO = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL'];
+const scrubTrio = () => TRIO.map((k) => [k, process.env[k]]);
 const withKey = async (fn) => {
   const prev = process.env.ANTHROPIC_API_KEY;
+  const trio = scrubTrio();
+  TRIO.forEach((k) => { if (process.env[k] !== undefined) delete process.env[k]; });
   process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
   try { return await fn(); }
   finally {
     if (prev === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = prev;
+    restoreTrio(trio);
   }
 };
 
 const withoutKey = async (fn) => {
   const prev = process.env.ANTHROPIC_API_KEY;
+  const trio = scrubTrio();
+  TRIO.forEach((k) => { if (process.env[k] !== undefined) delete process.env[k]; });
   delete process.env.ANTHROPIC_API_KEY;
   try { return await fn(); }
-  finally { if (prev !== undefined) process.env.ANTHROPIC_API_KEY = prev; }
+  finally {
+    if (prev !== undefined) process.env.ANTHROPIC_API_KEY = prev;
+    restoreTrio(trio);
+  }
 };
+
+function restoreTrio(saved) {
+  for (const [k, v] of saved) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
 
 describe('claude client: key gating', () => {
   it('hasApiKey reflects the env var', async () => {

@@ -12,6 +12,7 @@ import { queryBatch, isQueryComplete } from '../advisories/osv.js';
 import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { analyzePackage } from '../analysis/signals.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
+import { buildEnvelope } from '../cli/schema.js';
 
 /**
  * `vexes guard` — Pre-install protection.
@@ -26,6 +27,129 @@ import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
  *
  * This approach works even with cached packages (no network interception needed).
  */
+/**
+ * Lockfile-only dry-run flags per package manager. `--package-lock-only` is
+ * npm-only; pnpm needs `--lockfile-only`; yarn (berry) updates the lockfile
+ * without touching node_modules via `--mode=update-lockfile`. npx has no
+ * lockfile mode (its real install is guarded as-is). Never executes scripts.
+ */
+export function dryRunFlags(manager) {
+  switch (manager) {
+    case 'pnpm': return ['--lockfile-only', '--ignore-scripts'];
+    case 'yarn': return ['--mode=update-lockfile', '--ignore-scripts', '--non-interactive'];
+    case 'npx': return [];
+    default: return ['--package-lock-only', '--ignore-scripts'];
+  }
+}
+
+/**
+ * Extract the package names being installed from `npm install <pkg>`-style
+ * args, ignoring flags, local path/dir targets, and version specs.
+ * @returns {string[]} lowercased requested names (may be empty)
+ */
+export function requestedNamesFromArgs(args = []) {
+  const verbIdx = args.findIndex((a) => ['install', 'i', 'add'].includes(a));
+  if (verbIdx === -1) return [];
+  const names = [];
+  for (const tok of args.slice(verbIdx + 1)) {
+    if (tok.startsWith('-')) continue;                              // flags (-D, --save-dev ...)
+    if (tok === '.') continue;                                      // install current dir
+    if (tok.includes('/') && !tok.startsWith('@')) continue;        // local path target
+    if (tok.startsWith('@')) {                                      // scoped: @scope/name[@ver]
+      const at = tok.lastIndexOf('@');
+      names.push(at > 0 && at !== tok.indexOf('@') ? tok.slice(0, at) : tok);
+    } else {
+      names.push(tok.split('@')[0]);                                // name[@ver]
+    }
+  }
+  return names.filter(Boolean);
+}
+
+/** Parse a raw package-lock.json into its `packages` map ({} on bad JSON). */
+function parseLockGraph(raw) {
+  try {
+    const data = JSON.parse(String(raw || ''));
+    if (data && typeof data === 'object' && data.packages) return data.packages;
+    return {};
+  } catch { return {}; }
+}
+
+/** Flood the dependency graph from `roots` over every `node_modules/*` entry. */
+function reachableNames(packages, roots) {
+  const seen = new Set();
+  for (const r of roots) seen.add(String(r).toLowerCase());
+  let frontier = [...seen];
+  while (frontier.length) {
+    const next = [];
+    for (const name of frontier) {
+      for (const [key, entry] of Object.entries(packages)) {
+        if (!key || key === '') continue;
+        const entryName = key.split('node_modules/').pop();
+        const visitKey = `__seen:${name}:${key}`;
+        if (!entryName || entryName.toLowerCase() !== name || seen.has(visitKey)) continue;
+        seen.add(visitKey); // walk this occurrence's edges once
+        for (const e of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) {
+          if (!entry || !entry[e]) continue;
+          for (const depName of Object.keys(entry[e])) {
+            const n = depName.toLowerCase();
+            if (!seen.has(n)) { seen.add(n); next.push(n); }
+          }
+        }
+      }
+    }
+    frontier = next;
+  }
+  return seen;
+}
+
+/**
+ * The lockfile tamper guard. After a dry-run install, verify the diff only
+ * touches packages reachable from the requested install:
+ *  - added/changed entries must be reachable from a requested name in the
+ *    AFTER graph (something unseen appeared/moved that nobody asked for);
+ *  - removed entries must be reachable in the BEFORE graph (npm dedupes and
+ *    evicts while installing — an unrelated silent removal is the tamper sign).
+ * Returns null when clean, or a human reason string. Empty requestedNames
+ * (e.g. bare `npm install`) skips attribution — nothing to compare against.
+ * The caller restores the original lockfile and fails on any non-null.
+ */
+export function verifyLockfileDiff({ beforeRaw, afterRaw, diff, requestedNames = [] }) {
+  if (requestedNames.length === 0) return null;
+  const before = reachableNames(parseLockGraph(beforeRaw), requestedNames);
+  const after = reachableNames(parseLockGraph(afterRaw), requestedNames);
+  for (const { name } of diff.added || []) {
+    if (!after.has(String(name).toLowerCase())) return `added package "${name}" is not reachable from the requested install`;
+  }
+  for (const { name } of diff.changed || []) {
+    if (!after.has(String(name).toLowerCase())) return `changed package "${name}" is not reachable from the requested install`;
+  }
+  for (const { name } of diff.removed || []) {
+    if (!before.has(String(name).toLowerCase())) return `removed package "${name}" is not reachable from the requested install`;
+  }
+  return null;
+}
+
+/**
+ * Emit guard's machine output through the shared JSON envelope (cli/schema.js)
+ * so agents/CI get the same versioned shape they get from every other vexes
+ * command. Command-specific fields (installCommand, blocked, incomplete,
+ * diff, results) ride in `extra` — `results` stays a top-level key, so older
+ * consumers of the ad-hoc guard object keep working.
+ */
+export function buildGuardEnvelope({ installCommand, diff, blocked, incomplete, warnings, results }) {
+  const added = (diff?.added || []).length;
+  const changed = (diff?.changed || []).length;
+  const removed = (diff?.removed || []).length;
+  return buildEnvelope({
+    command: 'guard',
+    complete: !incomplete,
+    warnings,
+    summary: { added, changed, removed, blocked, incomplete },
+    findings: [],
+    extra: { installCommand, blocked, incomplete, diff: { added, changed, removed }, results: results || [] },
+  });
+}
+
 export async function runGuard(flags, args) {
   // Subcommands
   if (flags.setup) return runSetup(flags);
@@ -86,15 +210,16 @@ export async function runGuard(flags, args) {
   }
 
   const installDisplay = installArgs.join(' ');
-  const dryRunSpinner = isJSON ? null : createSpinner(`Dry-running: ${installDisplay} --package-lock-only --ignore-scripts`);
+  const dryFlags = dryRunFlags(manager);
+  const dryRunSpinner = isJSON ? null : createSpinner(`Dry-running: ${installDisplay} ${dryFlags.join(' ')}`);
 
   // Backup the lockfile
   const lockfileBackup = readFileSync(lockfilePath, 'utf8');
 
   try {
-    // Run the install in lockfile-only mode (no node_modules changes, no scripts)
-    // Uses execFileSync (no shell) to prevent command injection
-    execFileSync(manager, [...installArgs.slice(1), '--package-lock-only', '--ignore-scripts'], {
+    // Run the install in the manager's lockfile-only mode (no node_modules
+    // changes, no scripts). Uses execFileSync (no shell) to prevent injection.
+    execFileSync(manager, [...installArgs.slice(1), ...dryFlags], {
       cwd: targetDir,
       stdio: 'pipe',
       timeout: 120_000,
@@ -126,6 +251,27 @@ export async function runGuard(flags, args) {
     writeFileSync(lockfilePath, lockfileBackup);
     if (!isJSON) out(`\n  ${C.green}\u2713 No dependency changes — install is safe${C.reset}\n`);
     return EXIT.OK;
+  }
+
+  // --- Lockfile tamper guard ------------------------------------------------
+  // The dry-run result is only as trustworthy as the registry + install hooks
+  // that produced it. Verify the diff touches ONLY packages reachable from the
+  // requested install; anything else (silent removal, attribute-less add) is
+  // tamper → restore the original lockfile and fail loud.
+  let afterRaw;
+  try { afterRaw = readFileSync(lockfilePath, 'utf8'); } catch { afterRaw = ''; }
+  const tamperReason = verifyLockfileDiff({
+    beforeRaw: lockfileBackup,
+    afterRaw,
+    diff,
+    requestedNames: requestedNamesFromArgs(installArgs),
+  });
+  if (tamperReason) {
+    dryRunSpinner?.stop('Lockfile tamper check failed');
+    writeFileSync(lockfilePath, lockfileBackup);
+    log.error(`lockfile tamper check failed: ${tamperReason}`);
+    if (!isJSON) out(`  ${C.red}! ${C.bold}${sanitize(tamperReason)}${C.reset} ${C.dim}— lockfile restored, install not executed.${C.reset}\n`);
+    return EXIT.ERROR;
   }
 
   // 4. Analyze new and changed packages
@@ -188,15 +334,15 @@ export async function runGuard(flags, args) {
 
     if (isJSON) {
       const blocked = critical.length > 0 || hasKnownVulns || analysisIncomplete;
-      out(JSON.stringify({
-        version: VERSION, command: 'guard',
+      const payload = buildGuardEnvelope({
         installCommand: installDisplay,
-        diff: { added: diff.added.length, changed: diff.changed.length, removed: diff.removed.length },
+        diff,
         blocked,
         incomplete: analysisIncomplete,
         warnings: [...osvData.failures, ...incompleteReasons],
         results,
-      }, null, 2));
+      });
+      out(JSON.stringify(payload, null, 2));
 
       if (!blocked) return EXIT.OK;
       return analysisIncomplete && critical.length === 0 && !hasKnownVulns ? EXIT.ERROR : EXIT.VULNS_FOUND;

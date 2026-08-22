@@ -18,7 +18,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { log } from '../../core/logger.js';
 
 // Per-platform isolation primitives, ordered by preference. Existence probe
@@ -57,12 +57,20 @@ export function detectSandboxHost() {
 // NOTE: Seatbelt's `-p` inline form rejects `//` comments — keep this profile
 // comment-free or sandbox-exec aborts at parse time.
 function seatbeltProfile(workdir, tmpdir) {
+  // Seatbelt matches write-subpath rules against the RESOLVED path. macOS
+  // /tmp, /var and $TMPDIR are symlinks to /private/*, so an unresolved
+  // subpath rule silently no-ops and (under `deny default`) denies every
+  // write — the containment is real but the harness would starve. Resolve
+  // both first; realpathSync fails (missing path) → fall back to the literal.
+  const resolve = (p) => { try { return realpathSync(String(p)); } catch { return String(p); } };
+  const rw = resolve(workdir || process.cwd());
+  const rt = resolve(tmpdir || '/tmp');
   return `(version 1)
 (deny default)
 (allow process*)
 (allow sysctl-read)
 (allow file-read*)
-(allow file-write* (subpath "${workdir}") (subpath "${tmpdir}"))
+(allow file-write* (subpath "${rw}") (subpath "${rt}"))
 (allow file-read-metadata)
 (allow mach-lookup)
 (allow signal)
