@@ -10,7 +10,7 @@ When a signal fires for an allowlisted package, it gets a `knownGood: true` evid
 
 This means:
 - esbuild's legitimate postinstall is flagged at `LOW` severity instead of `HIGH`
-- If esbuild's postinstall suddenly starts accessing `process.env.AWS_SECRET_ACCESS_KEY`, that new signal is NOT downweighted and fires at full severity
+- If esbuild's postinstall suddenly starts accessing `process.env.AWS_SECRET_ACCESS_KEY`, the signal still fires and its severity *label* stays CRITICAL — but its contribution to the composite risk score is still downweighted 0.2x like every other known-good signal. The allowlist reduces noise; it does not boost severity for new patterns.
 
 ## Known postinstall packages
 
@@ -36,7 +36,7 @@ These packages have install scripts for legitimate reasons (downloading platform
 
 ## Popular package databases
 
-Used for typosquat detection. A package name within Levenshtein distance 1-2 of a popular package is flagged.
+Used for typosquat detection. A package name within Levenshtein distance 1 (4–6 chars) or 2 (7+ chars) of a popular package is flagged; names of 3 or fewer characters are never compared.
 
 ### npm (~150 popular packages)
 lodash, chalk, react, axios, express, debug, tslib, commander, moment, uuid, webpack, typescript, eslint, prettier, jest, next, vue, tailwindcss, prisma, zod, pino, winston, and many more.

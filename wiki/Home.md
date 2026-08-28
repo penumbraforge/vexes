@@ -7,7 +7,7 @@ Welcome to the vexes wiki -- the complete reference for the cross-ecosystem depe
 ## Pages
 
 - **[Getting Started](Getting-Started.md)** -- Installation, first scan, understanding output
-- **[Commands Reference](Commands-Reference.md)** -- Full documentation for scan, analyze, fix, guard, monitor
+- **[Commands Reference](Commands-Reference.md)** -- Full documentation for scan, analyze, fix, guard, monitor (plus pointers to inspect, doctor, licenses, explain)
 - **[Detection Signals](Detection-Signals.md)** -- Every signal vexes can detect, with severity levels and examples
 - **[Configuration](Configuration.md)** -- .vexesrc.json, user config, signal overrides, cache tuning
 - **[CI/CD Integration](CI-CD-Integration.md)** -- GitHub Actions, SARIF upload, exit codes, JSON output

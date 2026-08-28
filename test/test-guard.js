@@ -8,7 +8,6 @@ describe('guard dry-run flags (manager-correct)', () => {
     assert.deepEqual(dryRunFlags('npm'), ['--package-lock-only', '--ignore-scripts']);
     assert.deepEqual(dryRunFlags('pnpm'), ['--lockfile-only', '--ignore-scripts']);
     assert.deepEqual(dryRunFlags('yarn'), ['--mode=update-lockfile', '--ignore-scripts', '--non-interactive']);
-    assert.deepEqual(dryRunFlags('npx'), []); // no lockfile-only mode — no flags to add
     assert.deepEqual(dryRunFlags('something-else'), dryRunFlags('npm'));
   });
 
@@ -16,6 +15,15 @@ describe('guard dry-run flags (manager-correct)', () => {
     for (const m of ['npm', 'pnpm', 'yarn']) {
       assert.ok(dryRunFlags(m).includes('--ignore-scripts'), `${m} must ignore scripts`);
     }
+  });
+
+  it('refuses npx outright — no dry-run mode means the package would execute before analysis', async () => {
+    // runGuard returns EXIT.ERROR before any execution when manager is npx.
+    // No lockfile is needed: the refusal happens before lockfile checks.
+    const { runGuard } = await import('../src/commands/guard.js');
+    const EXIT = (await import('../src/core/constants.js')).EXIT;
+    const rc = await runGuard({ force: false }, ['npx', 'some-package']);
+    assert.equal(rc, EXIT.ERROR);
   });
 });
 

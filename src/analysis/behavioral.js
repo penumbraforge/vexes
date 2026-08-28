@@ -6,6 +6,13 @@ import { log } from '../core/logger.js';
  * Builds a capability profile per package version, then diffs against the
  * previous version. A utility library that suddenly gains process+network
  * capabilities between versions is flagged. The DIFF is what matters.
+ *
+ * Honesty note: registry metadata does not expose a previous version's
+ * install scripts, so a fabricated "previous" profile must be marked
+ * `capabilitiesKnown: false`. Only a profile built from actually-inspected
+ * previous-version code sets it true; anything else degrades to
+ * INITIAL_DANGEROUS_CAPABILITY (present-now, MODERATE) instead of claiming
+ * a CAPABILITY_ESCALATION (gained-between-versions, CRITICAL).
  */
 
 /**
@@ -53,27 +60,34 @@ export function buildProfile(metadata, astResult) {
 export function diffProfiles(current, previous) {
   const findings = [];
 
-  if (!previous) {
-    // First version — no diff possible, but flag dangerous capabilities
+  if (!previous || previous.capabilitiesKnown === false) {
+    // No previous-version capability data (first version, or the registry
+    // gives no per-version script history). No diff is possible — flag the
+    // dangerous capabilities the current version HAS, at MODERATE, without
+    // claiming they appeared "between versions". Metadata-only diffs that
+    // don't depend on capability data (dependency spike) still run below.
     for (const cap of current.capabilities) {
       if (DANGEROUS_CAPABILITIES.has(cap)) {
         findings.push({
           signal: 'INITIAL_DANGEROUS_CAPABILITY',
           severity: 'MODERATE',
-          description: `Package has "${cap}" capability`,
+          description: `Package has "${cap}" capability in its latest version (previous version's capabilities unknown — no diff possible)`,
           evidence: { capability: cap },
         });
       }
     }
-    return findings;
+    if (!previous) return findings;
   }
 
+  const capsKnown = previous.capabilitiesKnown !== false;
   const prevCaps = new Set(previous.capabilities);
   const newCaps = current.capabilities.filter(c => !prevCaps.has(c));
 
-  // Capability escalation: new dangerous capabilities appeared
+  // Capability escalation: new dangerous capabilities appeared. Only claimed
+  // when the previous version's capabilities are actually known — otherwise
+  // the initial-capability path above already spoke.
   for (const cap of newCaps) {
-    if (DANGEROUS_CAPABILITIES.has(cap)) {
+    if (capsKnown && DANGEROUS_CAPABILITIES.has(cap)) {
       findings.push({
         signal: 'CAPABILITY_ESCALATION',
         severity: 'CRITICAL',

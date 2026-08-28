@@ -6,7 +6,8 @@
  * Signals from these packages are downweighted, not suppressed — a compromised version
  * of esbuild would still be caught if new dangerous patterns appear.
  *
- * This list is auditable in the repo. Users can extend it in .vexesrc.json.
+ * This list is auditable in the repo. Extending it via .vexesrc.json is not
+ * implemented yet (see wiki/Allowlists.md).
  */
 
 // Packages with legitimate postinstall scripts (download platform binaries)

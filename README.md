@@ -23,7 +23,7 @@ npx @penumbraforge/vexes scan
 ```
 $ vexes scan --path demo
 
-  vexes v0.4.0 -- scanning dependencies
+  vexes v0.5.0 -- scanning dependencies
 
   Found 33 unique packages across 3 dependency file(s)
 
@@ -39,7 +39,8 @@ $ vexes scan --path demo
   ...
 
   (real output, trimmed for the README — the demo tree carries 219 findings:
-   27 critical . 108 high . 84 moderate across npm, pypi, cargo)
+   27 critical . 109 high . 83 moderate across npm, pypi, cargo, as of 2026-08-28;
+   counts drift as OSV data changes)
 ```
 
 ## What it does
@@ -50,7 +51,7 @@ vexes checks dependencies against vulnerability databases and adds four layers o
 |-------|-----------------|----------------|
 | **1. AST Analysis** | Parses JS/Python source via acorn AST | `eval()`, `child_process.exec()`, credential harvesting, obfuscated code, dynamic imports, `WebAssembly`, `setTimeout(string)`, DNS exfiltration, prototype chain escapes |
 | **2. Dependency Graph** | Profiles newly added dependencies | Phantom dependencies (brand-new packages), circular staging, typosquatting, Unicode homoglyph attacks |
-| **3. Behavioral Fingerprinting** | Diffs capability profiles between versions | A utility library that suddenly gains network+exec capabilities |
+| **3. Behavioral Fingerprinting** | Inspects install-script capabilities of the latest version | A utility library whose install scripts have network+exec capabilities |
 | **4. Registry Metadata** | Analyzes publish history, maintainers, timing | Account takeovers, rapid publishes, dormant package reactivation |
 
 **Two kinds of signal, weighted differently:**
@@ -120,15 +121,20 @@ vexes scan --ai --json                   # + Tier B: LLM exploitability verdicts
 **Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.sum), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml), Hex (mix.lock), Dart/pub (pubspec.lock)
 
 **Reachability (`--min-reachability`):** Tier A builds an import graph over the
-project's own source (acorn for JS, light `import`/`use` scanning for Python and
-Rust) and grades every dependency `reachable | lazy | dead | unknown` —
+project's own source (acorn for JS, light import scanning for TypeScript/TSX,
+light `import`/`use` scanning for Python and Rust) and grades every dependency
+`reachable | lazy | dead | unknown` —
 **dead** means no project code imports it (dev/test leftovers, abandoned
 lockfile entries), which is the single biggest source of false positives in SCA
 tools. The default keeps everything, graded; `--min-reachability reachable`
 drops alarming-but-unreachable findings. Grades flow into JSON findings, the
 `llmSummary`, and SARIF `properties.reachability`, so agents and CI can
 prioritize by what the app can actually load. Unscannable ecosystems (Go, Ruby,
-PHP, NuGet, Java) are honestly graded `unknown`, never mislabeled dead.
+PHP, NuGet, Java) are honestly graded `unknown`, never mislabeled dead. The
+scanner is still static: computed specifiers (`require(\`./plugins/${name}\`)`),
+CLI invocations of a dep's binary, and deps used only by sibling workspace
+packages can grade `dead` wrongly — treat `dead` as "no static import found,"
+not "provably unused."
 
 **Ecosystem reachability:** only `npm`/`pypi`/`cargo` have source scanners today.
 A lockfile-only repo (or `--path` pointing at one with no source) grades
@@ -190,17 +196,32 @@ vexes analyze --json                # Machine-readable JSON output
 - `TYPOSQUAT` -- Name suspiciously similar to a popular package
 - `PHANTOM_DEPENDENCY` -- Brand-new dependency added (< 7 days old)
 - `CIRCULAR_STAGING` -- New dep published by the same account as the parent
-- `CAPABILITY_ESCALATION` -- Package gained dangerous capabilities between versions
+- `CAPABILITY_ESCALATION` -- Previous version's capabilities known and the package gained dangerous ones between versions (rare: requires a real previous-version diff)
+- `INITIAL_DANGEROUS_CAPABILITY` -- Latest version's install scripts have dangerous capabilities (previous version's capabilities are not knowable from registry metadata, so no diff is claimed)
 - `AST_DANGEROUS_PATTERN` -- Dangerous code patterns in install scripts
 - `TARBALL_DANGEROUS_PATTERN` -- Dangerous patterns in actual package source code
 - `HOMOGLYPH` -- Package name contains suspicious Unicode (zero-width chars, RTL override, non-ASCII)
 - `MISSING_PROVENANCE` -- No Sigstore provenance attestation
-- `SIGNATURE_SPOOF` -- Provenance **present and cryptographically valid** but
-  the attestation certifies a *different package's artifact* (replay) or claims
-  a *different source repo* than the package declares. Provenance ≠ trust: the
-  TanStack worm shipped valid SLSA L3 provenance; vexes is the tool that xrefs
-  what a signature actually says against who the package claims to be.
+- `SIGNATURE_SPOOF` -- The provenance attestation certifies a *different
+  package's artifact* (replay) or claims a *different source repo* than the
+  package declares. vexes **decodes and cross-references attested fields; it
+  does not verify DSSE signatures, certificates, or transparency-log inclusion
+  proofs** — so it can catch a mismatch between what an attestation says and
+  what the package claims, but it cannot confirm the attestation is genuine.
+  Provenance ≠ trust: the TanStack worm shipped valid SLSA L3 provenance;
+  vexes is the tool that xrefs what an attestation says against who the
+  package claims to be.
 - `NO_REPOSITORY` -- No source repository link
+
+**Coverage caveats for name-based detection:** typosquat similarity is computed
+against a curated list of ~165 npm / ~105 PyPI popular packages — a typosquat
+of anything outside that list is invisible. Similarity thresholds are
+length-dependent (names ≤3 chars are never compared; 4–6 chars allow distance
+1; 7+ allow distance 2), and scoped names (`@scope/pkg`) are not typosquat
+candidates. Homoglyph detection flags invisible Unicode, BIDI overrides, and
+any non-ASCII character — npm names are ASCII-only by registry rule, so on npm
+that check is effectively dormant; it is live on PyPI. It detects "non-ASCII
+present," not true Unicode-confusable mapping.
 
 ### Dynamic sandbox (experimental)
 
@@ -230,7 +251,7 @@ vexes fix --json                    # Machine-readable output
 
 ### `vexes guard` -- Pre-install check
 
-Intercepts `npm install` and analyzes new or changed packages before they execute. Works by diffing lockfiles -- no network proxy needed. This is the least exercised command; it sits in the path of your installs, so try it on a throwaway project first.
+Intercepts `npm install` (and `pnpm`/`yarn` lockfile updates) and analyzes new or changed packages before they execute. Works by diffing lockfiles -- no network proxy needed. **`npx` is refused, not guarded**: it has no dry-run mode, so the package would execute before it could be analyzed -- use `vexes inspect <pkg>` first. This is the least exercised command; it sits in the path of your installs, so try it on a throwaway project first.
 
 ```bash
 vexes guard -- npm install axios    # Guard a specific install
@@ -241,11 +262,11 @@ vexes guard --force -- npm install  # Override HIGH warnings (CRITICAL still blo
 
 **How it works:**
 1. Snapshots current lockfile
-2. Runs `npm install --package-lock-only --ignore-scripts` (dry-run)
+2. Runs the install in lockfile-only mode (`npm`/`pnpm`/`yarn`; scripts never run)
 3. Diffs the lockfile to find new/changed packages
 4. Runs behavioral analysis on those packages
-5. Blocks if CRITICAL, prompts on HIGH, allows if clean
-6. Runs the real install only after approval
+5. Blocks on CRITICAL or any known-vulnerable (`KNOWN_COMPROMISED`) package and on incomplete analysis; prompts on HIGH; allows if clean
+6. Runs the real install only after approval (`--force` overrides HIGH warnings, never CRITICAL)
 
 ### `vexes monitor` -- Continuous monitoring
 
@@ -436,12 +457,12 @@ needed. Every machine command emits the same envelope:
 ```json
 {
   "schemaVersion": "1.0",
-  "generator": { "name": "vexes", "version": "0.4.0" },
+  "generator": { "name": "vexes", "version": "0.5.0" },
   "timestamp": "...", "command": "scan",
   "target": { "dir": "...", "lockfiles": [...], "ecosystems": [...] },
   "complete": true,              // false ⇒ NEVER treat as clean
   "result": { "complete": true, "warnings": [] },
-  "summary": { "total": 33, "vulnerable": 219, "critical": 27, "high": 108, "moderate": 84, "low": 0, "suppressed": 0,
+  "summary": { "total": 33, "vulnerable": 219, "critical": 27, "high": 109, "moderate": 83, "low": 0, "suppressed": 0,
     "reachable": 0, "lazy": 0, "dead": 33, "unreachable": 33 },
   "findings": [ { "id": "GHSA-23hp-3jrh-7fpw", "package": "tar", "version": "6.1.0", "ecosystem": "npm",
     "severityLevel": { "level": "CRITICAL", "order": 4 },

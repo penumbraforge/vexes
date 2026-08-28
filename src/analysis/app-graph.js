@@ -33,7 +33,8 @@ const SKIP_DIRS = new Set([
 ]);
 
 const JS_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx']);
-const SOURCE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.py', '.rs']);
+const TS_EXT = new Set(['.ts', '.tsx', '.mts', '.cts']);
+const SOURCE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.py', '.rs']);
 
 // Ecosystems whose the source scanner can grade. Everything else returns
 // "unknown" from reachabilityOf (never mislabeled dead — we didn't check).
@@ -130,6 +131,7 @@ export function extractImports(src, fileAbs) {
   const file = fileAbs.replaceAll('\\', '/');
   const ext = extname(file).toLowerCase();
   if (JS_EXT.has(ext)) return extractJsImports(src, file);
+  if (TS_EXT.has(ext)) return extractTsImports(src, file);
   if (ext === '.py') return extractPythonImports(src, file);
   if (ext === '.rs') return extractRustImports(src, file);
   return { file, static: [], dynamic: [] };
@@ -192,6 +194,36 @@ function extractJsImports(src, file) {
     }
   }
 
+  return imports;
+}
+
+// TypeScript light scan (regex, not AST — acorn cannot parse TS syntax).
+// Covers the runtime-relevant forms: `import x from 'p'` (incl. multi-line;
+// `import type` is skipped — type-only imports never execute the package),
+// side-effect `import 'p'`, `export ... from 'p'`, dynamic `import('p')`,
+// and `require('p')`. Same honesty as the Python/Rust scanners: string and
+// comment contents may produce false edges; path aliases (@/x, ~/x) resolve
+// to nothing and are ignored as bare specifiers.
+const TS_IMPORT_FROM_RE = /^\s*import\s+(type\s+)?[\s\S]*?from\s*['"]([^'"]+)['"]/gm;
+const TS_EXPORT_FROM_RE = /^\s*export\s+(type\s+)?[\s\S]*?from\s*['"]([^'"]+)['"]/gm;
+const TS_SIDE_EFFECT_RE = /^\s*import\s*['"]([^'"]+)['"]/gm;
+const TS_DYNAMIC_RE = /import\(\s*['"]([^'"]+)['"]\s*\)/g;
+const TS_REQUIRE_RE = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+function extractTsImports(src, file) {
+  const imports = { file, static: [], dynamic: [] };
+  // `import type` / `export type` are erased at compile time — they never
+  // execute the package, so they must not create reachability edges.
+  for (const m of src.matchAll(TS_IMPORT_FROM_RE)) {
+    if (!m[1]) imports.static.push(m[2]);
+  }
+  for (const m of src.matchAll(TS_EXPORT_FROM_RE)) {
+    if (!m[1]) imports.static.push(m[2]);
+  }
+  for (const re of [TS_SIDE_EFFECT_RE, TS_REQUIRE_RE]) {
+    for (const m of src.matchAll(re)) imports.static.push(m[1]);
+  }
+  for (const m of src.matchAll(TS_DYNAMIC_RE)) imports.dynamic.push(m[1]);
   return imports;
 }
 

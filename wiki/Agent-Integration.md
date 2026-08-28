@@ -36,7 +36,7 @@ findings        []      — normalized OSV-style records with contract fields
 severityLevel   { level, order }
 signal          detection signal id (KNOWN_COMPROMISED, ...)
 confidence      proven | deterministic | heuristic | inferred
-reachability    reachable | lazy | dead | unknown   (Tier A arrives with app-graph)
+reachability    reachable | lazy | dead | unknown   (Tier A: computed from the app-graph on every scan)
 direct          boolean — false means "known transitive", undefined = unknown
 advisories      [osvId, ...aliases] deduped
 fixed           ">= x.y.z" when a fix range is known

@@ -13,7 +13,7 @@ vexes uses `node:sqlite` (DatabaseSync) for caching, which was stabilized in Nod
 ### Is this different from `npm audit`?
 
 Yes. `npm audit` only checks npm packages against the GitHub Advisory Database. vexes:
-- Scans **8 ecosystems** (npm incl. pnpm/Yarn, PyPI, Cargo, Go, Ruby, PHP, NuGet, Java)
+- Scans **10 ecosystems** (npm incl. pnpm/Yarn, PyPI, Cargo, Go, Ruby, PHP, NuGet, Java, Hex, Pub) — deep 4-layer analysis is npm/PyPI only; the rest are OSV-and-metadata
 - Uses **OSV.dev** which aggregates from multiple advisory sources
 - Performs **behavioral analysis** (maintainer changes, capability escalation, typosquatting)
 - Can **inspect actual source code** via tarball analysis
@@ -28,7 +28,7 @@ Yes. `npm audit` only checks npm packages against the GitHub Advisory Database. 
 | Behavioral analysis | Yes | Yes | No | No |
 | AST code inspection | Yes | Yes | No | No |
 | Lockfile diffing | Yes | No | No | No |
-| Cross-ecosystem | Yes (9) | JS/Python | Many | Many |
+| Cross-ecosystem | Yes (10) | JS/Python | Many | Many |
 | Cost | Free | Paid | Paid | Free |
 | SARIF output | Yes | Yes | Yes | N/A |
 

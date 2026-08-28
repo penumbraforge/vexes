@@ -3,6 +3,49 @@
 All notable changes to vexes are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-08-28
+
+The honesty audit release. A claims-vs-code audit found three places where
+docs or signal names said more than the code does; all three are fixed here,
+plus the most dangerous reachability gap.
+
+### Fixed
+- **TypeScript reachability** — `.ts/.tsx/.mts/.cts` files were never scanned,
+  so every dependency in a TypeScript project graded `dead` — and
+  `--min-reachability reachable` would have dropped *all* findings. TypeScript
+  is now covered by a light import scan (regex, like Python/Rust; acorn cannot
+  parse TS syntax). `import type` / `export type` correctly create no edge —
+  type-only imports never execute a package.
+- **`CAPABILITY_ESCALATION` no longer fires without a real diff.** Registry
+  metadata does not expose a previous version's install scripts, so the
+  fabricated "previous profile" made every dangerous install-script capability
+  report as CRITICAL "gained between versions" — including packages that had
+  shipped the same script for years. That case is now
+  `INITIAL_DANGEROUS_CAPABILITY` (MODERATE, "present in latest version;
+  previous capabilities unknown"). The CRITICAL escalation signal fires only
+  when a genuine previous-version diff exists.
+- **`guard` refuses `npx` instead of faking it.** npx has no lockfile-only
+  mode, so the "dry-run" was the real execution — the package's scripts ran
+  before any analysis. guard now exits with an error pointing at
+  `vexes inspect <pkg>`.
+
+### Changed
+- Confidence grades added for signals that silently fell through to
+  `inferred`: `NEW_DEPENDENCY`, `NEW_DEP_HAS_INSTALL_SCRIPTS`,
+  `DEPENDENCY_SPIKE`, `MAINTAINER_REDUCTION`, `REPOSITORY_REMOVED`,
+  `INITIAL_DANGEROUS_CAPABILITY`.
+- Docs trued up against code: provenance is described as field
+  cross-referencing (vexes never verifies DSSE signatures — it didn't before
+  either), typosquat/homoglyph coverage limits are stated (curated ~165/105
+  popular-package list, length-dependent thresholds, scoped names out of
+  scope, npm homoglyph check dormant by registry rule), guard's decision
+  matrix now matches the code (blocks on any `KNOWN_COMPROMISED` and on
+  incomplete analysis), ecosystem counts reconciled to 10, and the
+  Allowlists.md worked example no longer contradicts the 0.2x downweight it
+  actually applies.
+- `doctor` no longer warns about a missing `-r` fixture: the fixture file now
+  ships, so the recursive-include path is exercised cleanly.
+
 ## [0.4.0] — 2026-08-22
 
 The live-AI and dynamic-sandbox release. Tier B AI lands against a **local

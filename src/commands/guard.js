@@ -31,13 +31,13 @@ import { buildEnvelope } from '../cli/schema.js';
  * Lockfile-only dry-run flags per package manager. `--package-lock-only` is
  * npm-only; pnpm needs `--lockfile-only`; yarn (berry) updates the lockfile
  * without touching node_modules via `--mode=update-lockfile`. npx has no
- * lockfile mode (its real install is guarded as-is). Never executes scripts.
+ * lockfile mode and is refused in runGuard before reaching this point.
+ * Never executes scripts.
  */
 export function dryRunFlags(manager) {
   switch (manager) {
     case 'pnpm': return ['--lockfile-only', '--ignore-scripts'];
     case 'yarn': return ['--mode=update-lockfile', '--ignore-scripts', '--non-interactive'];
-    case 'npx': return [];
     default: return ['--package-lock-only', '--ignore-scripts'];
   }
 }
@@ -174,6 +174,14 @@ export async function runGuard(flags, args) {
 
   if (manager && !ALLOWED_MANAGERS.has(manager)) {
     log.error(`guard only works with known package managers (${[...ALLOWED_MANAGERS].join(', ')}), got "${manager}"`);
+    return EXIT.ERROR;
+  }
+
+  // npx has no lockfile-only mode and never updates package-lock.json, so the
+  // "dry-run" below would BE the real execution — the package's scripts run
+  // before any analysis happens. Refuse instead of pretending to guard.
+  if (manager === 'npx') {
+    log.error('guard cannot protect "npx": there is no dry-run mode, so the package would execute before it could be analyzed. Use "vexes inspect <package>" to assess it first, then run npx yourself.');
     return EXIT.ERROR;
   }
 

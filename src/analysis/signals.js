@@ -43,6 +43,12 @@ export const SIGNAL_CONFIDENCE = Object.freeze({
   PHANTOM_DEPENDENCY: 'heuristic',
   CIRCULAR_STAGING: 'heuristic',
   CAPABILITY_ESCALATION: 'heuristic',
+  INITIAL_DANGEROUS_CAPABILITY: 'heuristic',
+  NEW_DEPENDENCY: 'deterministic',
+  NEW_DEP_HAS_INSTALL_SCRIPTS: 'deterministic',
+  DEPENDENCY_SPIKE: 'heuristic', // count threshold is a judgment call
+  MAINTAINER_REDUCTION: 'deterministic',
+  REPOSITORY_REMOVED: 'deterministic',
   AST_DANGEROUS_PATTERN: 'heuristic',
   TARBALL_DANGEROUS_PATTERN: 'heuristic',
   SANDBOX_BEHAVIOR: 'heuristic', // observed at runtime under OS isolation — solid, but behavior can be staged/benign-in-context
@@ -364,6 +370,7 @@ function buildPreviousProfile(metadata) {
 
   return {
     capabilities: [], // We can't know previous capabilities without AST of previous version
+    capabilitiesKnown: false, // MUST be false — diffProfiles degrades to INITIAL_DANGEROUS_CAPABILITY
     hasInstallScripts: false, // Conservative: assume previous didn't have install scripts
     dependencyCount: prevDeps.length,
     maintainerCount: metadata.maintainers?.length || 0, // Assume same maintainer count

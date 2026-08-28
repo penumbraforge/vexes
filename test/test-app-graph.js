@@ -108,6 +108,51 @@ describe('app-graph: full graph', () => {
     }
   });
 
+  it('grades TypeScript projects honestly — imports in .ts/.tsx create real edges', () => {
+    const dir = makeProject({
+      'package.json': JSON.stringify({ name: 'ts-app', version: '1.0.0', main: 'src/index.ts' }),
+      'src/index.ts': [
+        "import express from 'express';",
+        "import {",
+        "  spawnSync,",
+        "} from 'child_process';",
+        "import type { Config } from 'config-type-only';",
+        "import('later').then(() => {});",
+        "const fs = require('fs-extra');",
+        "export * from 're-exported';",
+        "export type { T } from 'type-reexport';",
+        "",
+      ].join('\n'),
+      'src/util.ts': "import axios from 'axios';\n",
+      'src/deep/thing.tsx': "const x = await import('tsx-dynamic');\n",
+    });
+    try {
+      const deps = [
+        { name: 'express', version: '4.17.1', ecosystem: 'npm' },
+        { name: 'axios', version: '1.14.1', ecosystem: 'npm' },
+        { name: 'fs-extra', version: '11.0.0', ecosystem: 'npm' },
+        { name: 'later', version: '1.0.0', ecosystem: 'npm' },
+        { name: 're-exported', version: '1.0.0', ecosystem: 'npm' },
+        { name: 'config-type-only', version: '1.0.0', ecosystem: 'npm' },
+        { name: 'type-reexport', version: '1.0.0', ecosystem: 'npm' },
+        { name: 'tsx-dynamic', version: '1.0.0', ecosystem: 'npm' },
+        { name: 'never-mentioned', version: '1.0.0', ecosystem: 'npm' },
+      ];
+      const graph = buildAppGraph(dir, deps);
+      assert.equal(reachabilityOf(graph, 'npm', 'express'), 'reachable', 'TS static import');
+      assert.equal(reachabilityOf(graph, 'npm', 'axios'), 'reachable', 'import in .ts submodule');
+      assert.equal(reachabilityOf(graph, 'npm', 'fs-extra'), 'reachable', 'TS require()');
+      assert.equal(reachabilityOf(graph, 'npm', 're-exported'), 'reachable', 'TS export-from re-export');
+      assert.equal(reachabilityOf(graph, 'npm', 'later'), 'lazy', 'TS dynamic import');
+      assert.equal(reachabilityOf(graph, 'npm', 'tsx-dynamic'), 'lazy', 'TSX dynamic import');
+      assert.equal(reachabilityOf(graph, 'npm', 'config-type-only'), 'dead', 'import type never executes the package');
+      assert.equal(reachabilityOf(graph, 'npm', 'type-reexport'), 'dead', 'export type never executes the package');
+      assert.equal(reachabilityOf(graph, 'npm', 'never-mentioned'), 'dead', 'unreferenced dep in a TS project is not silently reachable');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('ignores dynamics in unimported files while grading reachable imports', () => {
     const dir = makeProject({
       'package.json': JSON.stringify({ name: 'app', version: '1.0.0' }),

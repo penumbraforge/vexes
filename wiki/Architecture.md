@@ -38,7 +38,7 @@ Parses JavaScript source using [acorn](https://github.com/acornjs/acorn) (vendor
 Profiles newly added dependencies by fetching their registry metadata:
 - **Phantom dependencies:** Brand-new packages (< 7 days old) with no ecosystem presence
 - **Circular staging:** New dep published by the same account within 48 hours (the axios RAT pattern)
-- **Typosquatting:** Levenshtein distance comparison against popular package databases
+- **Typosquatting:** Levenshtein distance comparison against a curated popular-package list (~165 npm / ~105 PyPI); thresholds are length-dependent and names ≤3 chars are never compared
 - **Install scripts on new deps:** New dependencies that run code on install
 
 ### Layer 3: Behavioral Fingerprinting (`behavioral.js`)

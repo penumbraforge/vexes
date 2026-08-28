@@ -44,9 +44,11 @@ Enumerate dependencies from lockfiles, query OSV.dev, and report known vulnerabi
 
 ### JSON output schema
 
+`scan --json` emits the versioned envelope (`schemaVersion`, `generator`, `target`, `findings[]`, ...) described in [Agent-Integration](Agent-Integration.md). The fields below are preserved inside it for backward compatibility.
+
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.5.0",
   "timestamp": "2026-03-31T...",
   "command": "scan",
   "complete": true,
@@ -97,6 +99,8 @@ Composite scores account for context:
 - **5+ unique signals**: 2x multiplier
 
 Risk levels: `NONE` (0), `LOW` (> 0), `MODERATE` (>= 5), `HIGH` (>= 15), `CRITICAL` (>= 30)
+
+> **Also shipped, documented in [Agent-Integration](Agent-Integration.md):** `inspect` (single-package assessment), `doctor` (self test), `licenses` (declared-license SBOM), and `explain` (AI-assisted triage, opt-in). `analyze` and `inspect` also accept an experimental `--sandbox` flag.
 
 ---
 

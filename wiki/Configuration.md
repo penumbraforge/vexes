@@ -36,9 +36,9 @@ Same format as project config. Applied before project config, so project setting
 
 ### `ecosystems`
 
-Array of ecosystems to scan. Default: `["npm", "pypi", "cargo", "go", "ruby", "php", "nuget", "java"]`.
+Array of ecosystems to scan. Default: `["npm", "pypi", "cargo", "go", "ruby", "php", "nuget", "java", "hex", "pub"]`.
 
-Valid values: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java`.
+Valid values: `npm`, `pypi`, `cargo`, `go`, `ruby`, `php`, `nuget`, `java`, `hex`, `pub`.
 
 **CLI override:** `--ecosystem npm` (sets a single ecosystem)
 
@@ -83,7 +83,7 @@ The cache uses SQLite (Node.js built-in `node:sqlite`). If the cache becomes cor
 | Option | Default | Description |
 |--------|---------|-------------|
 | `color` | `auto` | `auto` (detect TTY), `always`, `never` |
-| `format` | `text` | `text` or `json` |
+| `format` | `text` | `text`, `json`, or `sarif` |
 
 ## CLI flag reference
 

@@ -9,13 +9,13 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 | Signal | Default Severity | Description |
 |--------|-----------------|-------------|
 | `KNOWN_COMPROMISED` | CRITICAL | Package has known vulnerabilities in the OSV database |
-| `MAINTAINER_CHANGE` | CRITICAL / MODERATE | Publishing account changed between versions. CRITICAL if recent (< 90 days), MODERATE if old. Downweighted for org-managed packages (3+ maintainers). |
+| `MAINTAINER_CHANGE` | CRITICAL / MODERATE / LOW | Publishing account changed between versions. CRITICAL if recent (< 90 days), MODERATE if old. LOW for old transfers in org-managed packages (3+ maintainers). |
 | `POSTINSTALL_SCRIPT` | HIGH / LOW | Has install lifecycle scripts (preinstall, install, postinstall). LOW for known-good packages (esbuild, sharp, etc.). |
 | `RAPID_PUBLISH` | HIGH / LOW | Version published < 10 minutes after previous version. LOW for CI multi-publish (0s interval with 2+ maintainers). |
 | `VERSION_ANOMALY` | MODERATE / HIGH | Major version jumped by 3+ (MODERATE). Package dormant > 1 year then suddenly published (HIGH). |
 | `NO_REPOSITORY` | LOW | No source repository link in package metadata |
 | `MISSING_PROVENANCE` | MODERATE / LOW | No Sigstore provenance attestation. MODERATE if combined with other signals, LOW if standalone. |
-| `TYPOSQUAT` | HIGH | Package name is within Levenshtein distance 1-2 of a popular package |
+| `TYPOSQUAT` | HIGH | Package name is close to a popular package (Levenshtein ≤ 1 for names of 4–6 chars, ≤ 2 for 7+; names ≤ 3 chars are never compared). Checked against a curated list of ~165 npm / ~105 PyPI popular packages; scoped names are not candidates. |
 | `HOMOGLYPH` | CRITICAL | Package name contains invisible Unicode characters (zero-width, BIDI override) or non-ASCII homoglyphs |
 
 ### Layer 1: AST analysis
@@ -66,11 +66,18 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 
 | Signal | Default Severity | Description |
 |--------|-----------------|-------------|
-| `CAPABILITY_ESCALATION` | CRITICAL | Package gained dangerous capabilities between versions (e.g., process_spawn, network, credential_access) |
+| `CAPABILITY_ESCALATION` | CRITICAL | Package gained dangerous capabilities between versions (e.g., process_spawn, network, credential_access). Fires only when the previous version's capabilities are actually known — see `INITIAL_DANGEROUS_CAPABILITY`. |
 | `DEPENDENCY_SPIKE` | HIGH | Dependency count more than doubled and exceeds 5 |
 | `MAINTAINER_REDUCTION` | MODERATE | Number of maintainers decreased between versions |
 | `REPOSITORY_REMOVED` | MODERATE | Repository link was removed from metadata |
-| `INITIAL_DANGEROUS_CAPABILITY` | MODERATE | First version of package has dangerous capabilities |
+| `INITIAL_DANGEROUS_CAPABILITY` | MODERATE | Latest version's install scripts have dangerous capabilities, but the previous version's capabilities are not knowable from registry metadata — so no between-versions diff is claimed. This is the normal Layer 3 signal for established packages. |
+
+### Provenance and sandbox
+
+| Signal | Default Severity | Description |
+|--------|-----------------|-------------|
+| `SIGNATURE_SPOOF` | HIGH | Provenance attestation certifies a different package's artifact (replay) or claims a different source repo than the package declares. vexes decodes and cross-references attested fields; it does **not** verify DSSE signatures, certificates, or transparency-log inclusion proofs. Repo-mismatch may false-positive on legitimate fork publishing. |
+| `SANDBOX_BEHAVIOR` | CRITICAL / HIGH / MODERATE | Observed at runtime when a package is executed under an OS isolation primitive (`analyze --sandbox` / `inspect --sandbox`): writes outside the workdir are CRITICAL; process spawns or network attempts are HIGH; anything else recorded is MODERATE. Experimental — see [Commands Reference](Commands-Reference.md). |
 
 ## Disabling signals
 
