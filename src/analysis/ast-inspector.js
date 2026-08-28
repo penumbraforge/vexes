@@ -360,6 +360,22 @@ function analyzeCall(node, findings, ctx) {
         });
         return;
       }
+
+      // require('https').get(...) — direct call without a binding, the shape
+      // inline install-script payloads actually use
+      if (obj.type === 'CallExpression' && obj.callee?.name === 'require') {
+        const modArg = obj.arguments?.[0]?.value;
+        const modBare = typeof modArg === 'string' ? modArg.replace('node:', '') : null;
+        if (modBare && NETWORK_MODULES.has(modBare)) {
+          findings.push({
+            pattern: 'NETWORK_ACCESS',
+            severity: 'HIGH',
+            description: `require('${modArg}').${methodName}() — makes network connection`,
+            line: node.start,
+          });
+          return;
+        }
+      }
     }
 
     // fs write operations

@@ -84,6 +84,15 @@ describe('AST Inspector — malicious patterns', () => {
     assert.ok(r.findings.some(f => f.pattern === 'NETWORK_ACCESS'));
   });
 
+  it('detects direct require("https").get() without a binding', () => {
+    // The inline shape install-script payloads use — no `const x = require()`
+    // binding for the member-call resolution to follow. Found by the
+    // benchmark's capability-escalation fixture.
+    const r = inspectJS('require("https").get("https://metrics.example.invalid/ping");');
+    assert.ok(r.findings.some(f => f.pattern === 'NETWORK_ACCESS'));
+    assert.ok(r.capabilities.accessesNetwork);
+  });
+
   it('detects fs.writeFile to system path', () => {
     const r = inspectJS('const fs = require("fs"); fs.writeFileSync("/tmp/backdoor", "payload");');
     assert.ok(r.findings.some(f => f.pattern === 'SYSTEM_PATH_WRITE'));
