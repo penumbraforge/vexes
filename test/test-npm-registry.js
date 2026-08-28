@@ -99,3 +99,45 @@ describe('npm metadata version anchoring', () => {
     assert.equal(meta.previousVersion, '1.2.3');
   });
 });
+
+describe('previousInstallScripts extraction', () => {
+  // PREVIOUS-VERSION SCRIPT HISTORY
+  //
+  // previousInstallScripts is deliberately three-valued:
+  //   null  — no previous version exists (or registry unreachable): capabilities
+  //           of the previous version are UNKNOWN, no diff possible
+  //   {}    — previous version exists and verifiably has no lifecycle scripts
+  //   {...} — previous version's lifecycle scripts, inspectable like the current
+  //           ones so behavioral diffing measures both sides the same way
+  it('exposes the previous version lifecycle scripts for the anchor version', () => {
+    const withScripts = {
+      ...packument,
+      versions: {
+        ...packument.versions,
+        '1.2.3': {
+          ...packument.versions['1.2.3'],
+          scripts: { postinstall: 'node-gyp rebuild' },
+        },
+      },
+    };
+    const meta = normalizeMetadata(withScripts, 'pkg', '9.0.0');
+    assert.deepEqual(meta.previousInstallScripts, { postinstall: 'node-gyp rebuild' });
+  });
+
+  it('gives {} when the previous version verifiably has no lifecycle scripts', () => {
+    const meta = normalizeMetadata(packument, 'pkg', '9.0.0');
+    // 1.2.3 exists with scripts: {} — meaningful, diffable absence.
+    assert.deepEqual(meta.previousInstallScripts, {});
+  });
+
+  it('gives null when there is no previous version at all', () => {
+    const only = {
+      'dist-tags': { latest: '1.0.0' },
+      time: { created: '2026-01-01T00:00:00Z', '1.0.0': '2026-01-01T00:00:00Z' },
+      versions: { '1.0.0': { version: '1.0.0', scripts: { postinstall: 'node x.js' } } },
+    };
+    const meta = normalizeMetadata(only, 'pkg', '1.0.0');
+    assert.equal(meta.previousVersion, null);
+    assert.equal(meta.previousInstallScripts, null);
+  });
+});

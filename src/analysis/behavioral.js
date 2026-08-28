@@ -91,7 +91,7 @@ export function diffProfiles(current, previous) {
       findings.push({
         signal: 'CAPABILITY_ESCALATION',
         severity: 'CRITICAL',
-        description: `Package gained "${cap}" capability in latest version (was not present before)`,
+        description: `Package gained "${cap}" capability in latest version (absent from previous version's install scripts)`,
         evidence: {
           capability: cap,
           previousCapabilities: previous.capabilities,

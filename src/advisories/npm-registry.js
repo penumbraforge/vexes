@@ -115,6 +115,19 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
   }
   const hasInstallScripts = Object.keys(installScripts).length > 0;
 
+  // Previous version's lifecycle scripts — lets behavioral analysis run a
+  // REAL capability diff instead of assuming the previous version was clean.
+  // null = previous version unknown (no diff possible); {} = previous version
+  // known to have no lifecycle scripts (a meaningful, diffable fact).
+  let previousInstallScripts = null;
+  if (previousData) {
+    previousInstallScripts = {};
+    const prevScripts = previousData.scripts || {};
+    for (const hook of LIFECYCLE_SCRIPTS) {
+      if (prevScripts[hook]) previousInstallScripts[hook] = prevScripts[hook];
+    }
+  }
+
   // Extract dependencies diff (latest vs previous)
   const latestDeps = Object.keys(latestData.dependencies || {});
   const previousDeps = previousData ? Object.keys(previousData.dependencies || {}) : latestDeps;
@@ -176,6 +189,7 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
     maintainerChanged: latestPublisher !== null && previousPublisher !== null && latestPublisher !== previousPublisher,
     hasInstallScripts,
     installScripts,
+    previousInstallScripts,
     scripts,
     dependencies: latestDeps,
     addedDeps,

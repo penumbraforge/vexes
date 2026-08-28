@@ -288,7 +288,32 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
         : null;
       const currentProfile = buildProfile(metadata, astResult);
       const previousProfile = buildPreviousProfile(metadata);
-      const behaviorFindings = diffProfiles(currentProfile, previousProfile);
+
+      // When the registry exposed the previous version's lifecycle scripts,
+      // build the previous profile from REAL data so the escalation diff is
+      // genuine. Absence of scripts is itself diffable data ({}); only a
+      // null previousInstallScripts leaves capabilities unknown.
+      let effectivePrevious = previousProfile;
+      if (previousProfile && metadata.previousInstallScripts != null) {
+        const prevScripts = metadata.previousInstallScripts;
+        const prevAst = Object.keys(prevScripts).length > 0
+          ? inspectAllScripts(prevScripts, metadata.name)
+          : null;
+        effectivePrevious = buildProfile(
+          { hasInstallScripts: Object.keys(prevScripts).length > 0 },
+          prevAst
+        );
+        effectivePrevious.capabilitiesKnown = true;
+        // Capability data now comes from real previous scripts; the remaining
+        // profile fields stay metadata-derived (from buildPreviousProfile's
+        // estimate) so DEPENDENCY_SPIKE / MAINTAINER_REDUCTION /
+        // REPOSITORY_REMOVED behave exactly as before.
+        effectivePrevious.dependencyCount = previousProfile.dependencyCount;
+        effectivePrevious.maintainerCount = previousProfile.maintainerCount;
+        effectivePrevious.hasRepository = previousProfile.hasRepository;
+      }
+
+      const behaviorFindings = diffProfiles(currentProfile, effectivePrevious);
 
       for (const f of behaviorFindings) {
         signals.push({ ...f, layer: 3 });
