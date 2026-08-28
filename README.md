@@ -84,6 +84,8 @@ The red team test suite contains hand-built, offline fixtures modeled on publish
 
 Passing these tests shows that vexes flags these particular fixtures. It does not show that it would flag the original attacks as they were actually published, or that it would catch a new one. There is also a false-positive suite that checks common benign patterns are not flagged, but neither suite is a substitute for evidence from real-world use, which vexes does not yet have.
 
+On top of the unit-level red team suite, a [detection benchmark](BENCHMARK.md) measures three things end to end and publishes the numbers: flagging of historically compromised packages against their OSV advisories (5/5), detection of re-authored attack techniques (6/6), and the false-positive rate on popular benign packages (0/10 flagged at HIGH+). The benchmark downloads no malware anywhere — the known-bad set works from lockfile text plus OSV, and the rest uses inert fixtures we wrote ourselves. CI re-runs it on every change to `src/`, and a regression on the known-bad set fails the build.
+
 ## Installation
 
 ```bash

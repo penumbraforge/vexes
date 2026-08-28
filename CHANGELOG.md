@@ -3,6 +3,35 @@
 All notable changes to vexes are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Detection benchmark** (`npm run bench`, `BENCHMARK.md`, CI job) — three
+  ground-truth sets, none of which download malware: known-bad flagging of
+  historically compromised packages via their OSV advisories (5/5, gated in
+  CI), re-authored technique fixtures through the full analysis pipeline
+  (6/6), and the benign false-positive rate on popular packages (0/10 at
+  HIGH+). The benchmark caught a real evasion immediately: inline
+  `require('https').get(...)` with no variable binding evaded
+  network-capability detection (fixed).
+
+### Fixed
+- **Direct-require network calls** — `require('https').get(...)` was not
+  flagged as `NETWORK_ACCESS` unless the module was first bound with
+  `const https = require('https')`. The direct form, the one inline
+  install-script payloads actually use, is now detected.
+
+### Changed
+- **`CAPABILITY_ESCALATION` is now a real between-versions diff** — npm
+  exposes per-version lifecycle scripts, so the previous version's scripts
+  are inspected with the same extractor as the current version's. A new
+  install script on a previously script-free package escalates CRITICALLY;
+  without previous-version data the finding honestly degrades to the
+  MODERATE `INITIAL_DANGEROUS_CAPABILITY`.
+- **`--top <n>`** for `scan` and `analyze` text output — first-run output
+  shows the highest-confidence findings instead of everything. JSON output
+  is unchanged.
+
 ## [0.5.0] — 2026-08-28
 
 The honesty audit release. A claims-vs-code audit found three places where

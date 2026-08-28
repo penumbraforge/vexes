@@ -1,0 +1,37 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+  # Weekly freshness check of the OSV ground truth + benign FP rate
+  schedule:
+    - cron: '37 6 * * 1'
+  pull_request:
+    branches: [main]
+    paths: ['src/**', 'benchmark/**']
+  push:
+    branches: [main]
+    paths: ['src/**', 'benchmark/**']
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      # PRs: the gate only (known compromises must be flagged; the full run
+      # also gates on this but takes longer — it inspects ten live packages).
+      - name: Known-bad flagging (gate)
+        if: github.event_name == 'pull_request'
+        run: node benchmark/run.mjs --part a
+
+      # main pushes + scheduled: full run. The run exits nonzero if any
+      # known-bad package goes unflagged; technique detection and the benign
+      # FP rate are published to the job summary as tuning targets.
+      - name: Full benchmark
+        if: github.event_name != 'pull_request'
+        run: node benchmark/run.mjs

