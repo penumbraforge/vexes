@@ -69,6 +69,18 @@ MODERATE/LOW context signals (dormancy, missing provenance, maintainer
 history) still appear in normal output — those are informational and
 expected to fire on real-world packages.
 
+## OSV parity vs osv-scanner
+
+`node benchmark/parity.mjs` (dev-only; requires `osv-scanner` on PATH) runs
+both vexes and Google's osv-scanner against the same lockfile of 11
+packages at vulnerable versions and diffs the advisory sets, matching on
+full identifier sets (GHSA + CVE aliases) since the two tools may surface
+different ids for the same advisory.
+
+Last run **2026-08-28**: 41 advisories found by vexes, 41 by osv-scanner,
+**41 matched, 0 differences in either direction**. vexes' OSV querying
+agrees with the reference implementation.
+
 ## Safety
 
 - **Part A** downloads nothing: a lockfile is text, and vexes matches it
