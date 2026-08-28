@@ -3,9 +3,12 @@
 All notable changes to vexes are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.6.0] — 2026-08-28
 
 ### Added
+- **SECURITY.md with an explicit threat model** — what vexes protects
+  against, what it does not (no runtime protection, static analysis is
+  defeatable, advisory lag), and how to report misses.
 - **Detection benchmark** (`npm run bench`, `BENCHMARK.md`, CI job) — three
   ground-truth sets, none of which download malware: known-bad flagging of
   historically compromised packages via their OSV advisories (5/5, gated in
