@@ -123,6 +123,7 @@ function printHelp() {
                           bar: reachable, lazy, dead ${C.dim}(default: dead = all)${C.reset}
     --ai                 Tier B: LLM exploitability verdict per finding
                           ${C.dim}(advisory; uses local provider, see --explain; never filters)${C.reset}
+    --top <n>            Show only the first n findings in text output
     --cached             Use cached results without freshness check
     --json               Output JSON to stdout
     --format <fmt>       Output format: text, json, sarif ${C.dim}(default: text)${C.reset}
@@ -139,6 +140,7 @@ function printHelp() {
                           evidence ${C.dim}(spawns, network, writes)${C.reset}
     --explain <package>  Detailed breakdown for a specific package
     --strict             Fail on any signal (for CI)
+    --top <n>            Show only the n highest-risk packages
     --verbose, -v        Show all signals including LOW
     --json               Output JSON to stdout
     --no-color           Disable ANSI colors

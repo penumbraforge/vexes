@@ -460,10 +460,19 @@ export async function runScan(flags, args) {
         (groups[v.severity] ??= []).push(v);
       }
 
+      // --top <n> limits TEXT output only; JSON keeps every finding. Exit
+      // codes and summary counts still reflect the full result set.
+      const topN = Number.isFinite(parseInt(config.top, 10)) ? parseInt(config.top, 10) : null;
+      let shownCount = 0;
+
       for (const sev of ['CRITICAL', 'HIGH', 'MODERATE', 'LOW']) {
         if (!groups[sev]?.length) continue;
+        if (topN != null && shownCount >= topN) break;
         out(header(sev));
         for (const v of groups[sev]) {
+          if (topN != null && shownCount >= topN) break;
+          shownCount++;
+          out(formatVuln(v));
           out(formatVuln(v));
           const reach = reachabilityOf(appGraph, v.ecosystem, v.package);
           if (reach === 'dead') {
@@ -489,6 +498,10 @@ export async function runScan(flags, args) {
           }
           out('');
         }
+      }
+
+      if (topN != null && filtered.length > shownCount) {
+        out(`  ${C.dim}… ${filtered.length - shownCount} more finding(s) not shown (--top ${topN}); JSON output has everything${C.reset}`);
       }
 
       // Show fix commands if --fix was used

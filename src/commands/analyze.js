@@ -454,19 +454,36 @@ export async function runAnalyze(flags, args) {
           out(`\n  ${C.yellow}! No risk signals detected, but analysis was incomplete${C.reset}\n`);
         }
       } else {
+        // MISSING_PROVENANCE is true of nearly everything published before
+        // Sigstore provenance existed (~2023). It still counts toward risk,
+        // but displaying it per-package floods the first run \u2014 so collapse
+        // it into a footer line unless verbose. JSON output is unchanged.
+        const CONF_ORDER = { proven: 3, deterministic: 2, heuristic: 1, inferred: 0 };
+        const bestConfidence = (r) => Math.max(...r.signals.map(s => CONF_ORDER[s.confidence] ?? 0), 0);
+        const hasProvenanceOnly = (r) => r.signals.every(s => s.signal === 'MISSING_PROVENANCE');
+
+        const displayResults = verbose ? flaggedResults : flaggedResults.filter(r => !hasProvenanceOnly(r));
+        const provenanceOnlyCount = flaggedResults.length - displayResults.length;
+        const topN = Number.isFinite(parseInt(flags.top, 10)) ? parseInt(flags.top, 10) : null;
+        const shownResults = topN != null ? displayResults.slice(0, topN) : displayResults;
+
         out(header('Risk Assessment'));
-        out(`  ${C.dim}${'Package'.padEnd(35)} Risk   Signals${C.reset}`);
+        out(`  ${C.dim}${'Package'.padEnd(35)} Risk   Signals   ${C.reset}${C.dim}(* = hard evidence, ~ = heuristic only)${C.reset}`);
         out(`  ${C.dim}${'\u2500'.repeat(70)}${C.reset}`);
 
-        for (const r of flaggedResults) {
+        for (const r of shownResults) {
           const rColor = r.riskLevel === 'CRITICAL' ? C.red :
                          r.riskLevel === 'HIGH' ? C.yellow :
                          r.riskLevel === 'MODERATE' ? C.cyan : C.dim;
           const bar = riskBar(r.riskScore);
-          const sigNames = [...new Set(r.signals.map(s => s.signal))].join(', ');
+          const displaySignals = verbose ? r.signals : r.signals.filter(s => s.signal !== 'MISSING_PROVENANCE');
+          const sigNames = [...new Set(displaySignals.map(s => s.signal))].join(', ') || '\u2014';
           const nameVer = `${sanitize(r.name)} ${C.dim}${sanitize(r.version)}${C.reset}`;
+          // Evidentiary marker: * when any signal rests on hard evidence
+          // (OSV match, registry metadata fact); ~ when the row is heuristic-only.
+          const confGlyph = bestConfidence(r) >= 2 ? `${C.cyan}*${C.reset}` : `${C.dim}~${C.reset}`;
 
-          out(`  ${rColor}${nameVer.padEnd(45)}${C.reset} ${bar}  ${C.dim}${sanitize(sigNames)}${C.reset}`);
+          out(`  ${rColor}${nameVer.padEnd(45)}${C.reset} ${bar}  ${confGlyph} ${C.dim}${sanitize(sigNames)}${C.reset}`);
 
           // Show signal details if verbose
           if (verbose) {
@@ -477,6 +494,15 @@ export async function runAnalyze(flags, args) {
             }
             out('');
           }
+        }
+
+        const hidden = (topN != null ? displayResults.length - shownResults.length : 0);
+        if (hidden > 0) {
+          out(`  ${C.dim}\u2026 and ${hidden} more (raise --top or use -v to see everything)${C.reset}`);
+        }
+        if (provenanceOnlyCount > 0) {
+          out(`  ${C.dim}${provenanceOnlyCount} package(s) flagged only for missing provenance attestation${C.reset}`);
+          out(`  ${C.dim}(common for releases before ~2023 \u2014 still counted in risk; -v shows them)${C.reset}`);
         }
       }
 
