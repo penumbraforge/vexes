@@ -55,10 +55,41 @@ describe('AdvisoryCache', () => {
   });
 
   it('stores and retrieves signals', () => {
-    const signals = { signals: [], riskScore: 0 };
+    const signals = {
+      name: 'test', version: '1.0.0', ecosystem: 'npm',
+      signals: [], riskScore: 0, riskLevel: 'NONE', warnings: [],
+      osvFingerprint: '', analysisFingerprint: 'sha256-test',
+    };
     cache.setSignals('npm', 'test', '1.0.0', signals);
     const result = cache.getSignals('npm', 'test', '1.0.0');
     assert.deepEqual(result, signals);
+  });
+
+  it('rejects malformed advisory and signal rows instead of treating them as clean', () => {
+    assert.throws(() => cache.setAdvisories('npm', 'bad', '1.0.0', {}), /must be arrays/);
+    assert.throws(() => cache.setAdvisories('npm', 'bad', '1.0.0', [{}]), /string ids/);
+    assert.throws(
+      () => cache.setSignals('npm', 'bad', '1.0.0', { signals: [], riskScore: 0, riskLevel: 'NONE' }),
+      /schema validation/,
+    );
+  });
+
+  it('treats invalid TTL values as cache misses', () => {
+    cache.setAdvisories('npm', 'ttl', '1.0.0', []);
+    for (const ttl of [NaN, Infinity, -1, 'forever']) {
+      assert.equal(cache.getAdvisories('npm', 'ttl', '1.0.0', ttl), null);
+    }
+  });
+
+  it('persists the latest registry version observed for freshness monitoring', () => {
+    cache.setFreshnessState('npm', 'express', '5.0.0', 1000);
+    assert.deepEqual(cache.getFreshnessState('npm', 'express'), {
+      latestVersion: '5.0.0', firstSeenAt: 1000, lastSeenAt: 1000,
+    });
+    cache.setFreshnessState('npm', 'express', '5.0.1', 2000);
+    assert.deepEqual(cache.getFreshnessState('npm', 'express'), {
+      latestVersion: '5.0.1', firstSeenAt: 1000, lastSeenAt: 2000,
+    });
   });
 
   it('returns stats', () => {
@@ -93,12 +124,14 @@ describe('NoOpCache', () => {
     assert.equal(cache.getAdvisoriesAny('npm', 'x', '1.0'), null);
     assert.equal(cache.getMetadata('npm', 'x'), null);
     assert.equal(cache.getSignals('npm', 'x', '1.0'), null);
+    assert.equal(cache.getFreshnessState('npm', 'x'), null);
   });
 
   it('setters do not throw', () => {
     assert.doesNotThrow(() => cache.setAdvisories('npm', 'x', '1.0', []));
     assert.doesNotThrow(() => cache.setMetadata('npm', 'x', {}));
     assert.doesNotThrow(() => cache.setSignals('npm', 'x', '1.0', {}));
+    assert.doesNotThrow(() => cache.setFreshnessState('npm', 'x', '2.0.0'));
   });
 
   it('stats returns zeros', () => {

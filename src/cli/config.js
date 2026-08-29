@@ -7,6 +7,7 @@ import { log } from '../core/logger.js';
 const VALID_ECOSYSTEMS = new Set(Object.keys(ECOSYSTEMS));
 const VALID_SEVERITIES = new Set(['critical', 'high', 'moderate', 'low']);
 const VALID_FORMATS = new Set(['text', 'json', 'sarif']);
+const VALID_COLORS = new Set(['auto', 'always', 'never']);
 
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -83,19 +84,65 @@ function merge(target, source) {
   return result;
 }
 
+// Repository config is policy input from the code being inspected. It may
+// tune finding presentation, but it must never opt into execution, stale-cache
+// trust, network-heavy modes, writes, or choose the cache database itself.
+function projectPolicy(raw) {
+  const allowed = {};
+  for (const key of ['ecosystems', 'severity', 'ignore', 'strict', 'verbose', 'top', 'minReachability']) {
+    if (raw[key] !== undefined) allowed[key] = raw[key];
+  }
+  if (raw.analyze?.signals && typeof raw.analyze.signals === 'object' && !Array.isArray(raw.analyze.signals)) {
+    allowed.analyze = { signals: raw.analyze.signals };
+  }
+  if (raw.output && typeof raw.output === 'object' && !Array.isArray(raw.output)) {
+    allowed.output = {};
+    for (const key of ['color', 'format']) {
+      if (raw.output[key] !== undefined) allowed.output[key] = raw.output[key];
+    }
+  }
+  return allowed;
+}
+
+export function validateCacheTtl(value, label) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${label} must be a finite non-negative number`);
+  }
+  return value;
+}
+
 /**
  * Load config: defaults < user config < project config < CLI flags
  */
 export function loadConfig(dir, flags = {}) {
-  const userConf = loadUserConfig();
-  const projConf = findProjectConfig(dir);
+  const userConf = flags['user-config'] === false ? {} : loadUserConfig();
+  const projConf = flags['project-config'] === false ? {} : findProjectConfig(dir);
 
   // Deep-clone DEFAULTS so nested objects (output, cache) are never aliased to
   // the shared template. Without this, flag writes like `config.output.format`
   // and the cache-dir `~` expansion below would mutate DEFAULTS in place and
   // leak across every subsequent loadConfig() call in the same process.
   let config = merge(structuredClone(DEFAULTS), userConf);
-  config = merge(config, projConf);
+  config = merge(config, projectPolicy(projConf));
+
+  // These modes always require an explicit CLI flag for this invocation.
+  // Even user config cannot silently execute package code or request writes.
+  for (const key of ['sandbox', 'sandboxHost', 'deep', 'fix', 'ai', 'useCache', 'cached']) {
+    delete config[key];
+  }
+
+  // Validate nested objects before applying CLI flags. A malformed trusted
+  // user config must fail with a useful message instead of causing a later
+  // property access to throw (or, worse, silently selecting an output/cache
+  // behavior different from the one the user thought they configured).
+  for (const key of ['analyze', 'cache', 'output']) {
+    if (!config[key] || typeof config[key] !== 'object' || Array.isArray(config[key])) {
+      throw new Error(`${key} must be an object`);
+    }
+  }
+  if (!config.analyze.signals || typeof config.analyze.signals !== 'object' || Array.isArray(config.analyze.signals)) {
+    throw new Error('analyze.signals must be an object');
+  }
 
   // CLI flag overrides with validation
   if (flags.ecosystem) {
@@ -139,11 +186,11 @@ export function loadConfig(dir, flags = {}) {
   if (flags.verbose) config.verbose = true;
   if (flags.strict) config.strict = true;
   if (flags.deep) config.deep = true;
-  if (flags.sandbox) config.sandbox = true;
+  if (flags.sandbox === true) config.sandbox = true;
   // sandboxHost is a test-only injection (host: null forces refusal). Passed
   // through flags directly, documented nowhere — the CLI sandbox host is always
   // auto-detected so a config file can't silently disable isolation.
-  if (flags.sandboxHost !== undefined) config.sandboxHost = flags.sandboxHost;
+  if (flags.sandbox === true && flags.sandboxHost !== undefined) config.sandboxHost = flags.sandboxHost;
   if (flags.fix) config.fix = true;
   if (flags.explain) config.explain = flags.explain;
   // --top <n>: limit how many findings TEXT output displays. JSON/SARIF always
@@ -179,6 +226,8 @@ export function loadConfig(dir, flags = {}) {
   // Max 7 days for advisories, max 30 days for metadata.
   const MAX_ADVISORY_TTL = 7 * 24 * 60 * 60 * 1000;   // 7 days
   const MAX_METADATA_TTL = 30 * 24 * 60 * 60 * 1000;   // 30 days
+  validateCacheTtl(config.cache?.advisoryTtlMs, 'cache.advisoryTtlMs');
+  validateCacheTtl(config.cache?.metadataTtlMs, 'cache.metadataTtlMs');
   if (config.cache?.advisoryTtlMs > MAX_ADVISORY_TTL) {
     log.warn(`advisory cache TTL clamped to 7 days (was ${Math.round(config.cache.advisoryTtlMs / 86400000)}d)`);
     config = { ...config, cache: { ...config.cache, advisoryTtlMs: MAX_ADVISORY_TTL } };
@@ -188,16 +237,50 @@ export function loadConfig(dir, flags = {}) {
     config = { ...config, cache: { ...config.cache, metadataTtlMs: MAX_METADATA_TTL } };
   }
 
-  // Validate all ecosystem names (catches invalid values from config files too)
-  if (Array.isArray(config.ecosystems)) {
-    const invalid = config.ecosystems.filter(e => !VALID_ECOSYSTEMS.has(e));
-    if (invalid.length > 0) {
-      log.warn(`ignoring unknown ecosystem(s) from config: ${invalid.join(', ')}`);
-      config = { ...config, ecosystems: config.ecosystems.filter(e => VALID_ECOSYSTEMS.has(e)) };
-      if (config.ecosystems.length === 0) {
-        throw new Error(`no valid ecosystems configured — valid options: ${[...VALID_ECOSYSTEMS].join(', ')}`);
-      }
+  // Validate the collection shape before commands iterate it. A string is
+  // iterable character-by-character and previously produced a false-clean
+  // zero-dependency scan instead of a configuration error.
+  if (!Array.isArray(config.ecosystems)) {
+    throw new Error(`ecosystems must be an array — valid options: ${[...VALID_ECOSYSTEMS].join(', ')}`);
+  }
+  const invalid = config.ecosystems.filter(e => typeof e !== 'string' || !VALID_ECOSYSTEMS.has(e));
+  if (invalid.length > 0) {
+    log.warn(`ignoring unknown ecosystem(s) from config: ${invalid.join(', ')}`);
+    config = { ...config, ecosystems: config.ecosystems.filter(e => VALID_ECOSYSTEMS.has(e)) };
+    if (config.ecosystems.length === 0) {
+      throw new Error(`no valid ecosystems configured — valid options: ${[...VALID_ECOSYSTEMS].join(', ')}`);
     }
+  }
+
+  // Repository policy is untrusted input and user config can be malformed.
+  // Reject ambiguous shapes/values instead of letting strings iterate as
+  // collections or unknown thresholds accidentally produce zero findings.
+  if (typeof config.severity !== 'string' || !VALID_SEVERITIES.has(config.severity.toLowerCase())) {
+    throw new Error(`severity must be one of: ${[...VALID_SEVERITIES].join(', ')}`);
+  }
+  config.severity = config.severity.toLowerCase();
+
+  if (!Array.isArray(config.ignore) || config.ignore.some(v => typeof v !== 'string')) {
+    throw new Error('ignore must be an array of strings');
+  }
+
+  if (typeof config.output.format !== 'string' || !VALID_FORMATS.has(config.output.format.toLowerCase())) {
+    throw new Error(`output.format must be one of: ${[...VALID_FORMATS].join(', ')}`);
+  }
+  config.output.format = config.output.format.toLowerCase();
+  if (typeof config.output.color !== 'string' || !VALID_COLORS.has(config.output.color.toLowerCase())) {
+    throw new Error(`output.color must be one of: ${[...VALID_COLORS].join(', ')}`);
+  }
+  config.output.color = config.output.color.toLowerCase();
+
+  for (const [signal, value] of Object.entries(config.analyze.signals)) {
+    if (value !== 'off') {
+      throw new Error(`analyze.signals.${signal} must be "off" when present`);
+    }
+  }
+
+  if (typeof config.cache.dir !== 'string' || config.cache.dir.trim() === '') {
+    throw new Error('cache.dir must be a non-empty string');
   }
 
   // Not frozen: isolation now comes from the structuredClone above, not from

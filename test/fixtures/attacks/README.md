@@ -1,25 +1,20 @@
-# Attack Simulations
+# Offline technique fixtures
 
-These fixtures reconstruct real-world supply chain attacks as test data.
-No actual malicious code is executed — these are JSON metadata and JS source
-strings fed directly into the analysis pipeline.
+These files are repository-authored metadata and source strings used to exercise
+selected analysis signals. They are not malware, copies of malware, or faithful
+reconstructions of named incidents, and no package code is executed.
 
-## Attacks Simulated
+The fixtures cover combinations such as:
 
-1. **axios-rat** — March 2026: Maintainer account hijacked, malicious version
-   published with hidden dependency `plain-crypto-js` that deploys RAT
+1. publishing-account changes and newly added dependencies;
+2. rapid publishing plus install-hook, environment, network, and process access;
+3. dormancy followed by new dependency metadata;
+4. base64 decoding plus dynamic code construction;
+5. cross-platform process/network/credential-shaped source patterns;
+6. typosquat-like spellings from the curated comparison lists;
+7. Python process, network, encoding, filesystem, and system-path patterns; and
+8. selected obfuscation and dynamic-loading syntax.
 
-2. **shai-hulud** — September 2025: Self-replicating worm injected into chalk,
-   debug, ansi-styles via phished maintainer credentials
-
-3. **event-stream** — November 2018: New maintainer added `flatmap-stream`
-   dependency containing encoded payload targeting bitcoin wallets
-
-4. **ua-parser-js** — October 2021: Maintainer hijacked, cryptominer and
-   password stealer injected into postinstall
-
-5. **colors-faker** — January 2022: Original maintainer deliberately broke
-   packages, infinite loop in colors, all data deleted from faker
-
-6. **typosquat-generic** — Common attack: package with name similar to
-   popular package, brand new, single maintainer, contains payload
+Passing these fixtures means the asserted signals fire on these exact inputs.
+It does not measure live-attack recall, general false-positive rate, or whether
+vexes would have detected any historical incident before public disclosure.

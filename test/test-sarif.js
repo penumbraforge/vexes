@@ -89,6 +89,16 @@ describe('toSarif', () => {
     assert.equal(crit.partialFingerprints['vexes/packageVulnerability/v1'], 'npm:lodash:GHSA-crit');
   });
 
+  it('emits canonical direct-import evidence without using it to suppress findings', () => {
+    const one = toSarif({
+      ...scanResult,
+      vulnerabilities: [{ ...scanResult.vulnerabilities[0], reachability: 'dead', importEvidence: 'not_found' }],
+    });
+    assert.equal(one.runs[0].results.length, 1);
+    assert.equal(one.runs[0].results[0].properties.importEvidence, 'not_found');
+    assert.equal(one.runs[0].results[0].properties.reachability, 'dead');
+  });
+
   it('reports warnings as invocation notifications and reflects completeness', () => {
     const inv = doc.runs[0].invocations[0];
     assert.equal(inv.executionSuccessful, true);

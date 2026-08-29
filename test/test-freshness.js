@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { assessNewVersion, checkOneDep } from '../src/analysis/freshness.js';
+import { assessNewVersion, checkOneDep, checkFreshness } from '../src/analysis/freshness.js';
 
 /**
  * FRESHNESS LAYER (new-release detection)
@@ -23,6 +23,7 @@ function meta(overrides = {}) {
     previousPublisher: 'alice',
     hasInstallScripts: false,
     installScripts: {},
+    previousInstallScripts: {},
     addedDeps: [],
     removedDeps: [],
     publishIntervalMs: 30 * DAY,
@@ -64,7 +65,7 @@ describe('freshness: assessNewVersion', () => {
   });
 
   it('flags a dormant-but-active release', () => {
-    const r = assessNewVersion(meta({ dormancyMs: 200 * DAY }));
+    const r = assessNewVersion(meta({ publishIntervalMs: 200 * DAY }));
     assert.equal(r.alert, true);
     assert.ok(r.reasons.some(x => /reactivated after 200 days/.test(x)));
   });
@@ -93,7 +94,10 @@ describe('freshness: checkOneDep', () => {
       latestAvailable: '2.0.0', latestVersion: '2.0.0',
       maintainerChanged: true, previousPublisher: 'alice', latestPublisher: 'mallory',
     });
-    const r = await checkOneDep({ name: 'pkg', version: '1.5.0', ecosystem: 'npm' }, { fetchMeta });
+    const r = await checkOneDep(
+      { name: 'pkg', version: '1.5.0', ecosystem: 'npm' },
+      { fetchMeta, lastSeenVersion: '1.5.0' },
+    );
     assert.equal(r.isNew, true);
     assert.equal(r.latest, '2.0.0');
     assert.equal(r.alert, true);
@@ -105,5 +109,51 @@ describe('freshness: checkOneDep', () => {
     const r = await checkOneDep({ name: 'pkg', version: '1.0.0', ecosystem: 'npm' }, { fetchMeta });
     assert.equal(r.skipped, true);
     assert.equal(r.alert, false);
+  });
+
+  it('establishes a baseline instead of calling an existing update newly published', async () => {
+    const fetchMeta = async () => meta({ latestAvailable: '2.0.0', latestVersion: '2.0.0', maintainerChanged: true });
+    const r = await checkOneDep({ name: 'pkg', version: '1.0.0', ecosystem: 'npm' }, { fetchMeta });
+    assert.equal(r.baseline, true);
+    assert.equal(r.updateAvailable, true);
+    assert.equal(r.isNew, false);
+    assert.equal(r.alert, false);
+  });
+
+  it('refuses unsupported ecosystems instead of querying them as npm', async () => {
+    let fetched = false;
+    const r = await checkOneDep(
+      { name: 'serde', version: '1.0.0', ecosystem: 'cargo' },
+      { fetchMeta: async () => { fetched = true; return meta(); } },
+    );
+    assert.equal(fetched, false);
+    assert.equal(r.skipped, true);
+    assert.match(r.warning, /does not support ecosystem cargo/);
+  });
+});
+
+describe('freshness: persisted release events', () => {
+  it('alerts once per newly observed latest version and reports lookup completeness', async () => {
+    const states = new Map();
+    const cache = {
+      getFreshnessState(eco, name) { const latestVersion = states.get(`${eco}:${name}`); return latestVersion ? { latestVersion } : null; },
+      setFreshnessState(eco, name, version) { states.set(`${eco}:${name}`, version); },
+    };
+    let latest = '2.0.0';
+    const fetchMeta = async () => meta({
+      latestAvailable: latest, latestVersion: latest,
+      maintainerChanged: true, previousPublisher: 'alice', latestPublisher: 'mallory',
+    });
+    const deps = [{ name: 'pkg', version: '1.0.0', ecosystem: 'npm' }];
+
+    const baseline = await checkFreshness(deps, { fetchMeta, cache });
+    assert.equal(baseline.complete, true);
+    assert.equal(baseline.alerts.length, 0);
+
+    latest = '2.0.1';
+    const changed = await checkFreshness(deps, { fetchMeta, cache });
+    assert.equal(changed.alerts.length, 1);
+    const repeated = await checkFreshness(deps, { fetchMeta, cache });
+    assert.equal(repeated.alerts.length, 0);
   });
 });

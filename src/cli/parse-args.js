@@ -24,6 +24,10 @@ export function parseArgs(argv) {
     if (COMMANDS.has(cmd)) {
       result.command = cmd;
       i = 1;
+    } else {
+      result.command = 'unknown';
+      result.args.push(argv[0]);
+      i = 1;
     }
   }
 

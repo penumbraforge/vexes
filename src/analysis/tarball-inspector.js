@@ -1,18 +1,17 @@
 import { createGunzip } from 'node:zlib';
-import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { log } from '../core/logger.js';
 import { inspectJS, inspectPython } from './ast-inspector.js';
-import { FETCH_TIMEOUT_MS, USER_AGENT } from '../core/constants.js';
+import { FETCH_TIMEOUT_MS, USER_AGENT, PYPI_JSON_URL } from '../core/constants.js';
+import { fetchJSON } from '../core/fetcher.js';
 
 /**
- * Tarball AST inspector — downloads an npm package tarball and inspects
- * the actual source code, not just install script strings.
- *
- * This catches malware that lives in the package's .js files, not in the
- * package.json scripts field. The axios RAT payload was in plain-crypto-js's
- * actual code, not in a postinstall string.
+ * Tarball source-pattern inspector — downloads an npm/PyPI archive and
+ * examines a bounded set of selected entry/install-like files. This adds
+ * evidence beyond inline package-manager script strings; it is not exhaustive
+ * package review or malware detection.
  *
  * Uses native Node.js tar parsing (no tar dependency) — reads the raw
  * POSIX tar format from the gunzipped stream.
@@ -44,16 +43,56 @@ const INSPECTABLE_PATTERNS = [...JS_INSPECTABLE, ...PY_INSPECTABLE];
 const MAX_INSPECT_SIZE = 512 * 1024; // 512KB
 // Max total files to inspect per package
 const MAX_FILES = 10;
+const MAX_ARCHIVE_FILES = 5000;
+const MAX_EXTRACT_FILE_SIZE = 10 * 1024 * 1024;
 // Max tarball download size (compressed)
 const MAX_TARBALL_SIZE = 5 * 1024 * 1024; // 5MB
-// Max decompressed size — prevents gzip bombs (a 46-byte gzip can decompress to 4.5PB)
+// Max accepted decompressed size — bounds expansion and memory use.
 const MAX_DECOMPRESSED_SIZE = 50 * 1024 * 1024; // 50MB
 
-// Allowed tarball host domains — prevents SSRF via manipulated registry responses
+// Allowed tarball host domains — constrains SSRF exposure from registry responses.
 const ALLOWED_TARBALL_HOSTS = new Set([
   'registry.npmjs.org',
   'files.pythonhosted.org',
 ]);
+
+/**
+ * Collect JavaScript runtime entrypoints from npm package metadata.
+ * Conditional export maps often include `types` declarations alongside the
+ * executable entry. Feeding `.d.ts` into Acorn creates a loud parse failure
+ * that says nothing about runtime behavior, so type-only conditions and
+ * TypeScript declaration/source paths are excluded from the JS sample.
+ */
+export function collectInspectableEntrypoints(pkgData = {}) {
+  const entries = [];
+  const add = (value) => {
+    if (typeof value !== 'string') return;
+    const pathOnly = value.split(/[?#]/, 1)[0];
+    if (/\.(?:d\.)?(?:ts|tsx|mts|cts)$/i.test(pathOnly)) return;
+    entries.push(value);
+  };
+
+  add(pkgData.main);
+  if (typeof pkgData.bin === 'string') {
+    add(pkgData.bin);
+  } else if (pkgData.bin && typeof pkgData.bin === 'object') {
+    for (const value of Object.values(pkgData.bin)) add(value);
+  }
+
+  const visitExports = (value) => {
+    if (typeof value === 'string') {
+      add(value);
+      return;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    for (const [condition, target] of Object.entries(value)) {
+      if (condition === 'types' || condition === 'typings') continue;
+      visitExports(target);
+    }
+  };
+  visitExports(pkgData.exports);
+  return [...new Set(entries)];
+}
 
 /**
  * Download and inspect an npm package tarball for dangerous code patterns.
@@ -62,17 +101,43 @@ const ALLOWED_TARBALL_HOSTS = new Set([
  * @param {string} packageName — for logging
  * @returns {Promise<TarballInspectionResult>}
  */
-export async function inspectTarball(tarballUrl, packageName) {
+export async function inspectTarball(tarballUrl, packageName, artifact = {}) {
   const findings = [];
   const inspectedFiles = [];
   const warnings = [];
+  let eligibleFiles = 0;
+  let archiveFiles = 0;
+  let oversizeFiles = 0;
+  let digestVerified = false;
 
   try {
-    const files = await downloadAndExtractJS(tarballUrl, packageName);
+    const selection = await downloadAndExtractJS(tarballUrl, packageName, artifact);
+    const files = selection.files;
+    eligibleFiles = selection.eligibleFiles;
+    archiveFiles = selection.archiveFiles;
+    oversizeFiles = selection.oversizeFiles;
+    digestVerified = selection.digestVerified;
+    if (!digestVerified) {
+      warnings.push('registry artifact digest was unavailable; downloaded bytes were not digest-verified');
+    }
+    warnings.push(
+      `bounded source sampling inspected ${files.length} of ${selection.eligibleFiles} selected entry/install files ` +
+      `from ${selection.archiveFiles} archive files` +
+      `${selection.oversizeFiles ? `; ${selection.oversizeFiles} candidate file(s) exceeded ${MAX_INSPECT_SIZE} bytes` : ''}; ` +
+      `this is not full-package coverage`,
+    );
 
     if (files.length === 0) {
       log.debug(`no inspectable JS files found in tarball for ${packageName}`);
-      return { findings, inspectedFiles, capabilities: {}, warnings };
+      return {
+        findings, inspectedFiles, capabilities: {}, warnings,
+        coverage: {
+          mode: 'bounded-source-sampling', packageComplete: false, inspectedFiles: 0,
+          eligibleFiles: selection.eligibleFiles, archiveFiles: selection.archiveFiles,
+          oversizeFiles: selection.oversizeFiles,
+          digestVerified,
+        },
+      };
     }
 
     log.debug(`inspecting ${files.length} files from ${packageName} tarball`);
@@ -118,11 +183,22 @@ export async function inspectTarball(tarballUrl, packageName) {
     possibleObfuscation: allPatterns.has('POSSIBLE_OBFUSCATION'),
   };
 
-  return { findings, inspectedFiles, capabilities, warnings };
+  return {
+    findings, inspectedFiles, capabilities, warnings,
+    coverage: {
+      mode: 'bounded-source-sampling',
+      packageComplete: false,
+      inspectedFiles: inspectedFiles.length,
+      eligibleFiles,
+      archiveFiles,
+      oversizeFiles,
+      digestVerified,
+    },
+  };
 }
 
 /**
- * Validate a tarball URL to prevent SSRF attacks.
+ * Validate a tarball URL as one SSRF mitigation.
  * Only allows HTTPS URLs from known registry hosts.
  */
 function validateTarballUrl(tarballUrl) {
@@ -145,51 +221,63 @@ function validateTarballUrl(tarballUrl) {
 /**
  * Download + decompress a tarball in one bounded step (shared by the memory
  * AST path and the disk extraction path). Enforces the same URL allowlist
- * (SSRF), Content-Length cap, streamed size cap, and gzip-bomb guard.
+ * host/protocol restriction, Content-Length cap, streamed size cap, and expansion bound.
  */
-async function fetchDecompressed(tarballUrl, packageName) {
-  // SSRF prevention: only fetch from known registry hosts over HTTPS
-  validateTarballUrl(tarballUrl);
-
+async function fetchDecompressed(tarballUrl, packageName, artifact = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  let res;
   try {
-    res = await fetch(tarballUrl, {
-      headers: { 'User-Agent': USER_AGENT },
-      signal: controller.signal,
-    });
+    // Follow redirects manually so every hop remains HTTPS and on an allowed
+    // registry host. Native fetch's default redirect mode would validate only
+    // the attacker-controlled initial URL, then happily follow Location to an
+    // internal address.
+    let currentUrl = tarballUrl;
+    let res;
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      validateTarballUrl(currentUrl);
+      res = await fetch(currentUrl, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: controller.signal,
+        redirect: 'manual',
+      });
+      if (![301, 302, 303, 307, 308].includes(res.status)) break;
+      const location = res.headers.get('location');
+      if (!location) throw new Error(`tarball redirect omitted Location for ${packageName}`);
+      if (redirects === 5) throw new Error(`too many tarball redirects for ${packageName}`);
+      currentUrl = new URL(location, currentUrl).toString();
+    }
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} fetching tarball for ${packageName}`);
+    }
+
+    // Pre-check Content-Length if available
+    const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
+    if (contentLength > MAX_TARBALL_SIZE) {
+      throw new Error(`tarball too large (${contentLength} bytes) for ${packageName}`);
+    }
+
+    // Keep the same abort signal active through body consumption. A response
+    // that sends headers and then stalls must not evade the timeout.
+    const chunks = [];
+    let totalBytes = 0;
+    for await (const chunk of res.body) {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_TARBALL_SIZE) {
+        controller.abort();
+        throw new Error(`tarball download exceeded ${MAX_TARBALL_SIZE} bytes for ${packageName} — aborted`);
+      }
+      chunks.push(chunk);
+    }
+    const compressed = Buffer.concat(chunks);
+    if (artifact.integrity || artifact.shasum) {
+      verifyArtifactDigest(compressed, artifact, packageName);
+    }
+    return gunzip(compressed);
   } finally {
     clearTimeout(timer);
   }
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} fetching tarball for ${packageName}`);
-  }
-
-  // Pre-check Content-Length if available
-  const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
-  if (contentLength > MAX_TARBALL_SIZE) {
-    throw new Error(`tarball too large (${contentLength} bytes) for ${packageName}`);
-  }
-
-  // Stream the response body with incremental size enforcement.
-  // This prevents memory exhaustion when Content-Length is missing or lies.
-  const chunks = [];
-  let totalBytes = 0;
-  for await (const chunk of res.body) {
-    totalBytes += chunk.length;
-    if (totalBytes > MAX_TARBALL_SIZE) {
-      controller.abort();
-      throw new Error(`tarball download exceeded ${MAX_TARBALL_SIZE} bytes for ${packageName} — aborted`);
-    }
-    chunks.push(chunk);
-  }
-  const compressed = Buffer.concat(chunks);
-
-  // Gunzip
-  return gunzip(compressed);
 }
 
 /**
@@ -203,8 +291,11 @@ async function fetchDecompressed(tarballUrl, packageName) {
  * @param {string} destDir — must already exist (caller's mkdtemp)
  * @returns {Promise<string[]>} absolute paths written
  */
-export async function downloadAndExtractToDisk(tarballUrl, packageName, destDir) {
-  const decompressed = await fetchDecompressed(tarballUrl, packageName);
+export async function downloadAndExtractToDisk(tarballUrl, packageName, destDir, artifact = {}) {
+  if (!artifact.integrity && !artifact.shasum) {
+    throw new Error(`refusing dynamic extraction for ${packageName}: registry artifact digest is unavailable`);
+  }
+  const decompressed = await fetchDecompressed(tarballUrl, packageName, artifact);
   const entries = parseTar(decompressed, packageName, true /* returnAll */);
   const written = [];
   for (const entry of entries) {
@@ -240,10 +331,10 @@ function safeJoin(root, candidate) {
  * Download a tarball and extract JS files that match our inspection patterns.
  * Uses zero external dependencies — native gunzip + raw tar header parsing.
  *
- * Security: validates URL (SSRF prevention), streams with size limit (memory exhaustion prevention).
+ * Security: constrains URL destinations and bounds streamed input/memory use.
  */
-async function downloadAndExtractJS(tarballUrl, packageName) {
-  const decompressed = await fetchDecompressed(tarballUrl, packageName);
+async function downloadAndExtractJS(tarballUrl, packageName, artifact = {}) {
+  const decompressed = await fetchDecompressed(tarballUrl, packageName, artifact);
 
   // Parse tar — first pass extracts package.json to find entry points,
   // second pass uses those entry points plus static patterns
@@ -254,30 +345,13 @@ async function downloadAndExtractJS(tarballUrl, packageName) {
   const extraPatterns = [];
   if (pkgJsonEntry) {
     try {
-      const pkgData = JSON.parse(pkgJsonEntry.content);
-      if (typeof pkgData.main === 'string') extraPatterns.push(pkgData.main);
-      if (typeof pkgData.bin === 'string') {
-        extraPatterns.push(pkgData.bin);
-      } else if (pkgData.bin && typeof pkgData.bin === 'object') {
-        extraPatterns.push(...Object.values(pkgData.bin).filter(v => typeof v === 'string'));
-      }
-      // exports can be string or object with nested conditions
-      if (typeof pkgData.exports === 'string') {
-        extraPatterns.push(pkgData.exports);
-      } else if (pkgData.exports && typeof pkgData.exports === 'object') {
-        const extractExports = (obj) => {
-          for (const v of Object.values(obj)) {
-            if (typeof v === 'string') extraPatterns.push(v);
-            else if (v && typeof v === 'object') extractExports(v);
-          }
-        };
-        extractExports(pkgData.exports);
-      }
+      const pkgData = JSON.parse(pkgJsonEntry.content.toString('utf8'));
+      extraPatterns.push(...collectInspectableEntrypoints(pkgData));
     } catch { /* malformed package.json — proceed with static patterns */ }
   }
 
   // Build the final file list from static patterns + dynamic package.json refs
-  const files = allEntries.filter(f => {
+  const candidates = allEntries.filter(f => {
     if (f.path === 'package.json') return false; // Already used for metadata
     // Match static inspectable patterns
     if (INSPECTABLE_PATTERNS.some(p => p.test('/' + f.path))) return true;
@@ -287,14 +361,68 @@ async function downloadAndExtractJS(tarballUrl, packageName) {
       const norm = ep.replace(/^\.\//, '');
       return normalized === norm || normalized.endsWith('/' + norm);
     });
-  }).slice(0, MAX_FILES);
+  });
+  const eligible = candidates.filter(file => file.size <= MAX_INSPECT_SIZE);
+  const files = eligible.slice(0, MAX_FILES).map(file => ({
+    ...file,
+    content: file.content.toString('utf8'),
+  }));
 
-  return files;
+  return {
+    files,
+    eligibleFiles: eligible.length,
+    archiveFiles: allEntries.length,
+    oversizeFiles: candidates.length - eligible.length,
+    digestVerified: !!(artifact.integrity || artifact.shasum),
+  };
+}
+
+/**
+ * Verify compressed registry bytes against npm SRI (preferred) or the legacy
+ * SHA-1 shasum. Throws on malformed/unsupported evidence or any mismatch.
+ */
+export function verifyArtifactDigest(buffer, artifact = {}, packageName = 'package') {
+  if (artifact.integrity) {
+    const tokens = String(artifact.integrity).trim().split(/\s+/).filter(Boolean);
+    const supported = [];
+    const strength = { sha1: 1, sha256: 2, sha384: 3, sha512: 4 };
+    for (const token of tokens) {
+      const match = token.match(/^(sha(?:1|256|384|512))-([A-Za-z0-9+/=_-]+)(?:\?.*)?$/i);
+      if (!match) continue;
+      const algorithm = match[1].toLowerCase();
+      const expected = Buffer.from(match[2].replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+      if (expected.length > 0) supported.push({ algorithm, expected });
+    }
+
+    if (supported.length === 0) throw new Error(`unsupported or malformed registry integrity for ${packageName}`);
+
+    // Follow SRI's strongest-algorithm rule. A matching sha1 token must not
+    // override a mismatching sha512 token in the same integrity value.
+    const strongest = Math.max(...supported.map(item => strength[item.algorithm]));
+    for (const { algorithm, expected } of supported) {
+      if (strength[algorithm] !== strongest) continue;
+      const actual = createHash(algorithm).update(buffer).digest();
+      if (actual.equals(expected)) return true;
+    }
+    throw new Error(`registry integrity mismatch for ${packageName}`);
+  }
+
+  if (artifact.shasum) {
+    const expected = String(artifact.shasum).trim().toLowerCase();
+    if (!/^[a-f0-9]{40}$/.test(expected)) {
+      throw new Error(`malformed registry shasum for ${packageName}`);
+    }
+    const actual = createHash('sha1').update(buffer).digest('hex');
+    if (actual === expected) return true;
+    throw new Error(`registry shasum mismatch for ${packageName}`);
+  }
+
+  return false;
 }
 
 /**
  * Gunzip a buffer using Node's native zlib.
- * Enforces a decompressed size limit to prevent gzip bombs.
+ * Enforces a decompressed size limit to bound archive expansion.
  */
 function gunzip(buffer) {
   return new Promise((resolve, reject) => {
@@ -337,7 +465,7 @@ function parseTar(buffer, packageName, returnAll = false) {
 
     // Extract filename (bytes 0-99, null-terminated)
     const nameEnd = header.indexOf(0, 0);
-    const name = header.subarray(0, Math.min(nameEnd, 100)).toString('utf8');
+    const name = header.subarray(0, nameEnd === -1 ? 100 : Math.min(nameEnd, 100)).toString('utf8');
 
     // Extract file size (bytes 124-135, octal)
     const sizeStr = header.subarray(124, 136).toString('utf8').trim();
@@ -355,7 +483,7 @@ function parseTar(buffer, packageName, returnAll = false) {
 
     // Check prefix field (bytes 345-499) for long paths (UStar format)
     const prefixEnd = header.indexOf(0, 345);
-    const prefix = header.subarray(345, Math.min(prefixEnd, 500)).toString('utf8');
+    const prefix = header.subarray(345, prefixEnd === -1 ? 500 : Math.min(prefixEnd, 500)).toString('utf8');
     const fullPath = prefix ? `${prefix}/${name}` : name;
 
     // Strip the leading "package/" that npm tarballs always have
@@ -363,12 +491,15 @@ function parseTar(buffer, packageName, returnAll = false) {
 
     offset += 512; // Move past header
 
-    if (isFile && size > 0 && size <= MAX_INSPECT_SIZE) {
+    if (offset + size > buffer.length) break;
+
+    if (isFile && size >= 0) {
       if (returnAll) {
-        // In returnAll mode, extract all reasonably-sized text files
-        // (caller will filter by pattern + package.json refs)
-        if (fileCount < MAX_FILES * 3 && /\.(js|mjs|cjs|json|py|wasm)$/.test(relativePath)) {
-          const content = buffer.subarray(offset, offset + size).toString('utf8');
+        // Disk extraction needs a coherent package tree, not the first thirty
+        // text files. The decompressed archive already has a global 50 MiB
+        // bound; retain binary bytes and cap pathological file counts/sizes.
+        if (fileCount < MAX_ARCHIVE_FILES && size <= MAX_EXTRACT_FILE_SIZE) {
+          const content = Buffer.from(buffer.subarray(offset, offset + size));
           files.push({ path: relativePath, content, size });
           fileCount++;
         }
@@ -399,6 +530,19 @@ export function getTarballUrl(registryMetadata, version) {
   const name = registryMetadata?.name;
   if (!name || !version) return null;
 
+  // Prefer the exact artifact URL returned for the anchored registry version.
+  // Constructing a conventional URL can point at a different host/path than
+  // the registry actually attested in its packument.
+  const anchored = registryMetadata?.tarball || registryMetadata?.artifact?.tarball;
+  if (anchored) {
+    try {
+      validateTarballUrl(anchored);
+      return anchored;
+    } catch {
+      return null;
+    }
+  }
+
   // npm tarball URL convention: registry.npmjs.org/{name}/-/{basename}-{version}.tgz
   const basename = name.startsWith('@') ? name.split('/')[1] : name;
   return `https://registry.npmjs.org/${name}/-/${basename}-${version}.tgz`;
@@ -410,17 +554,17 @@ export function getTarballUrl(registryMetadata, version) {
 export async function getPypiTarballUrl(packageName, version) {
   const normalized = packageName.toLowerCase().replace(/[._]/g, '-');
   try {
-    const data = await (await fetch(
-      `https://pypi.org/pypi/${encodeURIComponent(normalized)}/${encodeURIComponent(version)}/json`,
-      { headers: { 'User-Agent': USER_AGENT } }
-    )).json();
+    const data = await fetchJSON(
+      `${PYPI_JSON_URL}/${encodeURIComponent(normalized)}/${encodeURIComponent(version)}/json`,
+      { timeout: FETCH_TIMEOUT_MS },
+    );
 
     // Find the sdist (.tar.gz) URL — preferred for source inspection
     const urls = data.urls || [];
     const sdist = urls.find(u => u.packagetype === 'sdist');
     const url = sdist?.url || urls[0]?.url || null;
 
-    // Validate the URL before returning — SSRF prevention
+    // Validate the URL before returning — constrain destination exposure.
     if (url) {
       try { validateTarballUrl(url); } catch { return null; }
     }

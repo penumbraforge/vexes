@@ -1,6 +1,8 @@
 # Detection Signals
 
-vexes detects supply chain threats through signals. Each signal represents a specific suspicious pattern. Signals are combined with context-aware scoring to produce composite risk assessments.
+vexes emits evidence signals for review. A signal may describe an upstream
+advisory match, a registry fact, or a heuristic pattern. Composite scores are
+prioritization aids, not verdicts; expect false positives and misses.
 
 ## Signal reference
 
@@ -8,32 +10,34 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 
 | Signal | Default Severity | Description |
 |--------|-----------------|-------------|
-| `KNOWN_COMPROMISED` | CRITICAL | Package has known vulnerabilities in the OSV database |
+| `KNOWN_MALICIOUS` | CRITICAL | OSV explicitly labels the package/version malicious (`MAL-*` or malware-typed record). This is an upstream record match, not proof of execution in this project. |
+| `KNOWN_VULNERABILITY` | Upstream severity; MODERATE fallback | OSV reports this version in an ordinary affected vulnerability range. It does not imply malware or exploitation. |
+| `KNOWN_COMPROMISED` / `OSV_MATCH` | Compatibility | Older policy/consumer names accepted for advisory matches; new analysis results use the two identifiers above. |
 | `MAINTAINER_CHANGE` | CRITICAL / MODERATE / LOW | Publishing account changed between versions. CRITICAL if recent (< 90 days), MODERATE if old. LOW for old transfers in org-managed packages (3+ maintainers). |
-| `POSTINSTALL_SCRIPT` | HIGH / LOW | Has install lifecycle scripts (preinstall, install, postinstall). LOW for known-good packages (esbuild, sharp, etc.). |
-| `RAPID_PUBLISH` | HIGH / LOW | Version published < 10 minutes after previous version. LOW for CI multi-publish (0s interval with 2+ maintainers). |
-| `VERSION_ANOMALY` | MODERATE / HIGH | Major version jumped by 3+ (MODERATE). Package dormant > 1 year then suddenly published (HIGH). |
+| `POSTINSTALL_SCRIPT` | MODERATE / LOW | Has consumer install hooks (`preinstall`, `install`, or `postinstall`). Hook presence is an execution surface, not evidence of malicious content. LOW for curated exact-name entries such as esbuild and sharp. |
+| `RAPID_PUBLISH` | HIGH / LOW | Version published < 10 minutes after previous version. LOW for an exact-name allowlist entry or likely CI multi-publish (0s interval with 2+ maintainers). |
+| `VERSION_ANOMALY` | LOW / MODERATE / HIGH | A major-version jump of 3+ is MODERATE. A version after >1 year of dormancy is HIGH for its first 90 days, MODERATE until one year, then LOW. |
 | `NO_REPOSITORY` | LOW | No source repository link in package metadata |
-| `MISSING_PROVENANCE` | MODERATE / LOW | No Sigstore provenance attestation. MODERATE if combined with other signals, LOW if standalone. |
-| `TYPOSQUAT` | HIGH | Package name is close to a popular package (Levenshtein ≤ 1 for names of 4–6 chars, ≤ 2 for 7+; names ≤ 3 chars are never compared). Checked against a curated list of ~165 npm / ~105 PyPI popular packages; scoped names are not candidates. |
-| `HOMOGLYPH` | CRITICAL | Package name contains invisible Unicode characters (zero-width, BIDI override) or non-ASCII homoglyphs |
+| `MISSING_PROVENANCE` | MODERATE / LOW | No npm Sigstore provenance attestation among packages selected for the provenance stage. MODERATE if combined with other signals, LOW if standalone. |
+| `TYPOSQUAT` | HIGH | Package name is close to a popular package (Levenshtein ≤ 1 for names of 4–6 chars, ≤ 2 for 7+; names ≤ 3 chars are never compared). Checked against a curated list of ~165 npm / ~105 PyPI popular packages. Scoped names are compared in full, including the scope, which can weaken the heuristic. |
+| `HOMOGLYPH` | CRITICAL | Legacy signal name: package name contains invisible/BIDI characters or any non-ASCII character. No visual-confusable mapping is performed. |
 
-### Layer 1: AST analysis
+### Layer 1: source-pattern analysis
 
 | Signal | Default Severity | Description |
 |--------|-----------------|-------------|
-| `AST_DANGEROUS_PATTERN` | Varies | Dangerous code pattern found in install scripts |
-| `TARBALL_DANGEROUS_PATTERN` | Varies | Dangerous code pattern found in actual package source |
+| `AST_DANGEROUS_PATTERN` | Varies | JavaScript AST or Python text-pattern match in inspectable inline install-script content |
+| `TARBALL_DANGEROUS_PATTERN` | Varies | Pattern match in one of up to 10 selected files from a bounded tarball sample |
 
 **Detected patterns:**
 
 | Pattern | Severity | Example |
 |---------|----------|---------|
-| `CODE_EXECUTION` | CRITICAL | `eval()`, `new Function()`, `vm.runInNewContext()`, `process.dlopen()`, indirect eval `(0,eval)()`, `setTimeout(string)`, `WebAssembly.instantiate()`, `new Worker()`, `module.constructor._load()`, `.constructor(string)` (prototype chain), `globalThis['eval']()` |
+| `CODE_EXECUTION` | HIGH / CRITICAL | `new Worker()` is HIGH; `eval()`, `new Function()`, `vm.runInNewContext()`, `process.dlopen()`, indirect eval `(0,eval)()`, `setTimeout(string)`, `WebAssembly.instantiate()`, `module.constructor._load()`, `.constructor(string)` (prototype chain), and `globalThis['eval']()` are CRITICAL |
 | `PROCESS_SPAWN` | CRITICAL | `child_process.exec()`, `execSync()`, `spawn()`, `process.binding('spawn_sync')`, `process.mainModule.require()` |
 | `SYSTEM_PATH_WRITE` | CRITICAL | `fs.writeFile('/tmp/backdoor')`, `fs.writeFile('/etc/cron.d/...')` |
 | `SELF_DELETION` | CRITICAL | `fs.unlinkSync(__filename)` -- code erases itself after execution |
-| `ENV_HARVESTING` | CRITICAL | `process.env.AWS_SECRET_ACCESS_KEY`, `process.env.GITHUB_TOKEN`, `process['env']` (computed), `fs.readFileSync('.ssh/id_rsa')` (sensitive file reads) |
+| `ENV_HARVESTING` | CRITICAL | `process.env.AWS_SECRET_ACCESS_KEY`, `process['env']['GITHUB_TOKEN']` (computed), `fs.readFileSync('.ssh/id_rsa')` (sensitive file reads) |
 | `NETWORK_ACCESS` | HIGH | `fetch()`, `https.request()`, `http.get()`, `dns.resolve()` (DNS exfiltration), `dns.lookup()` |
 | `BASE64_DECODE` | HIGH | `Buffer.from(x, 'base64')`, `.toString('base64')` |
 | `DYNAMIC_REQUIRE` | HIGH | `require(variable)` -- loads arbitrary modules |
@@ -42,7 +46,7 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 | `FILESYSTEM_WRITE` | MODERATE | `fs.writeFile()` to non-system paths |
 | `UNPARSEABLE_CODE` | HIGH | Code that can't be parsed as JavaScript |
 
-**Python-specific patterns:**
+**Python-specific text patterns (not an AST):**
 
 | Pattern | Severity | Example |
 |---------|----------|---------|
@@ -57,10 +61,10 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 
 | Signal | Default Severity | Description |
 |--------|-----------------|-------------|
-| `PHANTOM_DEPENDENCY` | CRITICAL / HIGH | Newly added dependency is < 7 days old (CRITICAL) or has 1 maintainer + 1-2 versions (HIGH) |
-| `CIRCULAR_STAGING` | CRITICAL | New dependency published by the same account within 48 hours |
-| `NEW_DEP_HAS_INSTALL_SCRIPTS` | HIGH | Newly added dependency has install lifecycle scripts |
-| `NEW_DEPENDENCY` | MODERATE / HIGH | New dependency added. HIGH if metadata unavailable. |
+| `PHANTOM_DEPENDENCY` | CRITICAL / HIGH | Dependency added by the analyzed npm release relative to its previous published version is < 7 days old (CRITICAL) or has at most 1 maintainer and 1–2 versions (HIGH) |
+| `CIRCULAR_STAGING` | CRITICAL | Such an added dependency was published by the same account within 48 hours |
+| `NEW_DEP_HAS_INSTALL_SCRIPTS` | HIGH | Such an added dependency declares a consumer install hook (`preinstall`, `install`, or `postinstall`) |
+| `NEW_DEPENDENCY` | MODERATE / HIGH | Dependency added by that npm release. HIGH if registry metadata is unavailable. |
 
 ### Layer 3: Behavioral fingerprinting
 
@@ -68,16 +72,16 @@ vexes detects supply chain threats through signals. Each signal represents a spe
 |--------|-----------------|-------------|
 | `CAPABILITY_ESCALATION` | CRITICAL | Package gained dangerous capabilities between versions (e.g., process_spawn, network, credential_access). Fires only when the previous version's capabilities are actually known — see `INITIAL_DANGEROUS_CAPABILITY`. |
 | `DEPENDENCY_SPIKE` | HIGH | Dependency count more than doubled and exceeds 5 |
-| `MAINTAINER_REDUCTION` | MODERATE | Number of maintainers decreased between versions |
-| `REPOSITORY_REMOVED` | MODERATE | Repository link was removed from metadata |
-| `INITIAL_DANGEROUS_CAPABILITY` | MODERATE | Latest version's install scripts have dangerous capabilities, but the previous version's capabilities are not knowable from registry metadata — so no between-versions diff is claimed. This is the normal Layer 3 signal for established packages. |
+| `MAINTAINER_REDUCTION` | MODERATE | Profile-diff primitive for a maintainer-count decrease. The ordinary registry analysis path does not currently retain prior-version maintainer-list history, so it does not emit this signal from a live package lookup. |
+| `REPOSITORY_REMOVED` | MODERATE | Profile-diff primitive for repository-link removal. The ordinary registry analysis path does not currently retain prior-version repository history, so it does not emit this signal from a live package lookup. |
+| `INITIAL_DANGEROUS_CAPABILITY` | MODERATE | Analyzed version's inspectable install scripts have dangerous capabilities, but usable previous-version script data was unavailable, so no between-version change is claimed. |
 
 ### Provenance and sandbox
 
 | Signal | Default Severity | Description |
 |--------|-----------------|-------------|
-| `SIGNATURE_SPOOF` | HIGH | Provenance attestation certifies a different package's artifact (replay) or claims a different source repo than the package declares. vexes decodes and cross-references attested fields; it does **not** verify DSSE signatures, certificates, or transparency-log inclusion proofs. Repo-mismatch may false-positive on legitimate fork publishing. |
-| `SANDBOX_BEHAVIOR` | CRITICAL / HIGH / MODERATE | Observed at runtime when a package is executed under an OS isolation primitive (`analyze --sandbox` / `inspect --sandbox`): writes outside the workdir are CRITICAL; process spawns or network attempts are HIGH; anything else recorded is MODERATE. Experimental — see [Commands Reference](Commands-Reference.md). |
+| `ATTESTATION_IDENTITY_MISMATCH` | HIGH | Decoded attestation subject/repository fields disagree with package metadata. vexes does **not** verify DSSE signatures, certificates, artifact digests, or transparency-log inclusion proofs. A crafted or invalid bundle can therefore produce this signal. Repo mismatch may also occur for legitimate forks/mirrors. `SIGNATURE_SPOOF` is a compatibility name only. |
+| `SANDBOX_BEHAVIOR` | CRITICAL / HIGH | Best-effort telemetry from one selected npm entrypoint under an accepted Linux `bwrap` host: recorder-observed outside writes are CRITICAL; selected process/network API use is HIGH. The recorder is bypassable and children are not instrumented. This is not a clean-execution verdict or proof of containment. |
 
 ## Disabling signals
 
@@ -94,18 +98,11 @@ In `.vexesrc.json`:
 }
 ```
 
-Setting a signal to `"off"` suppresses it. Use sparingly.
-
-### Undisableable signals
-
-The following critical signals **cannot be disabled** via config -- they detect active supply chain attacks and suppressing them would create a dangerous blind spot:
-
-- `KNOWN_COMPROMISED` -- package has known vulnerabilities in OSV
-- `PHANTOM_DEPENDENCY` -- brand-new dependency (< 7 days old)
-- `CIRCULAR_STAGING` -- new dependency published by the same account
-- `CAPABILITY_ESCALATION` -- package gained dangerous capabilities between versions
-
-Attempting to set these to `"off"` in `.vexesrc.json` has no effect.
+Setting a signal to `"off"` suppresses it. Every documented analysis signal is
+configurable. The legacy `KNOWN_COMPROMISED` switch also controls
+`KNOWN_MALICIOUS` and `KNOWN_VULNERABILITY` when their own switches are absent.
+Use this sparingly: project-local configuration can remove evidence from output,
+so review `.vexesrc.json` as security policy.
 
 ## Sensitive environment variables detected
 

@@ -1,17 +1,17 @@
 /**
- * Freshness layer — detect suspicious NEW releases within minutes, not days.
+ * Freshness layer — detect suspicious NEW releases on a configured registry
+ * polling cadence.
  *
- * The 2026 supply-chain race is measured in hours: axios was malicious for ~3
- * hours, Mastra republished 140+ packages in 88 minutes. CVE databases (OSV)
- * lag those windows by definition. This module polls the *registry* — where a
- * new version is visible within minutes of publication — and grades the signal
+ * Registry changes can become visible before an advisory is published. This
+ * module polls the registry and grades the signal
  * deltas the metadata normalizer already computes: maintainer change, install
  * scripts, newly added deps, rapid publish, dormancy.
  *
  * Inverted from `analyze`: analyze asks "is the installed thing risky NOW?"
- * freshness asks "did something new just land, and does it walk like an
- * attack?" Persisting the last-seen version hash means a release is graded
- * ONCE — subsequent polls are no-ops until the next publish.
+ * freshness asks "did the registry latest change since the last successful
+ * poll, and what evidence changed with it?" Persisted last-seen versions mean
+ * each release is graded once. The initial poll establishes a baseline and
+ * never treats an already-outdated project as a newly published event.
  *
  * @module analysis/freshness
  */
@@ -20,12 +20,11 @@ import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { fetchPypiMetadata } from '../advisories/pypi-registry.js';
 import { log } from '../core/logger.js';
 
-// Low bar — a fresh release is a new event in a short-lived-attack landscape.
-// The window tracks the documented 2026 attacks: axios was live ~3h, Mastra's
-// second-stage rollout ~88min. Flag anything published within 24h of its
-// predecessor when other deltas align.
+// Low bar: a new release is an event worth comparing to the persisted baseline.
+// Flag publication within 24h of its predecessor when other deltas align.
 const SUSPICIOUS_INTERVAL_MS = 24 * 60 * 60 * 1000;       // < 24h since previous release
 const DORMANCY_THRESHOLD_MS = 90 * 24 * 60 * 60 * 1000;   // > 90 days quiet then active again
+const SUPPORTED_ECOSYSTEMS = new Set(['npm', 'pypi']);
 
 /**
  * Grade a freshly-published release from its normalized registry metadata.
@@ -57,11 +56,18 @@ export function assessNewVersion(m) {
       `publisher changed: ${m.previousPublisher ?? '?'} → ${m.latestPublisher ?? '?'}`);
   }
 
-  // Install lifecycle scripts on the new release — the classic sneaky delivery.
-  if (m.hasInstallScripts) {
-    const hooks = Object.keys(m.installScripts || {}).join(',');
+  // Only newly introduced or changed consumer install hooks are a release
+  // delta. A longstanding postinstall script is not itself a fresh event.
+  const previousScripts = m.previousInstallScripts;
+  const changedHooks = previousScripts && typeof previousScripts === 'object'
+    ? Object.entries(m.installScripts || {})
+      .filter(([hook, command]) => previousScripts[hook] !== command)
+      .map(([hook]) => hook)
+    : [];
+  if (changedHooks.length > 0) {
+    const hooks = changedHooks.join(',');
     pushReason(reasons, levelState, 'high',
-      `new release carries install lifecycle scripts (${hooks})`);
+      `new or changed consumer install lifecycle scripts (${hooks})`);
   }
 
   // The new release pulls in dependencies it didn't have before — a staging
@@ -79,9 +85,9 @@ export function assessNewVersion(m) {
   }
 
   // Dormancy + sudden activity — hijack-after-abandon.
-  if (m.dormancyMs !== null && m.dormancyMs > DORMANCY_THRESHOLD_MS) {
+  if (m.publishIntervalMs !== null && m.publishIntervalMs > DORMANCY_THRESHOLD_MS) {
     pushReason(reasons, levelState, 'moderate',
-      `reactivated after ${(m.dormancyMs / 86400000).toFixed(0)} days dormant`);
+      `reactivated after ${(m.publishIntervalMs / 86400000).toFixed(0)} days dormant`);
   }
 
   // A big major jump on a NEW release from an unknown/fast publisher is worth
@@ -105,26 +111,40 @@ export function assessNewVersion(m) {
  *   from the INSTALLED version — a healthy "you're one behind" scan does NOT
  *   fire alerts by itself; the deltas decide.
  */
-export async function checkOneDep(dep, { fetchMeta } = {}) {
+export async function checkOneDep(dep, { fetchMeta, lastSeenVersion } = {}) {
   const name = dep.name;
   const ecosystem = dep.ecosystem;
   const installed = dep.version;
+  if (!SUPPORTED_ECOSYSTEMS.has(ecosystem)) {
+    return {
+      name, ecosystem, installed, latest: null, isNew: false, alert: false,
+      level: 'low', reasons: [], skipped: true,
+      warning: `freshness does not support ecosystem ${ecosystem}`,
+    };
+  }
   const fetchFn = fetchMeta || (ecosystem === 'pypi' ? fetchPypiMetadata : fetchNpmMetadata);
 
   const metadata = await fetchFn(name, null);
   if (!metadata) {
     log.debug(`freshness: no metadata for ${ecosystem}:${name} — skipping`);
-    return { name, installed, latest: null, isNew: false, alert: false, level: 'low', reasons: [], skipped: true };
+    return { name, ecosystem, installed, latest: null, isNew: false, alert: false, level: 'low', reasons: [], skipped: true, warning: 'registry metadata unavailable' };
   }
 
   const latest = metadata.latestAvailable || metadata.latestVersion;
-  const isNew = latest !== installed;
-  if (!isNew) return { name, installed, latest, isNew: false, alert: false, level: 'low', reasons: [], skipped: false };
+  if (!latest) {
+    return { name, ecosystem, installed, latest: null, isNew: false, alert: false, level: 'low', reasons: [], skipped: true, warning: 'registry latest version unavailable' };
+  }
+  const updateAvailable = latest !== installed;
+  const baseline = lastSeenVersion === undefined || lastSeenVersion === null;
+  const isNew = !baseline && latest !== lastSeenVersion;
+  if (!isNew) {
+    return { name, ecosystem, installed, latest, lastSeenVersion: lastSeenVersion ?? null, baseline, updateAvailable, isNew: false, alert: false, level: 'low', reasons: [], skipped: false };
+  }
 
   // We called the fetcher unanchored (null version), so normalizeMetadata
   // anchored to the registry's latest — exactly the release we want to grade.
   const assessment = assessNewVersion(metadata);
-  return { name, installed, latest, isNew: true, ...assessment, skipped: false };
+  return { name, ecosystem, installed, latest, lastSeenVersion, baseline: false, updateAvailable, isNew: true, ...assessment, skipped: false };
 }
 
 /**
@@ -132,15 +152,38 @@ export async function checkOneDep(dep, { fetchMeta } = {}) {
  * Failures degrade to skipped (never crash the watcher).
  */
 export async function checkFreshness(deps, opts = {}) {
-  const results = [];
+  const events = [];
+  const warnings = [];
+  let checked = 0;
+  let skipped = 0;
+  const cache = opts.cache;
   for (const dep of deps || []) {
     try {
-      results.push(await checkOneDep(dep, opts));
+      const state = cache?.getFreshnessState?.(dep.ecosystem, dep.name) || null;
+      const event = await checkOneDep(dep, { ...opts, lastSeenVersion: state?.latestVersion ?? null });
+      events.push(event);
+      if (event.skipped) {
+        skipped++;
+        if (event.warning) warnings.push(`${dep.ecosystem}:${dep.name}: ${event.warning}`);
+        continue;
+      }
+      checked++;
+      cache?.setFreshnessState?.(dep.ecosystem, dep.name, event.latest);
     } catch (err) {
-      log.debug(`freshness check failed for ${dep.ecosystem}:${dep.name}: ${err.message}`);
+      const warning = `${dep.ecosystem}:${dep.name}: ${err.message}`;
+      warnings.push(warning);
+      skipped++;
+      log.debug(`freshness check failed for ${warning}`);
     }
   }
-  return results.filter(r => r.isNew);
+  return {
+    events,
+    alerts: events.filter(r => r.isNew && r.alert),
+    complete: warnings.length === 0,
+    warnings,
+    checked,
+    skipped,
+  };
 }
 
 // Kept for callers that want the raw threshold knobs — re-export constants.

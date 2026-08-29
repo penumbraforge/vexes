@@ -13,7 +13,7 @@ import { log } from '../core/logger.js';
  * Rate limits: unauthenticated ≈ 20 req/min sustained. We serialize every
  * lookup through a shared min-interval throttle (well under that), and treat
  * per-package failures as `skipped` — one bad package must not kill a licenses
- * report. Zero network guarantees: all I/O flows through fetchJSON.
+ * report. Network boundary: all requests flow through the shared bounded fetch client.
  */
 
 let lastRequestAt = 0;

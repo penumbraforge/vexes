@@ -11,10 +11,9 @@
  *   2. ANTHROPIC_BASE_URL set       → Anthropic-compatible cluster (vLLM native
  *                                     Messages API, model auto-discovered).
  *   3. ANTHROPIC_API_KEY set        → Anthropic Messages API (hosted claude.js).
- *   4. neither                      → degrade with NO_PROVIDER — vexes never
- *                                     calls out on its own. The scanner is
- *                                     deterministic and offline; AI is an
- *                                     opt-in layer on top.
+ *   4. neither                      → degrade with NO_PROVIDER — no model call.
+ *                                     AI is opt-in independently of the OSV and
+ *                                     registry requests made by scanner commands.
  *
  * Nothing is ever sent to a provider except the extracted findings payload we
  * build — never raw downloaded package source, never advisory HTML. Callers

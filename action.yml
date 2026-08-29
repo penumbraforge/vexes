@@ -1,5 +1,5 @@
 name: vexes
-description: Cross-ecosystem dependency security scanner — catches supply chain attacks that vulnerability databases miss
+description: Experimental OSV scanner with additional heuristic supply-chain evidence
 author: Shadoe Myers
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   command:
-    description: 'Command to run: scan, analyze, or monitor (guard is rejected — it performs real installs)'
+    description: 'Command to run: scan, analyze, or monitor (guard is not supported by this CI action)'
     required: false
     default: 'scan'
   severity:
@@ -21,7 +21,9 @@ inputs:
     default: '.'
   sarif-file:
     description: >-
-      If set, also write a SARIF 2.1.0 report to this path. Pair it with
+      For command=scan, generate a fresh SARIF 2.1.0 report at this path and
+      expose it only after validating a complete vexes SARIF object. Analyze
+      and monitor do not support a SARIF filename through this action. Pair it with
       github/codeql-action/upload-sarif to surface findings in the Security tab:
 
         - uses: penumbraforge/vexes@<ref>
@@ -35,10 +37,9 @@ inputs:
   fail-on-findings:
     description: >-
       When 'true', the action fails the build if vexes reports findings
-      (exit 1) or an incomplete scan (exit 2). Default 'false' — the action
-      succeeds and exposes counts + exit-code as outputs for the caller to
-      act on. (A composite action that fails does not expose its outputs, so
-      gating and output-reading are mutually exclusive by design.)
+      (exit 1) or an incomplete/error result (exit 2). On a valid structured
+      run, the default 'false' exposes counts + exit-code without turning a
+      nonzero vexes result into a failing action step.
     required: false
     default: 'false'
   node-version:
@@ -52,22 +53,22 @@ inputs:
 
 outputs:
   vulnerabilities:
-    description: 'Total vulnerabilities (or flagged packages) found at or above the severity threshold'
+    description: 'Validated total vulnerabilities (or flagged packages) at/above the threshold; unset if structured output is invalid'
     value: ${{ steps.vexes.outputs.vulnerabilities }}
   critical:
-    description: 'Number of CRITICAL findings'
+    description: 'Validated number of CRITICAL findings; unset if structured output is invalid'
     value: ${{ steps.vexes.outputs.critical }}
   high:
-    description: 'Number of HIGH findings'
+    description: 'Validated number of HIGH findings; unset if structured output is invalid'
     value: ${{ steps.vexes.outputs.high }}
   moderate:
-    description: 'Number of MODERATE findings'
+    description: 'Validated number of MODERATE findings; unset if structured output is invalid'
     value: ${{ steps.vexes.outputs.moderate }}
   exit-code:
-    description: 'vexes exit code (0 clean, 1 findings, 2 incomplete/error)'
+    description: 'vexes exit code (0 complete/no findings at threshold, 1 findings at threshold, 2 incomplete/error)'
     value: ${{ steps.vexes.outputs.exit-code }}
   sarif-file:
-    description: 'Path to the written SARIF file, if sarif-file was requested'
+    description: 'Path to a fresh validated scan SARIF file; unset on generation, validation, or completeness failure'
     value: ${{ steps.vexes.outputs.sarif-file }}
 
 runs:
@@ -81,11 +82,15 @@ runs:
     - name: Run vexes
       id: vexes
       shell: bash
-      # Every input is passed through env and referenced below as a quoted shell
-      # variable — NOTHING is interpolated into the run body with ${{ }}, so this
-      # step is not a template-injection sink (the old `npx @latest ${{ inputs.* }}`
-      # was). VEXES_BIN points at the PINNED action code shipped in this ref, so
-      # the action honors `uses:` and never fetches from the registry at runtime.
+      # Inputs reach the script through env rather than expression interpolation.
+      # Structured inputs are quoted below; INPUT_ARGS is deliberately
+      # space-split and therefore documented as trusted-only. VEXES_BIN points
+      # at the pinned action code shipped in this ref, so
+      # the vexes invocation honors `uses:` and does not resolve an npm package
+      # from the registry at runtime. Project config is disabled so a checked-out
+      # pull request cannot weaken this action's scan policy. User-level config
+      # is also disabled so self-hosted runner state cannot silently alter the
+      # result; explicit action inputs still apply.
       env:
         INPUT_COMMAND: ${{ inputs.command }}
         INPUT_SEVERITY: ${{ inputs.severity }}
@@ -101,12 +106,12 @@ runs:
         # before any output was written.
         set +e -o pipefail
 
-        # Allowlist the command. guard performs real package installs and is
-        # never permitted from CI.
+        # Allowlist the command. Guard has an interactive/install mode and a
+        # narrower JSON assessment contract, so this CI action does not expose it.
         case "$INPUT_COMMAND" in
           scan|analyze|monitor) ;;
           *)
-            echo "::error title=vexes::command '$INPUT_COMMAND' is not allowed — use scan, analyze, or monitor." >&2
+            printf '::error title=vexes::command %q is not allowed — use scan, analyze, or monitor.\n' "$INPUT_COMMAND" >&2
             exit 2
             ;;
         esac
@@ -122,52 +127,181 @@ runs:
           --path "$INPUT_PATH" \
           --severity "$INPUT_SEVERITY" \
           --format json \
+          --no-project-config \
+          --no-user-config \
           $INPUT_ARGS > "$RESULT"
         CODE=$?
 
-        # Parse counts with node (no jq dependency) and write to $GITHUB_OUTPUT.
+        # Validate the shared envelope before trusting any counts. A successful
+        # process with empty, malformed, or legacy/non-envelope stdout is an
+        # incomplete action result, not a zero-finding result.
         node -e '
           const fs = require("fs");
-          let data = {};
-          try { data = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
-          const s = data.summary || {};
+          const fail = (message) => { console.error(message); process.exit(2); };
+          let data;
+          try { data = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+          catch (error) { fail(`invalid JSON: ${error.message}`); }
+          const object = value => value && typeof value === "object" && !Array.isArray(value);
+          if (!object(data) || data.schemaVersion !== "1.0" ||
+              !object(data.generator) || data.generator.name !== "vexes" ||
+              typeof data.generator.version !== "string" || data.generator.version.length === 0 ||
+              typeof data.generator.engine !== "string" || data.generator.engine.length === 0 ||
+              typeof data.timestamp !== "string" || !Number.isFinite(Date.parse(data.timestamp)) ||
+              data.command !== process.argv[2] ||
+              !object(data.target) || !Array.isArray(data.target.lockfiles) ||
+              !Array.isArray(data.target.ecosystems) || typeof data.complete !== "boolean" ||
+              !Array.isArray(data.warnings) || !data.warnings.every(v => typeof v === "string") ||
+              !object(data.result) ||
+              data.result.complete !== data.complete || !Array.isArray(data.result.warnings) ||
+              JSON.stringify(data.result.warnings) !== JSON.stringify(data.warnings) ||
+              !object(data.summary) ||
+              !Array.isArray(data.findings)) {
+            fail("stdout was JSON but not a valid vexes result envelope");
+          }
+          const s = data.summary;
+          if (!Number.isSafeInteger(s.total) || s.total < 0) {
+            fail("missing or invalid total summary count");
+          }
+          const baseCount = data.command === "analyze" ? s.flagged : s.vulnerable;
+          if (!Number.isSafeInteger(baseCount) || baseCount < 0) {
+            fail(`missing or invalid ${data.command === "analyze" ? "flagged" : "vulnerable"} summary count`);
+          }
+          const records = data.command === "analyze" ? data.results : data.findings;
+          if (!Array.isArray(records) || records.length !== baseCount) {
+            fail("summary count does not match the command result records");
+          }
+          const severityCounts = { critical: 0, high: 0, moderate: 0 };
+          const validLevels = new Set(["NONE", "UNKNOWN", "LOW", "MODERATE", "HIGH", "CRITICAL"]);
+          for (const record of records) {
+            if (!object(record)) fail("command result contains a non-object record");
+            const level = data.command === "analyze"
+              ? record.riskLevel
+              : record.severityLevel?.level;
+            if (typeof level !== "string" || !validLevels.has(level)) {
+              fail("command result contains an invalid severity level");
+            }
+            const key = level.toLowerCase();
+            if (key in severityCounts) severityCounts[key]++;
+          }
+          for (const [key, value] of Object.entries(severityCounts)) {
+            if (s[key] !== undefined && s[key] !== value) {
+              fail(`summary ${key} count does not match result records`);
+            }
+          }
+          const counts = {
+            vulnerabilities: baseCount,
+            ...severityCounts,
+          };
           const out = process.env.GITHUB_OUTPUT;
           const w = (k, v) => fs.appendFileSync(out, k + "=" + v + "\n");
-          w("vulnerabilities", s.vulnerable ?? s.flagged ?? 0);
-          w("critical", s.critical ?? 0);
-          w("high", s.high ?? 0);
-          w("moderate", s.moderate ?? 0);
-        ' "$RESULT"
-        echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+          for (const [key, value] of Object.entries(counts)) w(key, value);
+          if (!data.complete) process.exit(3);
+        ' "$RESULT" "$INPUT_COMMAND"
+        JSON_CODE=$?
+        rm -f -- "$RESULT"
+        if [ "$JSON_CODE" = "3" ]; then
+          CODE=2
+        elif [ "$JSON_CODE" != "0" ]; then
+          echo "::error title=vexes::vexes returned invalid structured output; treating the run as incomplete." >&2
+          CODE=2
+        fi
+        case "$CODE" in 0|1|2) ;; *) CODE=2 ;; esac
 
         # Optional SARIF report for github/codeql-action/upload-sarif.
-        if [ -n "$INPUT_SARIF_FILE" ]; then
-          node "$VEXES_BIN" "$INPUT_COMMAND" "${EXTRA[@]}" \
-            --path "$INPUT_PATH" \
-            --severity "$INPUT_SEVERITY" \
-            --sarif "$INPUT_SARIF_FILE" \
-            $INPUT_ARGS || true
-          echo "sarif-file=$INPUT_SARIF_FILE" >> "$GITHUB_OUTPUT"
+        if [ "$INPUT_COMMAND" = "scan" ] && [ -n "$INPUT_SARIF_FILE" ]; then
+          SARIF_TMP="$(mktemp)"
+          SARIF_READY=true
+
+          # Never mistake a pre-existing target for this run's report. A
+          # regular file/symlink is removed; directories and newline-bearing
+          # paths are refused rather than recursively changed or injected into
+          # GITHUB_OUTPUT.
+          case "$INPUT_SARIF_FILE" in
+            *$'\n'*|*$'\r'*)
+              echo "::error title=vexes::SARIF path contains a newline and was refused." >&2
+              SARIF_READY=false
+              ;;
+          esac
+          if [ "$SARIF_READY" = "true" ] && { [ -e "$INPUT_SARIF_FILE" ] || [ -L "$INPUT_SARIF_FILE" ]; }; then
+            if [ -d "$INPUT_SARIF_FILE" ]; then
+              echo "::error title=vexes::SARIF target is a directory and was refused." >&2
+              SARIF_READY=false
+            else
+              rm -f -- "$INPUT_SARIF_FILE"
+              if [ "$?" != "0" ]; then
+                echo "::error title=vexes::stale SARIF target could not be removed." >&2
+                SARIF_READY=false
+              fi
+            fi
+          fi
+
+          if [ "$SARIF_READY" = "true" ]; then
+            node "$VEXES_BIN" "$INPUT_COMMAND" "${EXTRA[@]}" \
+              --path "$INPUT_PATH" \
+              --severity "$INPUT_SEVERITY" \
+              --sarif "$SARIF_TMP" \
+              --no-project-config \
+              --no-user-config \
+              $INPUT_ARGS
+            SARIF_CODE=$?
+
+            if [ "$SARIF_CODE" = "0" ] || [ "$SARIF_CODE" = "1" ]; then
+              node -e '
+                const fs = require("fs");
+                let data;
+                try { data = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+                catch { process.exit(2); }
+                const valid = data && typeof data === "object" && !Array.isArray(data) &&
+                  data.version === "2.1.0" &&
+                  data.$schema === "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json" &&
+                  Array.isArray(data.runs) && data.runs.length > 0 &&
+                  data.runs.every(run => run && run.tool?.driver?.name === "vexes" &&
+                    typeof run.tool.driver.version === "string" && run.tool.driver.version.length > 0 &&
+                    Array.isArray(run.tool.driver.rules) && Array.isArray(run.results) &&
+                    Array.isArray(run.invocations) && run.invocations.length > 0 &&
+                    run.invocations.every(invocation => invocation?.executionSuccessful === true));
+                if (!valid) process.exit(2);
+              ' "$SARIF_TMP"
+              SARIF_VALID=$?
+            else
+              SARIF_VALID=2
+            fi
+
+            if [ "$SARIF_VALID" = "0" ]; then
+              mv -f -- "$SARIF_TMP" "$INPUT_SARIF_FILE"
+              if [ "$?" = "0" ]; then
+                echo "sarif-file=$INPUT_SARIF_FILE" >> "$GITHUB_OUTPUT"
+                if [ "$SARIF_CODE" = "1" ] && [ "$CODE" = "0" ]; then CODE=1; fi
+              else
+                echo "::error title=vexes::validated SARIF report could not be moved to the requested path." >&2
+                CODE=2
+              fi
+            else
+              echo "::error title=vexes::SARIF generation failed or produced an invalid/incomplete report." >&2
+              CODE=2
+            fi
+          else
+            CODE=2
+          fi
+          rm -f -- "$SARIF_TMP"
         fi
 
-        # This step's job is to WRITE OUTPUTS — it must always succeed. A
-        # composite-action step that exits non-zero aborts the action and
-        # discards the outputs it wrote. vexes's own exit code is surfaced as
-        # the exit-code output; the next step turns it into a build failure
-        # only when fail-on-findings is set.
+        echo "exit-code=$CODE" >> "$GITHUB_OUTPUT"
+
+        # This step writes validated outputs. The next step turns a nonzero
+        # exposed exit code into a build failure only when fail-on-findings is set.
         exit 0
 
     - name: Fail on findings
       shell: bash
       # Opt-in gate. Default is OFF so the action succeeds and its outputs
-      # (counts, exit-code, sarif-file) reach the caller — a composite action
-      # that fails does not expose outputs at all. Set fail-on-findings: true
-      # to make findings block the build instead.
+      # (counts, exit-code, sarif-file) can be read by the caller. Set
+      # fail-on-findings: true to make nonzero vexes results block the build.
       env:
         CODE: ${{ steps.vexes.outputs.exit-code }}
         FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
       run: |
         if [ "$FAIL_ON_FINDINGS" = "true" ] && [ "$CODE" != "0" ]; then
-          echo "::error title=vexes::scan exited $CODE (1 = findings, 2 = incomplete/error)" >&2
+          echo "::error title=vexes::vexes exited $CODE (1 = findings, 2 = incomplete/error)" >&2
           exit "$CODE"
         fi

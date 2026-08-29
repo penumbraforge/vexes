@@ -1,26 +1,48 @@
 # Allowlists
 
-vexes ships with built-in allowlists for packages that legitimately trigger certain signals. Allowlisted packages are **downweighted, not suppressed** -- a compromised version of an allowlisted package still triggers if new dangerous patterns appear.
+vexes ships with a curated built-in exact-name set for common packages expected
+to trigger selected install-hook signals in at least some versions. Signals
+carrying the internal `knownGood` annotation are
+**downweighted, not suppressed**. This is a noise-control heuristic, not a
+guarantee that a later compromised version will be detected.
 
 ## How allowlisting works
 
-When a signal fires for an allowlisted package, it gets a `knownGood: true` evidence flag. The composite scoring engine applies a **0.2x weight multiplier** to known-good signals, reducing their contribution to the risk score by 80%.
+Selected signal paths annotate allowlisted packages with `knownGood: true`. The
+composite scoring engine applies a **0.2x weight multiplier** to signals carrying
+that annotation, reducing those signals' score contribution by 80%. The
+allowlist is not a blanket package exemption.
 
-**AST analysis always runs.** Even for known-good packages, vexes parses and inspects install scripts via the AST inspector. The findings are produced with the `knownGood` flag so scoring can downweight them, but the analysis itself is never skipped. This ensures that a compromised version of esbuild or sharp cannot hide malicious code in install scripts.
+**Inspectable inline scripts are still analyzed.** The allowlist does not skip
+the inline-script pattern pass. File-based commands such as `node install.js`
+are not opened by this stage, however, so allowlisting does not establish
+coverage of all lifecycle code.
 
 This means:
-- esbuild's legitimate postinstall is flagged at `LOW` severity instead of `HIGH`
-- If esbuild's postinstall suddenly starts accessing `process.env.AWS_SECRET_ACCESS_KEY`, the signal still fires and its severity *label* stays CRITICAL — but its contribution to the composite risk score is still downweighted 0.2x like every other known-good signal. The allowlist reduces noise; it does not boost severity for new patterns.
+- esbuild's expected install-hook case is flagged at `LOW` severity instead of
+  the non-allowlisted `MODERATE`; this is a tuning choice, not a trust verdict
+- If an allowlisted package's inspectable inline postinstall string starts
+  accessing `process.env.AWS_SECRET_ACCESS_KEY`, the pattern signal still fires
+  and its severity *label* stays CRITICAL, while its contribution to the
+  composite risk score receives the same 0.2x known-good multiplier. File-based
+  script bodies remain outside this inline stage.
 
-## Known postinstall packages
+## Curated install-hook package names
 
-These packages have install scripts for legitimate reasons (downloading platform-specific binaries, installing git hooks, etc.):
+These names are included because versions of them commonly use install hooks for
+work such as downloading platform-specific binaries or installing git hooks.
+The list is name-based, not version-specific evidence that a hook is present or
+benign in the version being analyzed:
 
 ### Build tools
-`esbuild`, `@esbuild/*`, `swc`, `@swc/core`, `lightningcss`, `@parcel/watcher`, `turbo`, `@vercel/turbo`, `vite`, `node-sass`, `sass`
+`esbuild`, selected `@esbuild/...` platform packages, `swc`, `@swc/core`,
+`lightningcss`, `@parcel/watcher`, `turbo`, `@vercel/turbo`, `vite`,
+`node-sass`, `sass`
 
 ### Native modules
-`sharp`, `@img/sharp-*`, `@img/sharp-libvips-*`, `canvas`, `better-sqlite3`, `sqlite3`, `bcrypt`, `argon2`, `fsevents`, `keytar`
+`sharp`, selected `@img/sharp-...` and `@img/sharp-libvips-...` platform
+packages, `canvas`, `better-sqlite3`, `sqlite3`, `bcrypt`, `argon2`,
+`fsevents`, `keytar`
 
 ### Build systems
 `node-gyp`, `node-pre-gyp`, `@mapbox/node-pre-gyp`, `prebuild-install`, `grpc`, `@grpc/grpc-js`, `protobufjs`, `protobuf`
@@ -38,22 +60,16 @@ These packages have install scripts for legitimate reasons (downloading platform
 
 Used for typosquat detection. A package name within Levenshtein distance 1 (4–6 chars) or 2 (7+ chars) of a popular package is flagged; names of 3 or fewer characters are never compared.
 
-### npm (~150 popular packages)
+### npm (~165 entries)
 lodash, chalk, react, axios, express, debug, tslib, commander, moment, uuid, webpack, typescript, eslint, prettier, jest, next, vue, tailwindcss, prisma, zod, pino, winston, and many more.
 
-### PyPI (~100 popular packages)
+### PyPI (~105 entries)
 requests, numpy, pandas, flask, django, scipy, matplotlib, pillow, pyyaml, cryptography, pydantic, fastapi, sqlalchemy, boto3, tensorflow, torch, pytest, black, ruff, openai, anthropic, and many more.
 
 ## Extending allowlists
 
-Currently, allowlists are built into the source code (`src/core/allowlists.js`). Future versions will support extending them via `.vexesrc.json`:
-
-```json
-{
-  "allowlists": {
-    "postinstall": ["my-internal-build-tool"]
-  }
-}
-```
-
-To modify the built-in allowlists, edit `src/core/allowlists.js` directly.
+Allowlists are currently built into `src/core/allowlists.js`; configuration-file
+extensions are not implemented. A fork can change the source list, while normal
+users can disable a signal or explicitly ignore reviewed findings through
+configuration. Those choices have broader semantics than adding a trusted
+package, so review them as policy.

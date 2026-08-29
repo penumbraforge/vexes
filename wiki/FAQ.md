@@ -2,35 +2,39 @@
 
 ## General
 
-### Why zero dependencies?
+### Why zero external runtime npm dependencies?
 
-The dependency chain IS the attack surface. A security tool that depends on 500 npm packages can itself be compromised through those dependencies. vexes vendors acorn (the JS parser) and uses only Node.js built-in modules (`node:sqlite`, `node:zlib`, `node:fs`, `node:crypto`, `fetch`).
+Vexes has zero external runtime npm dependencies. It vendors Acorn (the JS
+parser) and otherwise uses Node.js built-in modules and `fetch`. That keeps its
+npm dependency surface small, but does not make the tool itself risk-free.
 
-### Why does vexes require Node.js >= 22.5.0?
+### Why does vexes require Node.js >= 22.13.0?
 
-vexes uses `node:sqlite` (DatabaseSync) for caching, which was stabilized in Node.js 22.5.0. It also uses the built-in `fetch` API (stable since Node.js 21).
+vexes uses `node:sqlite` (`DatabaseSync`) for caching. The module first appeared
+in Node.js 22.5.0 behind `--experimental-sqlite`; 22.13.0 is the first 22.x
+release where it can be used without that flag. Built-in `fetch` is also used.
 
 ### Is this different from `npm audit`?
 
-Yes. `npm audit` only checks npm packages against the GitHub Advisory Database. vexes:
-- Scans **10 ecosystems** (npm incl. pnpm/Yarn, PyPI, Cargo, Go, Ruby, PHP, NuGet, Java, Hex, Pub) — deep 4-layer analysis is npm/PyPI only; the rest are OSV-and-metadata
+They overlap on npm vulnerability reporting, but vexes also:
+- Scans **10 ecosystems** (npm incl. pnpm/Yarn, PyPI, Cargo, Go, Ruby, PHP,
+  NuGet, Java, Hex, Pub). Analysis depth varies: dependency-staging and
+  attestation checks are npm-specific, bounded file sampling supports npm/PyPI,
+  and the remaining ecosystems use OSV scanning.
 - Uses **OSV.dev** which aggregates from multiple advisory sources
-- Performs **behavioral analysis** (maintainer changes, capability escalation, typosquatting)
-- Can **inspect actual source code** via tarball analysis
-- Provides **pre-install protection** via the guard command
+- Surfaces **heuristic evidence** (publishing-account changes, capability
+  escalation, and name similarity)
+- Can inspect a bounded selected-file sample from npm/PyPI tarballs
+- Provides an experimental public-npm assessment/install boundary with lifecycle scripts disabled
 
-### How does vexes compare to Socket, Snyk, or Dependabot?
+### How does vexes compare to other dependency tools?
 
-| Feature | vexes | Socket | Snyk | Dependabot |
-|---------|-------|--------|------|------------|
-| Zero dependencies | Yes | No | No | N/A |
-| Self-hosted | Yes | Cloud | Cloud | GitHub |
-| Behavioral analysis | Yes | Yes | No | No |
-| AST code inspection | Yes | Yes | No | No |
-| Lockfile diffing | Yes | No | No | No |
-| Cross-ecosystem | Yes (10) | JS/Python | Many | Many |
-| Cost | Free | Paid | Paid | Free |
-| SARIF output | Yes | Yes | Yes | N/A |
+Vexes' present niche is a small local CLI that combines OSV lookup with
+inspectable heuristics and emits JSON/SARIF without external runtime npm
+dependencies. It is experimental and does not have the production evidence,
+maintained intelligence, policy breadth, hosted workflow, or support guarantees
+of mature commercial and platform tools. Competitor capabilities and pricing
+change frequently, so this project does not publish an uncited feature matrix.
 
 ## Scanning
 
@@ -38,14 +42,17 @@ Yes. `npm audit` only checks npm packages against the GitHub Advisory Database. 
 
 Exit code 2 means the scan was **incomplete** -- some packages could not be checked. This happens when:
 - OSV.dev API is down or rate-limiting
-- Lockfile parsing failed
+- Lockfile parsing failed or its schema is unsupported
+- Only a partial manifest fallback was available, or a replaced Go module was excluded
 - Network timeout
 
-vexes treats an incomplete scan as an error because silently reporting clean when you can't verify safety is dangerous.
+vexes treats an incomplete scan as an error because a partial advisory check
+must not be reported as clean.
 
 ### Can I scan without internet access?
 
-Partially. If you have a populated cache (`~/.cache/vexes/`), you can use `--cached` to scan using only cached results. But the initial population requires internet access to query OSV.dev and registry APIs.
+Partially. `--cached` accepts stale cache entries without refreshing them, but a
+cache miss still requires OSV access. It is not a guaranteed offline mode.
 
 ### Why are some vulnerabilities marked CRITICAL with no CVSS score?
 
@@ -59,31 +66,43 @@ UNKNOWN means vexes could not fetch the package's registry metadata (network err
 
 ### Why is esbuild flagged?
 
-esbuild has a legitimate postinstall script that downloads platform-specific binaries. vexes flags it at **LOW** severity (not HIGH) because it's in the known-good allowlist. The signal is visible in verbose mode but doesn't contribute significantly to the risk score.
+esbuild is a curated exact-name example of an expected install hook. Its
+install-script-presence signal is labeled **LOW**, remains visible in verbose
+mode, and receives the documented 0.2x allowlist multiplier. That entry is a
+tuning choice, not a security endorsement of any package version.
 
 ### What are "phantom dependencies"?
 
-A phantom dependency is a brand-new package (< 7 days old on the registry) that was added as a dependency. In the axios RAT attack, `plain-crypto-js` was a phantom dependency -- created hours before being added to the compromised axios version. Phantom dependencies are flagged at CRITICAL severity.
+This legacy signal name means a dependency added by the analyzed npm release
+relative to its previous published version is very new on the registry, or has
+sparse maintainer/version metadata. It does not mean the dependency was newly
+added to the project being scanned. Newness is a review signal, not evidence
+that the dependency is malicious.
 
 ## Guard
 
 ### Does guard actually run my install?
 
-Only if the analysis passes. Guard:
-1. Takes a lockfile snapshot
-2. Runs a dry-run install (`--package-lock-only --ignore-scripts`)
-3. Diffs the lockfile
-4. Analyzes new/changed packages
-5. **Restores the original lockfile**
-6. Only runs the real install if the analysis is clean
+Guard is experimental and public-registry npm-only. It:
 
-If guard blocks the install, your lockfile is unchanged and nothing was installed.
+1. Copies the current manifest and lockfile into a disposable resolver project
+2. Runs npm there in lockfile-only mode with lifecycle scripts disabled
+3. Diffs individual lockfile occurrences and validates registry identity fields
+4. Checks exact proposed versions against OSV, registry metadata, and behavioral signals
+5. In human mode, applies an approved manifest/lockfile and installs with `--ignore-scripts`
+6. Verifies the final manifest plus occurrence/version/resolved URL/integrity fields
+
+JSON mode stops after assessment and does not install. If npm fails after
+approval, `package.json` and `package-lock.json` are restored, but `node_modules`
+may be partially modified. Guard does not independently hash installed bytes.
 
 ### Can I bypass guard?
 
-- For HIGH-risk warnings: use `--force` or type `y` at the interactive prompt
-- For CRITICAL findings: guard always blocks. Run the install command directly to bypass.
-- To remove guard entirely: `vexes guard --uninstall`
+- For HIGH heuristic evidence: use `--force`; HIGH can also be approved interactively
+- For known advisories, CRITICAL evidence, or incomplete analysis: guard always blocks internally. Running npm directly bypasses guard.
+- To remove a wrapper installed by an older release: `vexes guard --uninstall`
+
+Automatic `guard --setup` is currently disabled; invoke guard explicitly.
 
 ## Troubleshooting
 
@@ -93,7 +112,9 @@ The SQLite cache couldn't be opened. This usually means:
 - The cache directory doesn't exist and can't be created (permissions)
 - The cache database is corrupted
 
-vexes continues scanning without caching. To fix: `rm -rf ~/.cache/vexes` and let vexes recreate it.
+vexes continues scanning without caching. After stopping running vexes
+processes, move the cache directory aside (or delete only that directory) and
+let vexes recreate it; keep the moved copy until the new cache opens normally.
 
 ### "lockfiles found but all failed to parse"
 
@@ -103,15 +124,29 @@ Your lockfile exists but is malformed JSON or an unsupported format version. Che
 
 ### Scans are slow
 
-First scan fetches all data from APIs. Subsequent scans use the cache (1-hour TTL for advisories). To speed things up:
+An uncached scan queries OSV; analysis also queries supported registry APIs.
+Subsequent runs can reuse the cache (1-hour default TTL for advisories). To
+reduce work:
 - Use `--ecosystem npm` to scan only one ecosystem
-- Use `--cached` to skip freshness checks
-- Use `--severity critical` to reduce output processing
+- Use `--cached` to accept stale hits without a freshness check (misses still use the network)
 
-### Why can't I disable KNOWN_COMPROMISED?
+### Can I disable an analysis signal?
 
-Four critical signals are undisableable by design: `KNOWN_COMPROMISED`, `PHANTOM_DEPENDENCY`, `CIRCULAR_STAGING`, and `CAPABILITY_ESCALATION`. These detect active supply chain attacks. Allowing them to be disabled via `.vexesrc.json` would let a malicious repo config suppress all detection. If you need to ignore a specific known vulnerability, use the `ignore` field in config instead.
+Yes. Every documented analysis signal can be set to `"off"` under
+`analyze.signals`. The legacy `KNOWN_COMPROMISED` switch also controls
+`KNOWN_MALICIOUS` and `KNOWN_VULNERABILITY` when their own switches are absent.
+Because project-local config can suppress evidence, review `.vexesrc.json` in
+security-sensitive repositories. The separate top-level `ignore` field accepts
+an explicitly reviewed advisory, package, or package-version finding. Pass
+`--no-project-config` when the checkout should not choose report policy. Guard
+clears configured ignores and signal suppression before its install decision.
+For reproducible CI, add `--no-user-config` so runner-account policy cannot
+change the result either.
 
 ### Does vexes support pnpm and Yarn?
 
-Yes. vexes automatically discovers and parses `pnpm-lock.yaml` (v6 and v9) and `yarn.lock` (v1 classic and v2+ Berry format) alongside `package-lock.json`. All three are treated as npm-ecosystem lockfiles and queried against the same OSV database.
+Yes. vexes automatically discovers `pnpm-lock.yaml` (v6/v9 forms) and
+`yarn.lock` (v1 classic/v2+ Berry forms) alongside `package-lock.json` and
+best-effort extracts dependency records. All three are treated as npm-ecosystem
+inputs for OSV queries. pnpm lockfile majors other than 6 or 9 fail visibly;
+they are not guessed as an empty dependency set.

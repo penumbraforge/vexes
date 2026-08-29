@@ -2,280 +2,711 @@
 /**
  * vexes detection benchmark.
  *
- * Measures three things, none of which download malware:
+ * Part A identifies exact advisories on historical malicious versions without
+ * downloading their packages. Part B analyzes inert, locally-authored technique
+ * fixtures and negative controls. Part C samples digest-pinned, currently
+ * low-risk npm controls without executing package code.
  *
- *   Part A — KNOWN-BAD FLAGGING. Lockfiles pinning historical malicious
- *   versions (all removed from npm, all in OSV). `vexes scan` must flag
- *   each from its OSV advisory. No package is downloaded — a lockfile is
- *   just text. This gates the exit code: flagging a known compromise is
- *   the one thing vexes must never regress on.
- *
- *   Part B — TECHNIQUE FIXTURES. Attack techniques (env exfil, downloader,
- *   payload decode, typosquat, capability escalation) re-authored by us as
- *   inert source strings and fed through analyzePackage in-process. These
- *   are our own benign code. Reports per-technique which signal families
- *   fired. No gate — the heuristic layer evolves on purpose.
- *
- *   Part C — BENIGN FALSE-POSITIVE RATE. Popular real packages via
- *   `vexes inspect --deep` (tarball analyzed as text, never executed).
- *   FPs count as any CRITICAL or HIGH signal. Deliberately includes one
- *   postinstall-carrying package (esbuild) as a stressor. Reports only.
- *
- * Usage:
- *   node benchmark/run.mjs                 # all parts, markdown to stdout
- *   node benchmark/run.mjs --part a        # just known-bad flagging
- *   node benchmark/run.mjs --json          # machine-readable result
- *   node benchmark/run.mjs --report f.md   # also write markdown to a file
+ * Every selected part is a gate. Execution errors exit 2 and complete metric
+ * regressions exit 1. Expected bounded sampling stays status INCOMPLETE but
+ * exits 0 unless --require-complete is explicitly requested.
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFileSync } from 'node:fs';
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const THIS_FILE = fileURLToPath(import.meta.url);
+export const ROOT = join(dirname(THIS_FILE), '..');
 const VEXES = join(ROOT, 'bin', 'vexes.js');
-const manifest = JSON.parse(readFileSync(join(ROOT, 'benchmark', 'manifest.json'), 'utf8'));
+export const defaultManifest = JSON.parse(
+  readFileSync(join(ROOT, 'benchmark', 'manifest.json'), 'utf8')
+);
 
-const args = process.argv.slice(2);
-const wantPart = (p) => !args.includes('--part') || args[args.indexOf('--part') + 1] === p;
-const asJSON = args.includes('--json');
-const reportFile = args.includes('--report') ? args[args.indexOf('--report') + 1] : null;
+const ADVISORY_SIGNALS = new Set([
+  'KNOWN_MALICIOUS',
+  'KNOWN_VULNERABILITY',
+  'OSV_MATCH',
+  'KNOWN_COMPROMISED', // older output remains benchmark-readable
+]);
+const LOUD = new Set(['CRITICAL', 'HIGH']);
+const PART_NAMES = Object.freeze({ a: 'knownBad', b: 'techniques', c: 'benignLive' });
 
-// ── helpers �─────────────────────────────────────────────────────────────
-
-function runVexes(cliArgs) {
-  const r = spawnSync(process.execPath, [VEXES, ...cliArgs], {
-    encoding: 'utf8',
-    timeout: 120_000,
-  });
-  if (!r.stdout) return null;
-  try {
-    return JSON.parse(r.stdout);
-  } catch {
-    return null;
+export function parseBenchmarkArgs(argv = []) {
+  const partIndex = argv.indexOf('--part');
+  const part = partIndex >= 0 ? argv[partIndex + 1] : null;
+  if (partIndex >= 0 && !PART_NAMES[part]) {
+    throw new Error(`--part must be one of a, b, or c (got ${part || 'nothing'})`);
   }
+  const reportIndex = argv.indexOf('--report');
+  if (reportIndex >= 0 && !argv[reportIndex + 1]) {
+    throw new Error('--report requires a file path');
+  }
+  return {
+    selectedParts: part ? [part] : ['a', 'b', 'c'],
+    asJSON: argv.includes('--json'),
+    reportFile: reportIndex >= 0 ? argv[reportIndex + 1] : null,
+    requireComplete: argv.includes('--require-complete'),
+  };
 }
 
-// ── Part A: known-bad flagging via OSV ──────────────────────────────────
+function isExpectedSampledDeepReport(report) {
+  if (!report || report.command !== 'inspect' || report.complete !== false ||
+      report.result?.complete !== false) return false;
+  const coverage = report.assessment?.deepInspection?.coverage;
+  const stage = report.stages?.deep;
+  const inspected = report.assessment?.tarballInspected;
+  const warnings = report.warnings || [];
+  const expectedWarning = warning =>
+    /^deep inspection: bounded source sampling inspected .*not full-package coverage$/i.test(warning);
+  return stage?.requested === true && stage.complete === false &&
+    stage.packageComplete === false && coverage?.mode === 'bounded-source-sampling' &&
+    coverage.packageComplete === false && Array.isArray(inspected) && inspected.length > 0 &&
+    warnings.length > 0 && warnings.every(expectedWarning);
+}
 
-function runPartA() {
+/**
+ * Invoke vexes and validate its machine contract. Exit 0 (clean) and exit 1
+ * (findings) are both valid only when parseable JSON explicitly says the run
+ * was complete. Part C may narrowly accept the inspect command's explicit
+ * bounded-sampling contract as successful execution while retaining
+ * evidenceComplete=false; no other incomplete contract is accepted.
+ */
+export function runVexes(cliArgs, { spawn = spawnSync, acceptSampledDeep = false } = {}) {
+  let child;
+  try {
+    child = spawn(process.execPath, [VEXES, ...cliArgs], {
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+  } catch (error) {
+    return {
+      report: null,
+      status: null,
+      stderr: '',
+      errors: [`vexes process error: ${error.message}`],
+      errorCount: 1,
+      complete: false,
+      evidenceComplete: false,
+      sampledEvidence: false,
+    };
+  }
+  const errors = [];
+  let report = null;
+
+  if (child.error) errors.push(`vexes process error: ${child.error.message}`);
+  if (child.signal) errors.push(`vexes terminated by ${child.signal}`);
+  if (!child.stdout?.trim()) {
+    errors.push('vexes produced no JSON output');
+  } else {
+    try {
+      report = JSON.parse(child.stdout);
+    } catch (error) {
+      errors.push(`vexes produced invalid JSON: ${error.message}`);
+    }
+  }
+
+  const sampledEvidence = acceptSampledDeep && isExpectedSampledDeepReport(report);
+  if (child.status !== 0 && child.status !== 1 && !(sampledEvidence && child.status === 2)) {
+    errors.push(`vexes exited ${child.status ?? 'without a status'}`);
+  }
+  if (report && (report.complete !== true || report.result?.complete !== true) && !sampledEvidence) {
+    errors.push('vexes report is incomplete or omits an explicit complete=true contract');
+  }
+
+  return {
+    report,
+    status: child.status ?? null,
+    stderr: String(child.stderr || '').trim(),
+    errors: [...new Set(errors)],
+    errorCount: new Set(errors).size,
+    complete: errors.length === 0,
+    evidenceComplete: report?.complete === true && report?.result?.complete === true,
+    sampledEvidence,
+  };
+}
+
+function packageNameOfFinding(finding) {
+  return typeof finding?.package === 'string'
+    ? finding.package
+    : finding?.package?.name || finding?.name;
+}
+
+function identifiersOfFinding(finding) {
+  return [
+    finding?.id,
+    finding?.displayId,
+    ...(Array.isArray(finding?.advisories) ? finding.advisories : []),
+    ...(Array.isArray(finding?.aliases) ? finding.aliases : []),
+  ].filter(value => typeof value === 'string' && value.trim().length > 0);
+}
+
+export function runPartA({ manifest = defaultManifest, runner = runVexes } = {}) {
   const results = [];
   for (const entry of manifest.knownBad) {
     const dir = mkdtempSync(join(tmpdir(), 'vexes-bench-a-'));
-    // Lockfiles are data, not code — pinning a removed malicious version
-    // here downloads nothing and runs nothing.
-    const lockfile = {
-      name: 'vexes-benchmark-known-bad',
-      version: '1.0.0',
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        [`node_modules/${entry.name}`]: {
-          version: entry.version,
-          resolved: `https://registry.npmjs.org/${entry.name}/-/${entry.name}-${entry.version}.tgz`,
+    try {
+      const lockfile = {
+        name: 'vexes-benchmark-known-bad',
+        version: '1.0.0',
+        lockfileVersion: 3,
+        requires: true,
+        packages: {
+          '': { name: 'vexes-benchmark-known-bad', version: '1.0.0' },
+          [`node_modules/${entry.name}`]: {
+            version: entry.version,
+            resolved: `https://registry.npmjs.org/${entry.name}/-/${entry.name}-${entry.version}.tgz`,
+          },
         },
-      },
-      dependencies: {
-        [entry.name]: { version: entry.version },
-      },
-    };
-    writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(lockfile, null, 2));
+        dependencies: { [entry.name]: { version: entry.version } },
+      };
+      writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(lockfile, null, 2));
 
-    // --severity low: Part A measures whether the OSV intelligence layer
-    // DETECTS the compromise. Some historical incidents (node-ipc ProTest)
-    // carry LOW CVSS severities, and the default `moderate` display filter
-    // would hide them — that's a threshold choice, not a detection miss.
-    const report = runVexes(['scan', '--path', dir, '--json', '--severity', 'low']);
-    // scan findings carry `package` as a plain string name.
-    const findings = (report?.findings || []).filter(
-      (f) => (typeof f.package === 'string' ? f.package : f.package?.name || f.name) === entry.name
-    );
-    // "Flagged" — any loud signal on the package. "Hit" — the SPECIFIC advisory
-    // from the manifest is matched. A CRITICAL from some unrelated advisory is
-    // a flag, not a correct identification of this compromise; the gate is on
-    // the identity match, otherwise the score overclaims.
-    const flagged =
-      findings.some((f) => f.signal === 'KNOWN_COMPROMISED') ||
-      findings.some((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH');
-    const advisoryIds = new Set(findings.flatMap((f) => [
-      f.id, f.displayId, ...(f.advisories || []), ...(f.aliases || []),
-    ].filter(Boolean)));
-    const hit = advisoryIds.has(entry.advisory);
+      const invocation = runner([
+        'scan', '--path', dir, '--json', '--severity', 'low',
+        '--no-project-config', '--no-user-config',
+      ]);
+      const findings = invocation.complete
+        ? (invocation.report?.findings || []).filter(f => packageNameOfFinding(f) === entry.name)
+        : [];
+      const advisoryIds = new Set(findings.flatMap(identifiersOfFinding));
+      const hit = invocation.complete && advisoryIds.has(entry.advisory);
+      const flagged = invocation.complete && findings.some(f =>
+        ADVISORY_SIGNALS.has(f.signal) || LOUD.has(String(f.severity || '').toUpperCase())
+      );
 
-    results.push({ ...entry, hit, flagged, signals: findings.map((f) => f.signal) });
+      results.push({
+        ...entry,
+        complete: invocation.complete,
+        hit,
+        flagged,
+        signals: findings.map(f => f.signal),
+        errors: invocation.errors,
+        errorCount: invocation.errorCount,
+      });
+    } catch (error) {
+      results.push({
+        ...entry,
+        complete: false,
+        hit: false,
+        flagged: false,
+        signals: [],
+        errors: [`benchmark fixture failed: ${error.message}`],
+        errorCount: 1,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
   return results;
 }
 
-// ── Part B: technique fixtures, in-process ──────────────────────────────
+function evidenceMatches(actual, expected) {
+  if (Array.isArray(actual)) return actual.some(value => evidenceMatches(value, expected));
+  if (expected && typeof expected === 'object') {
+    if (!actual || typeof actual !== 'object') return false;
+    return Object.entries(expected).every(([key, value]) => evidenceMatches(actual[key], value));
+  }
+  return actual === expected;
+}
 
-async function runPartB() {
-  const { analyzePackage } = await import(join(ROOT, 'src', 'analysis', 'signals.js'));
+export function signalMatchesCondition(signal, condition) {
+  if (typeof condition === 'string') return signal.signal === condition;
+  if (!condition || signal.signal !== condition.signal) return false;
+  if (condition.severity && signal.severity !== condition.severity) return false;
+  if (condition.evidence && !evidenceMatches(signal.evidence, condition.evidence)) return false;
+  return true;
+}
+
+function describeCondition(condition) {
+  if (typeof condition === 'string') return condition;
+  const evidence = Object.entries(condition.evidence || {})
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(',');
+  return `${condition.signal}${evidence ? `(${evidence})` : ''}`;
+}
+
+export async function runPartB({ manifest = defaultManifest, analyzer = null } = {}) {
+  const analyze = analyzer || (await import(join(ROOT, 'src', 'analysis', 'signals.js'))).analyzePackage;
   const results = [];
-  for (const t of manifest.techniques) {
-    const metadata = {
-      name: t.name,
-      latestVersion: '2.0.0',
-      previousVersion: '1.0.0',
-      maintainers: [{ name: 'author' }],
-      latestPublisher: 'author',
-      previousPublisher: 'author',
-      maintainerChanged: false,
-      hasInstallScripts: Object.keys(t.scripts).length > 0,
-      installScripts: t.scripts,
-      previousInstallScripts: t.previousInstallScripts,
-      scripts: {},
-      dependencies: [],
-      addedDeps: [],
-      removedDeps: [],
-      latestPublishTime: null,
-      previousPublishTime: null,
-      publishIntervalMs: null,
-      packageAgeMs: 400 * 24 * 60 * 60 * 1000,
-      majorJump: 0,
-      dormancyMs: null,
-      versionCount: 3,
-      repository: `https://github.com/example/${t.name}`,
-      license: 'MIT',
-    };
 
-    const { signals } = await analyzePackage(metadata, null, { ecosystem: 'npm' });
-    // npm is required so the typosquat fixture checks against the npm
-    // popular-name set. addedDeps is empty, so Layer 2 makes no registry
-    // fetches — nothing here touches the network.
-    const fired = new Set(signals.map((s) => s.signal));
-    // ATTACK fixtures (expectAnyOf non-empty) are detected when any expected
-    // signal family fires. CONTROL fixtures (expectAnyOf empty) are NOT
-    // "detected" — they PASS when nothing dangerous fired. Conflating the two
-    // is how a benchmark claims 6/6 when it ran 5 attacks + 1 negative.
-    const isControl = t.expectAnyOf.length === 0;
-    const loudSignals = signals.filter((s) => s.severity === 'CRITICAL' || s.severity === 'HIGH');
-    const hit = isControl
-      ? (t.expectNone || []).every((s) => !fired.has(s)) && loudSignals.length === 0
-      : t.expectAnyOf.some((s) => fired.has(s));
-    const strayFP = (t.expectNone || []).filter((s) => fired.has(s));
+  for (const fixture of manifest.techniques) {
+    const isControl = fixture.kind === 'control';
+    try {
+      const metadata = {
+        name: fixture.name,
+        latestVersion: '2.0.0',
+        previousVersion: '1.0.0',
+        maintainers: [{ name: 'author' }],
+        latestPublisher: 'author',
+        previousPublisher: 'author',
+        maintainerChanged: false,
+        hasInstallScripts: Object.keys(fixture.scripts).length > 0,
+        installScripts: fixture.scripts,
+        previousInstallScripts: fixture.previousInstallScripts,
+        scripts: fixture.scripts,
+        dependencies: [],
+        addedDeps: [],
+        removedDeps: [],
+        latestPublishTime: null,
+        previousPublishTime: null,
+        publishIntervalMs: null,
+        packageAgeMs: 400 * 24 * 60 * 60 * 1000,
+        majorJump: 0,
+        dormancyMs: null,
+        versionCount: 3,
+        repository: `https://github.com/example/${fixture.name}`,
+        license: 'MIT',
+      };
+      const analyzed = await analyze(metadata, null, { ecosystem: 'npm' });
+      const signals = analyzed?.signals || [];
+      const warnings = analyzed?.warnings || [];
+      const errors = warnings.map(w => `analysis warning: ${w}`);
+      if (!analyzed || !Array.isArray(analyzed.signals)) {
+        errors.push('analyzer returned no signals array');
+      }
 
-    results.push({
-      id: t.id,
-      technique: t.technique,
-      isControl,
-      hit,
-      expectAnyOf: t.expectAnyOf,
-      fired: [...fired],
-      loudSignals: loudSignals.map((s) => s.signal),
-      strayFP,
-    });
+      const expected = fixture.expectAll || [];
+      const forbidden = fixture.expectNone || [];
+      const missing = expected.filter(condition =>
+        !signals.some(signal => signalMatchesCondition(signal, condition))
+      );
+      const unexpected = forbidden.filter(condition =>
+        signals.some(signal => signalMatchesCondition(signal, condition))
+      );
+      const loudSignals = signals.filter(s => LOUD.has(String(s.severity || '').toUpperCase()));
+      const complete = errors.length === 0;
+      const hit = complete && missing.length === 0 && unexpected.length === 0 &&
+        (!isControl || loudSignals.length === 0);
+
+      results.push({
+        id: fixture.id,
+        technique: fixture.technique,
+        isControl,
+        complete,
+        hit,
+        expected: expected.map(describeCondition),
+        forbidden: forbidden.map(describeCondition),
+        missing: missing.map(describeCondition),
+        unexpected: unexpected.map(describeCondition),
+        fired: [...new Set(signals.map(s => s.signal))],
+        firedEvidence: signals.map(s => ({
+          signal: s.signal,
+          severity: s.severity,
+          pattern: s.evidence?.pattern,
+          capability: s.evidence?.capability,
+          capabilities: s.evidence?.capabilities,
+        })),
+        loudSignals: loudSignals.map(s => `${s.signal}(${s.severity})`),
+        errors,
+        errorCount: errors.length,
+      });
+    } catch (error) {
+      results.push({
+        id: fixture.id,
+        technique: fixture.technique,
+        isControl,
+        complete: false,
+        hit: false,
+        expected: (fixture.expectAll || []).map(describeCondition),
+        forbidden: (fixture.expectNone || []).map(describeCondition),
+        missing: (fixture.expectAll || []).map(describeCondition),
+        unexpected: [],
+        fired: [],
+        firedEvidence: [],
+        loudSignals: [],
+        errors: [`analyzer failed: ${error.message}`],
+        errorCount: 1,
+      });
+    }
   }
   return results;
 }
 
-// Part C — benign false-positive rate. `vexes inspect <name> --deep` fetches
-// registry metadata + the tarball and AST-inspects it as text; it does not
-// execute package code (sandboxing is an explicit, separate flag we never pass).
-function runPartC() {
-  const results = [];
-  for (const entry of manifest.benignLive) {
-    const report = runVexes(['inspect', entry.name, '--deep', '--json']);
-    if (!report) {
-      results.push({ ...entry, error: true, fp: null });
+function artifactErrors(metadata, entry) {
+  const errors = [];
+  if (!metadata) return ['npm metadata unavailable'];
+  if (metadata.metadataComplete !== true || metadata.requestedVersionFound !== true ||
+      metadata.anchoredToInstalled !== true || metadata.latestVersion !== entry.version) {
+    errors.push(metadata.anchorError || `metadata was not anchored to ${entry.name}@${entry.version}`);
+  }
+  for (const field of ['tarball', 'integrity', 'shasum']) {
+    if (!entry[field]) errors.push(`manifest omits pinned ${field}`);
+    else if (!metadata[field]) errors.push(`registry metadata omits ${field}`);
+    else if (metadata[field] !== entry[field]) errors.push(`${field} does not match pinned manifest value`);
+  }
+  return errors;
+}
+
+function deepInspectionErrors(report, entry) {
+  const errors = [];
+  const actualName = report?.package?.name || report?.assessment?.name;
+  const actualVersion = report?.package?.version || report?.assessment?.version;
+  if (actualName !== entry.name || actualVersion !== entry.version) {
+    errors.push(`inspect reported ${actualName || '?'}@${actualVersion || '?'}, expected ${entry.name}@${entry.version}`);
+  }
+  if (!Array.isArray(report?.assessment?.tarballInspected) || report.assessment.tarballInspected.length === 0) {
+    errors.push('deep tarball inspection produced no inspected-file evidence');
+  }
+  const artifact = report?.assessment?.registryArtifact;
+  if (!artifact) {
+    errors.push('inspect report omitted registry artifact identity');
+  } else {
+    for (const field of ['tarball', 'integrity', 'shasum']) {
+      if (artifact[field] !== entry[field]) {
+        errors.push(`inspect report ${field} does not match pinned manifest value`);
+      }
+    }
+  }
+  const coverage = report?.assessment?.deepInspection?.coverage;
+  if (coverage?.digestVerified !== true) {
+    errors.push('deep tarball bytes were not verified against the pinned registry digest');
+  }
+  const deepWarnings = (report?.warnings || []).filter(w => /(?:--deep|tarball).*(?:fail|skip|could not)/i.test(w));
+  errors.push(...deepWarnings.map(w => `inspect warning: ${w}`));
+  return errors;
+}
+
+function rawAdvisoryAssessment(report, entry) {
+  if (!Array.isArray(report?.findings)) {
+    return {
+      advisories: [],
+      blocking: [],
+      errors: ['inspect report omitted the raw findings array'],
+    };
+  }
+
+  const advisories = [];
+  const errors = [];
+  for (let index = 0; index < report.findings.length; index++) {
+    const finding = report.findings[index];
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+      errors.push(`inspect finding ${index} is not an object`);
       continue;
     }
-    const s = report.summary || {};
-    const signals = report.assessment?.signals || [];
-    // FP = any HIGH/CRITICAL signal, heuristic or OSV-derived. The envelope's
-    // `summary` counts only OSV advisories, so heuristic HIGH/CRITICAL signals
-    // would be invisible there — read the signals' severities directly.
-    const loud = signals.filter((x) => x.severity === 'CRITICAL' || x.severity === 'HIGH');
+
+    const name = packageNameOfFinding(finding);
+    const version = finding.version || finding.package?.version;
+    const ids = [...new Set(identifiersOfFinding(finding))];
+    const severity = String(finding.severity || finding.severityLevel?.level || '').toUpperCase();
+    if (name !== entry.name || version !== entry.version) {
+      errors.push(`inspect finding ${index} is not anchored to ${entry.name}@${entry.version}`);
+      continue;
+    }
+    if (ids.length === 0) {
+      errors.push(`inspect finding ${index} omitted an advisory ID`);
+      continue;
+    }
+    if (!['CRITICAL', 'HIGH', 'MODERATE', 'LOW'].includes(severity)) {
+      errors.push(`inspect finding ${ids[0]} omitted a recognized advisory severity`);
+      continue;
+    }
+    advisories.push({ ids, severity });
+  }
+
+  return {
+    advisories,
+    blocking: advisories.filter(advisory => LOUD.has(advisory.severity)),
+    errors,
+  };
+}
+
+export async function runPartC({
+  manifest = defaultManifest,
+  runner = runVexes,
+  metadataFetcher = null,
+} = {}) {
+  const fetchMetadata = metadataFetcher ||
+    (await import(join(ROOT, 'src', 'advisories', 'npm-registry.js'))).fetchNpmMetadata;
+  const results = [];
+
+  for (const entry of manifest.benignLive) {
+    let metadata;
+    try {
+      metadata = await fetchMetadata(entry.name, entry.version);
+    } catch (error) {
+      results.push({
+        ...entry,
+        complete: false,
+        fp: null,
+        signals: [],
+        loudSignals: [],
+        errors: [`npm metadata fetch failed: ${error.message}`],
+        errorCount: 1,
+      });
+      continue;
+    }
+
+    const errors = artifactErrors(metadata, entry);
+    if (errors.length > 0) {
+      results.push({
+        ...entry,
+        complete: false,
+        fp: null,
+        signals: [],
+        loudSignals: [],
+        errors,
+        errorCount: errors.length,
+      });
+      continue;
+    }
+
+    let invocation;
+    try {
+      invocation = runner(
+        ['inspect', `${entry.name}@${entry.version}`, '--deep', '--json', '--no-project-config', '--no-user-config'],
+        { acceptSampledDeep: true }
+      );
+    } catch (error) {
+      invocation = {
+        complete: false,
+        report: null,
+        errors: [`vexes invocation failed: ${error.message}`],
+        errorCount: 1,
+        evidenceComplete: false,
+        sampledEvidence: false,
+      };
+    }
+    errors.push(...(invocation?.errors || ['vexes runner returned no error contract']));
+    const advisoryAssessment = rawAdvisoryAssessment(invocation?.report, entry);
+    if (invocation?.complete) {
+      errors.push(...deepInspectionErrors(invocation.report, entry));
+      errors.push(...advisoryAssessment.errors);
+      if (!Array.isArray(invocation.report?.assessment?.signals)) {
+        errors.push('inspect report omitted the assessment signals array');
+      }
+    }
+
+    const signals = Array.isArray(invocation?.report?.assessment?.signals)
+      ? invocation.report.assessment.signals
+      : [];
+    const advisorySignals = signals.filter(s => ADVISORY_SIGNALS.has(s.signal));
+    const loud = signals.filter(s =>
+      !ADVISORY_SIGNALS.has(s.signal) && LOUD.has(String(s.severity || '').toUpperCase())
+    );
+    const complete = errors.length === 0;
+    const coverage = invocation?.report?.assessment?.deepInspection?.coverage || null;
+
     results.push({
       ...entry,
-      fp: loud.length > 0,
-      severities: { critical: s.critical, high: s.high, moderate: s.moderate, low: s.low },
-      signals: signals.map((x) => x.signal),
-      loudSignals: loud.map((x) => `${x.signal}(${x.severity})`),
+      complete,
+      fp: complete ? loud.length > 0 : null,
+      currentBlockingEvidence: complete ? advisoryAssessment.blocking.length > 0 : null,
+      signals: signals.map(s => s.signal),
+      loudSignals: loud.map(s => `${s.signal}(${s.severity})`),
+      advisorySignals: advisorySignals.map(s => `${s.signal}(${s.severity})`),
+      advisories: advisoryAssessment.advisories.map(advisory =>
+        `${advisory.ids[0]}(${advisory.severity})`
+      ),
+      blockingAdvisories: advisoryAssessment.blocking.map(advisory =>
+        `${advisory.ids[0]}(${advisory.severity})`
+      ),
+      blockingAdvisoryIds: [...new Set(advisoryAssessment.blocking.flatMap(a => a.ids))],
+      artifactVerified: complete && coverage?.digestVerified === true,
+      inspectedFiles: invocation?.report?.assessment?.tarballInspected?.length || 0,
+      evidenceComplete: invocation?.evidenceComplete === true && coverage?.packageComplete === true,
+      sampledEvidence: invocation?.sampledEvidence === true || coverage?.mode === 'bounded-source-sampling',
+      coverage,
+      errors: [...new Set(errors)],
+      errorCount: new Set(errors).size,
     });
   }
   return results;
 }
 
-// ── reporting ───────────────────────────────────────────────────────────
+function errorsIn(results) {
+  return results.reduce((count, result) => count + (result.errorCount || result.errors?.length || 0), 0);
+}
 
-function summarize([a, b, c]) {
-  const aHit = a.filter((r) => r.hit).length;
-  const aFlagged = a.filter((r) => r.flagged).length;
-  const attacks = b.filter((r) => !r.isControl);
-  const controls = b.filter((r) => r.isControl);
-  const bHit = attacks.filter((r) => r.hit).length;
-  const bControlsClean = controls.filter((r) => r.hit).length;
-  const cFP = c.filter((r) => r.fp).length;
-  const cErr = c.filter((r) => r.error).length;
-  const lines = [];
-
-  lines.push(`# vexes detection benchmark`);
-  lines.push('');
-  lines.push(`## Part A — known-bad identification (OSV) — ${aHit}/${a.length} advisory-matched (${aFlagged}/${a.length} flagged at HIGH+)`);
-  lines.push('');
-  lines.push('| package | version | incident | advisory | flagged | advisory matched |');
-  lines.push('|---|---|---|---|---|---|');
-  for (const r of a) {
-    lines.push(`| ${r.name} | ${r.version} | ${r.incident} | ${r.advisory} | ${r.flagged ? '🚩' : '—'} | ${r.hit ? '✅' : '❌'} |`);
+export function evaluateBenchmark(
+  parts,
+  selectedParts,
+  manifest = defaultManifest,
+  { requireComplete = false } = {}
+) {
+  const gates = {};
+  if (selectedParts.includes('a')) {
+    const rows = parts.knownBad || [];
+    const complete = rows.length === manifest.knownBad.length && rows.every(r => r.complete);
+    const passed = complete && rows.every(r => r.hit);
+    gates.a = {
+      executionComplete: complete,
+      evidenceComplete: complete,
+      complete,
+      passed,
+      errorCount: errorsIn(rows),
+      failureCount: complete ? rows.filter(r => !r.hit).length : 0,
+    };
   }
-  lines.push('');
-
-  lines.push(`## Part B — technique detection — ${bHit}/${attacks.length} attacks detected; ${bControlsClean}/${controls.length} negative controls clean`);
-  lines.push('');
-  lines.push('| technique | kind | expected (any of) | fired | result |');
-  lines.push('|---|---|---|---|---|');
-  for (const r of b) {
-    const mark = r.hit ? '✅' : '❌';
-    const kind = r.isControl ? 'control (must stay quiet)' : 'attack';
-    const extra = r.strayFP.length ? ` (stray: ${r.strayFP.join(', ')})` : '';
-    lines.push(`| ${r.id} | ${kind} | ${r.expectAnyOf.join(', ') || '—'} | ${r.fired.join(', ') || 'none'} | ${mark}${extra} |`);
+  if (selectedParts.includes('b')) {
+    const rows = parts.techniques || [];
+    const complete = rows.length === manifest.techniques.length && rows.every(r => r.complete);
+    const passed = complete && rows.every(r => r.hit);
+    gates.b = {
+      executionComplete: complete,
+      evidenceComplete: complete,
+      complete,
+      passed,
+      errorCount: errorsIn(rows),
+      failureCount: complete ? rows.filter(r => !r.hit).length : 0,
+      attackFailures: complete ? rows.filter(r => !r.isControl && !r.hit).length : 0,
+      controlFailures: complete ? rows.filter(r => r.isControl && !r.hit).length : 0,
+    };
   }
-  lines.push('');
+  if (selectedParts.includes('c')) {
+    const rows = parts.benignLive || [];
+    const ceiling = manifest.benignPolicy?.maxHighCriticalFalsePositives;
+    const policyValid = Number.isInteger(ceiling) && ceiling >= 0;
+    const executionComplete = policyValid && rows.length === manifest.benignLive.length && rows.every(r => r.complete);
+    const evidenceComplete = executionComplete && rows.every(r => r.evidenceComplete === true);
+    const fpCount = rows.filter(r => r.fp === true).length;
+    const blockingEvidenceCount = rows.filter(r => r.currentBlockingEvidence === true).length;
+    const passed = executionComplete && fpCount <= ceiling && blockingEvidenceCount === 0;
+    gates.c = {
+      executionComplete,
+      evidenceComplete,
+      complete: executionComplete && evidenceComplete,
+      passed,
+      ceiling: policyValid ? ceiling : null,
+      fpCount,
+      blockingEvidenceCount,
+      sampledCount: rows.filter(r => r.sampledEvidence === true).length,
+      errorCount: errorsIn(rows) + (policyValid ? 0 : 1),
+      failureCount: executionComplete && !passed
+        ? Math.max(0, fpCount - ceiling) + blockingEvidenceCount
+        : 0,
+    };
+  }
 
-  lines.push(`## Part C — benign false positives — ${cFP}/${c.length} flagged${cErr ? ` (${cErr} errored)` : ''}`);
-  lines.push('');
-  lines.push('| package | HIGH/CRITICAL signals | result |');
-  lines.push('|---|---|---|');
-  for (const r of c) {
-    if (r.error) {
-      lines.push(`| ${r.name} | — | ⚠️ error |`);
-    } else {
-      lines.push(`| ${r.name} | ${r.loudSignals.join(', ') || 'none'} | ${r.fp ? '🚩 FP' : '✅'} |`);
+  const executionComplete = Object.values(gates).every(gate => gate.executionComplete);
+  const evidenceComplete = executionComplete && Object.values(gates).every(gate => gate.evidenceComplete);
+  const complete = executionComplete && evidenceComplete;
+  const passed = executionComplete && Object.values(gates).every(gate => gate.passed);
+  const errorCount = Object.values(gates).reduce((sum, gate) => sum + gate.errorCount, 0);
+  const failureCount = Object.values(gates).reduce((sum, gate) => sum + gate.failureCount, 0);
+  return {
+    selectedParts,
+    gates,
+    executionComplete,
+    evidenceComplete,
+    complete,
+    passed,
+    status: !executionComplete ? 'ERROR' : (!passed ? 'FAIL' : (!evidenceComplete ? 'INCOMPLETE' : 'PASS')),
+    requireComplete,
+    errorCount,
+    failureCount,
+    exitCode: !executionComplete ? 2 : (!passed ? 1 : (requireComplete && !evidenceComplete ? 2 : 0)),
+  };
+}
+
+export function summarizeMarkdown(result) {
+  const lines = ['# vexes detection benchmark', ''];
+  const { parts, summary } = result;
+
+  if (summary.gates.a) {
+    const rows = parts.knownBad;
+    const hit = rows.filter(r => r.hit).length;
+    lines.push(`## Part A — exact known-bad identification — ${hit}/${rows.length}`);
+    lines.push('');
+    lines.push('| package | version | advisory | result |');
+    lines.push('|---|---|---|---|');
+    for (const row of rows) {
+      const mark = !row.complete ? `⚠️ incomplete (${row.errorCount} error${row.errorCount === 1 ? '' : 's'})` : (row.hit ? '✅' : '❌ miss');
+      lines.push(`| ${row.name} | ${row.version} | ${row.advisory} | ${mark} |`);
     }
+    lines.push('');
   }
+
+  if (summary.gates.b) {
+    const rows = parts.techniques;
+    const attacks = rows.filter(r => !r.isControl);
+    const controls = rows.filter(r => r.isControl);
+    lines.push(`## Part B — technique evidence — ${attacks.filter(r => r.hit).length}/${attacks.length} attacks; ${controls.filter(r => r.hit).length}/${controls.length} controls clean`);
+    lines.push('');
+    lines.push('| fixture | kind | required evidence | fired | result |');
+    lines.push('|---|---|---|---|---|');
+    for (const row of rows) {
+      const detail = [...row.missing, ...row.unexpected].join(', ') || row.loudSignals.join(', ');
+      const mark = !row.complete ? `⚠️ incomplete (${row.errorCount})` : (row.hit ? '✅' : `❌ ${detail}`);
+      lines.push(`| ${row.id} | ${row.isControl ? 'control' : 'attack'} | ${row.expected.join(' + ') || 'no HIGH/CRITICAL'} | ${row.fired.join(', ') || 'none'} | ${mark} |`);
+    }
+    lines.push('');
+  }
+
+  if (summary.gates.c) {
+    const rows = parts.benignLive;
+    const gate = summary.gates.c;
+    lines.push(`## Part C — pinned live sampled deep evidence — ${gate.fpCount}/${rows.length} heuristic HIGH/CRITICAL (ceiling ${gate.ceiling ?? 'invalid'})`);
+    lines.push('');
+    lines.push('| package | pinned version | sampled files | HIGH/CRITICAL heuristic signals | current blocking advisory | result |');
+    lines.push('|---|---|---:|---|---|---|');
+    for (const row of rows) {
+      const mark = !row.complete ? `⚠️ error (${row.errorCount})` : (row.fp || row.currentBlockingEvidence ? '🚩' : '✅ sampled');
+      lines.push(`| ${row.name} | ${row.version} | ${row.inspectedFiles || 0} | ${(row.loudSignals || []).join(', ') || 'none'} | ${(row.blockingAdvisories || []).join(', ') || 'none'} | ${mark} |`);
+    }
+    lines.push('');
+    lines.push(`Coverage: ${gate.sampledCount}/${rows.length} rows are explicitly bounded samples; package-complete evidence is ${gate.evidenceComplete ? 'available' : 'not available'}.`);
+    lines.push('');
+  }
+
+  lines.push(`**Overall: ${summary.status}.** ${summary.errorCount} execution error(s); ${summary.failureCount} gate regression(s).`);
   lines.push('');
   return lines.join('\n');
 }
 
-// ── main ────────────────────────────────────────────────────────────────
-
-const [a, b, c] = [
-  wantPart('a') ? runPartA() : [],
-  wantPart('b') ? await runPartB() : [],
-  wantPart('c') ? runPartC() : [],
-];
-
-const result = { parts: { knownBad: a, techniques: b, benignLive: c } };
-const markdown = summarize([a, b, c]);
-
-if (asJSON) {
-  console.log(JSON.stringify(result, null, 2));
-} else {
-  console.log(markdown);
+export async function runBenchmark({
+  selectedParts = ['a', 'b', 'c'],
+  manifest = defaultManifest,
+  runner = runVexes,
+  analyzer = null,
+  metadataFetcher = null,
+  requireComplete = false,
+} = {}) {
+  const parts = {};
+  if (selectedParts.includes('a')) parts.knownBad = runPartA({ manifest, runner });
+  if (selectedParts.includes('b')) parts.techniques = await runPartB({ manifest, analyzer });
+  if (selectedParts.includes('c')) {
+    parts.benignLive = await runPartC({ manifest, runner, metadataFetcher });
+  }
+  const summary = evaluateBenchmark(parts, selectedParts, manifest, { requireComplete });
+  return { schemaVersion: '1.0', parts, summary };
 }
 
-if (reportFile) writeFileSync(reportFile, markdown);
-if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, markdown);
+export async function main(argv = process.argv.slice(2)) {
+  let options;
+  try {
+    options = parseBenchmarkArgs(argv);
+  } catch (error) {
+    console.error(`benchmark usage error: ${error.message}`);
+    return 2;
+  }
 
-// The only gate: the SPECIFIC advisory for each known compromise must be
-// matched (not merely any HIGH+ signal). Technique detection and the benign
-// FP rate are published, not gated — they're tuning targets.
-const misses = a.filter((r) => !r.hit).length;
-if (misses > 0) {
-  console.error(`benchmark regression: ${misses} known-bad package(s) not flagged`);
-  process.exit(1);
+  let result;
+  try {
+    result = await runBenchmark({
+      selectedParts: options.selectedParts,
+      requireComplete: options.requireComplete,
+    });
+  } catch (error) {
+    console.error(`benchmark incomplete: ${error.message}`);
+    return 2;
+  }
+  const markdown = summarizeMarkdown(result);
+  console.log(options.asJSON ? JSON.stringify(result, null, 2) : markdown);
+  if (options.reportFile) writeFileSync(options.reportFile, markdown);
+  if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, markdown);
+  if (!result.summary.executionComplete) {
+    console.error(`benchmark execution error: ${result.summary.errorCount} error(s)`);
+  } else if (!result.summary.passed) {
+    console.error(`benchmark regression: ${result.summary.failureCount} gate failure(s)`);
+  } else if (!result.summary.evidenceComplete) {
+    console.error('benchmark evidence is explicitly sampled/incomplete; --require-complete makes this release-blocking');
+  }
+  return result.summary.exitCode;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === resolve(THIS_FILE)) {
+  process.exitCode = await main();
 }

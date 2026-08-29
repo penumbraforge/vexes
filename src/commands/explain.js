@@ -3,8 +3,8 @@
  *
  * Turns the wall of CVEs a scan produces into a prioritized, plain-English
  * action plan: what to fix first, why it matters (blast radius), and the
- * upgrade sequence. The scanner stays deterministic and offline; this is an
- * opt-in layer on top of the pluggable provider (local OpenAI-compatible
+ * upgrade sequence. AI use is separately opt-in; ordinary scanner commands
+ * can still contact OSV and package registries. The pluggable provider (local OpenAI-compatible
  * endpoint by default, Anthropic when ANTHROPIC_API_KEY is set — see
  * src/ai/provider.js). Nothing leaves the machine unless a provider is
  * configured, and only the sanitized extracted-findings payload is sent.
@@ -91,7 +91,12 @@ function scanToJson(path) {
       log.error(`could not run scan: ${err.message}`);
       resolvePromise(null);
     });
-    child.on('close', () => {
+    child.on('close', (code, signal) => {
+      if (signal || (code !== EXIT.OK && code !== EXIT.VULNS_FOUND)) {
+        log.error(`scan did not complete (exit ${code ?? 'unknown'}${signal ? `, signal ${signal}` : ''})`);
+        resolvePromise(null);
+        return;
+      }
       try {
         resolvePromise(JSON.parse(buf));
       } catch (err) {
@@ -100,6 +105,44 @@ function scanToJson(path) {
       }
     });
   });
+}
+
+function findingKey(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const id = value.id || value.displayId;
+  if (![id, value.package, value.version, value.ecosystem].every(v => typeof v === 'string' && v.length > 0)) {
+    return null;
+  }
+  return `${value.ecosystem}:${value.package}@${value.version}:${id}`;
+}
+
+/** Validate the current scan envelope before treating absence as clean. */
+export function validateScanReport(report) {
+  const object = value => value && typeof value === 'object' && !Array.isArray(value);
+  if (!object(report) || report.schemaVersion !== '1.0' ||
+      !object(report.generator) || report.generator.name !== 'vexes' ||
+      report.command !== 'scan' || !object(report.result) ||
+      !Array.isArray(report.warnings) || !Array.isArray(report.result.warnings) ||
+      JSON.stringify(report.warnings) !== JSON.stringify(report.result.warnings) ||
+      !object(report.summary) || !Array.isArray(report.findings) ||
+      !Array.isArray(report.vulnerabilities)) {
+    return { ok: false, reason: 'input is not a valid vexes scan envelope' };
+  }
+  if (report.complete !== true || report.result.complete !== true) {
+    return { ok: false, reason: 'the underlying scan is incomplete; refusing to triage it as clean' };
+  }
+  if (!Number.isSafeInteger(report.summary.vulnerable) || report.summary.vulnerable < 0 ||
+      report.summary.vulnerable !== report.findings.length ||
+      report.summary.vulnerable !== report.vulnerabilities.length) {
+    return { ok: false, reason: 'scan summary and finding counts do not agree' };
+  }
+  const publicKeys = report.findings.map(findingKey);
+  const rawKeys = report.vulnerabilities.map(findingKey);
+  if (publicKeys.some(key => key === null) || rawKeys.some(key => key === null) ||
+      publicKeys.slice().sort().join('\n') !== rawKeys.slice().sort().join('\n')) {
+    return { ok: false, reason: 'scan findings are malformed or disagree across envelope fields' };
+  }
+  return { ok: true };
 }
 
 /**
@@ -112,7 +155,7 @@ function scanToJson(path) {
  * model — only this sanitized, spec-shaped payload crosses the boundary.
  */
 function buildPayload(report) {
-  const vulns = Array.isArray(report.vulnerabilities) ? report.vulnerabilities : [];
+  const vulns = report.findings;
   const capped = vulns.slice(0, MAX_FINDINGS_IN_PROMPT);
   const findings = capped.map(v => ({
     id: sanitize(v.displayId || v.id).slice(0, 64),
@@ -164,6 +207,12 @@ export async function runExplain(flags, args) {
   const report = await loadReport(flags);
   if (!report) return EXIT.ERROR;
 
+  const validation = validateScanReport(report);
+  if (!validation.ok) {
+    out(`\n  ${C.yellow}! ${sanitize(validation.reason)}${C.reset}\n`);
+    return EXIT.ERROR;
+  }
+
   const payload = buildPayload(report);
 
   if (payload.findings.length === 0) {
@@ -197,9 +246,6 @@ export async function runExplain(flags, args) {
   // sanitizer the rest of the CLI uses before printing.
   out(sanitize(answer));
 
-  if (!report.complete) {
-    out(`\n  ${C.yellow}! The underlying scan was incomplete — triage may miss findings.${C.reset}`);
-  }
   out('');
   return EXIT.OK;
 }

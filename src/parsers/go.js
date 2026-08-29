@@ -1,5 +1,5 @@
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { log } from '../core/logger.js';
 
 /**
@@ -57,12 +57,30 @@ export function parseManifest(filePath) {
   try { content = readFileSync(filePath, 'utf8'); }
   catch (err) { throw new Error(`cannot read ${filePath}: ${err.code || err.message}`); }
 
+  if (!/^module\s+\S+\s*$/m.test(content)) {
+    throw new Error(`invalid go.mod schema in ${filePath}: module directive is missing`);
+  }
+
   const deps = [];
   const seen = new Set();
+  const workspace = applicableWorkspace(filePath);
+  const replacements = new Set([
+    ...replacedModules(content),
+    ...replacedModules(workspace?.content || ''),
+  ]);
+  // go.work can replace modules and make workspace modules override versioned
+  // downloads. This line parser does not implement Go's full workspace module
+  // selection, so an applicable workspace always keeps source coverage
+  // incomplete even when its explicit replacements do not match a require.
+  let unresolvedEntries = workspace ? 1 : 0;
   let inRequireBlock = false;
 
   const addDep = (name, version, isDirect) => {
     if (!name || !version) return;
+    if (replacements.has(name)) {
+      unresolvedEntries++;
+      return;
+    }
     const dedupKey = `${name}@${version}`;
     if (seen.has(dedupKey)) return;
     seen.add(dedupKey);
@@ -107,7 +125,50 @@ export function parseManifest(filePath) {
   }
 
   log.debug(`parsed ${deps.length} deps from ${filePath}`);
+  Object.defineProperty(deps, 'unresolvedEntries', {
+    enumerable: false,
+    get: () => unresolvedEntries,
+  });
   return deps;
+}
+
+function applicableWorkspace(modPath) {
+  if (process.env.GOWORK === 'off') return null;
+
+  if (process.env.GOWORK) {
+    const explicit = resolve(dirname(modPath), process.env.GOWORK);
+    try { return { path: explicit, content: readFileSync(explicit, 'utf8') }; }
+    catch { return { path: explicit, content: '' }; }
+  }
+
+  let current = dirname(modPath);
+  for (let i = 0; i < 20; i++) {
+    const candidate = join(current, 'go.work');
+    if (existsSync(candidate)) {
+      try { return { path: candidate, content: readFileSync(candidate, 'utf8') }; }
+      catch { return { path: candidate, content: '' }; }
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+
+function replacedModules(content) {
+  const names = new Set();
+  let inBlock = false;
+  for (const raw of content.split('\n')) {
+    const line = raw.replace(/\s*\/\/.*$/, '').trim();
+    if (!line) continue;
+    if (line === 'replace (') { inBlock = true; continue; }
+    if (inBlock && line === ')') { inBlock = false; continue; }
+    const spec = inBlock ? line : (line.startsWith('replace ') ? line.slice('replace '.length).trim() : null);
+    if (!spec) continue;
+    const match = spec.match(/^(\S+)(?:\s+v\S+)?\s+=>\s+\S+/);
+    if (match) names.add(match[1]);
+  }
+  return names;
 }
 
 /**

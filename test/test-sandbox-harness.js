@@ -115,10 +115,34 @@ describe('sandbox refusal paths (refuse-by-default)', () => {
         command: ['node', '--version'],
         workdir: dir,
         allow: false, // NOT opted in
-        host: { host: 'sandbox-exec', argv: [], writeIsolation: true },
+        host: { host: 'bwrap', argv: [], writeIsolation: true, readIsolation: true },
       });
       assert.equal(r.status, 'refused');
       assert.match(r.reason, /not opted in/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('labels candidate-visible recorder output as positive-only evidence', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vexes-positive-only-'));
+    try {
+      const entry = join(dir, 'index.js');
+      writeFileSync(entry, 'module.exports = {};\n');
+      const child = runHarnessed({
+        workdir: dir,
+        entryScript: entry,
+        allow: true,
+        host: { host: 'bwrap', writeIsolation: true, readIsolation: true },
+        spawn: () => {
+          writeFileSync(join(dir, '.vexes-evidence.jsonl'), '{"t":"recorder_ready"}\n');
+          return { status: 0, stdout: '', stderr: '', error: null, signal: null };
+        },
+      });
+      assert.equal(child.status, 'ran');
+      assert.equal(child.evidenceComplete, true);
+      assert.equal(child.evidenceTrusted, false);
+      assert.equal(child.negativeEvidenceTrusted, false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -135,7 +159,10 @@ describe('analyze --sandbox wiring (refusal)', () => {
         lockfileVersion: 3,
         packages: {
           '': { name: 'app', dependencies: { 'sb-evil-pkg': '^1.0.0' } },
-          'node_modules/sb-evil-pkg': { version: '1.0.0' },
+          'node_modules/sb-evil-pkg': {
+            version: '1.0.0',
+            resolved: 'https://registry.npmjs.org/sb-evil-pkg/-/sb-evil-pkg-1.0.0.tgz',
+          },
         },
       }));
 
@@ -177,12 +204,13 @@ describe('analyze --sandbox wiring (refusal)', () => {
           runAnalyze({ path: dir, json: true, sandbox: true, sandboxHost: null }, [])
         );
 
-        assert.equal(code, EXIT.VULNS_FOUND, 'CRITICAL/HIGH must exit VULNS_FOUND');
+        assert.equal(code, EXIT.ERROR, 'requested sandbox refusal makes the analysis incomplete');
         const payload = JSON.parse(stdout);
-        assert.equal(payload.complete, true, 'sandbox refusal must not mark the scan incomplete');
+        assert.equal(payload.complete, false, 'sandbox refusal must mark the requested stage incomplete');
+        assert.deepEqual(payload.stages.sandbox, { requested: true, complete: false });
         const warnings = payload.warnings.join('\n');
         assert.match(warnings, /sandbox/);
-        assert.match(warnings, /no isolation host/);
+        assert.match(warnings, /bwrap host that contains writes and hides user\/project host paths/);
 
         // Honesty: refusal pre-flight attaches no evidence and claims no run.
         assert.equal(JSON.stringify(payload).includes('SANDBOX_BEHAVIOR'), false);
@@ -235,8 +263,8 @@ async function runPositive() {
   }
 }
 
-// Write-containment guarantee — macOS seatbelt and bwrap ro-bind root. The
-// file the candidate tried to write outside workdir+tmp simply must not exist.
+// Accepted write-contained host path (currently Linux bwrap). The file the
+// candidate tried to write outside workdir+tmp must not exist in this fixture.
 describe('sandbox positive path (write-contained host)', { skip: !writesContained }, () => {
   it('runs under the recorder, records behavior, and contains outside writes', async () => {
     const { marker, dir, child } = await runPositive();

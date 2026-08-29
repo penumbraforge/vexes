@@ -14,6 +14,8 @@ import { log } from '../core/logger.js';
 const PACKAGE_RE = /^ {2}([A-Za-z0-9_.-]+):\s*$/;
 const VERSION_RE = /^ {4}version: "([^"]+)"/;
 const DEPENDENT_RE = /^ {4}dependency: "?([A-Za-z ]+)"?/;
+const SOURCE_RE = /^ {4}source: ([A-Za-z0-9_-]+)/;
+const URL_RE = /^ {6}url:\s*["']?([^"'\s]+)["']?\s*$/;
 
 /**
  * Parse a Dart pubspec.lock into a dependency list (Pub ecosystem).
@@ -29,9 +31,14 @@ export function parseLockfile(lockfilePath) {
     throw new Error(`cannot read ${lockfilePath}: ${err.code || err.message}`);
   }
 
+  if (!/^packages:\s*$/m.test(raw) || !/^sdks:\s*$/m.test(raw)) {
+    throw new Error(`invalid pubspec.lock schema in ${lockfilePath}: packages and sdks sections are required`);
+  }
+
   const deps = [];
   const seen = new Set();
   let current = null;
+  let unresolvedEntries = 0;
   for (const line of raw.split('\n')) {
     if (line === 'packages:' || line.startsWith('packages: ')) continue; // header
     if (line.startsWith('sdks:')) break;                                 // past package list
@@ -40,8 +47,8 @@ export function parseLockfile(lockfilePath) {
     if (indent === 2) {
       const pm = line.match(PACKAGE_RE);
       if (pm) {
-        if (current?.name && current?.version) flush(current); // boundary: flush prior pkg
-        current = { name: pm[1], version: null, isDirect: null };
+        if (current?.name) flush(current); // boundary: flush prior pkg
+        current = { name: pm[1], version: null, isDirect: null, source: null, hostedUrl: null };
       }
       continue;
     }
@@ -49,15 +56,26 @@ export function parseLockfile(lockfilePath) {
       const vs = line.match(VERSION_RE);
       if (vs) { current.version = vs[1]; continue; }
       const ds = line.match(DEPENDENT_RE);
-      if (ds) current.isDirect = ds[1].trim().startsWith('direct');
+      if (ds) { current.isDirect = ds[1].trim().startsWith('direct'); continue; }
+      const source = line.match(SOURCE_RE);
+      if (source) current.source = source[1];
+    }
+    if (indent === 6 && current) {
+      const url = line.match(URL_RE);
+      if (url) current.hostedUrl = url[1];
     }
     // indent 6 (description: block) and sdks section are ignored harmlessly
   }
 
-  if (current?.name && current?.version) flush(current);
+  if (current?.name) flush(current);
 
   function flush(c) {
-    if (!/^\d+\.\d+\.\d+/.test(c.version)) return; // must be a concrete release
+    const publicHosted = !!c.hostedUrl &&
+      ['https://pub.dev', 'https://pub.dartlang.org'].includes(c.hostedUrl.replace(/\/$/, ''));
+    if (!/^\d+\.\d+\.\d+/.test(c.version || '') || c.source !== 'hosted' || !publicHosted) {
+      unresolvedEntries++;
+      return;
+    }
     const key = `pub:${c.name}@${c.version}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -70,6 +88,10 @@ export function parseLockfile(lockfilePath) {
     });
   }
 
+  Object.defineProperty(deps, 'unresolvedEntries', {
+    enumerable: false,
+    value: unresolvedEntries,
+  });
   return deps;
 }
 

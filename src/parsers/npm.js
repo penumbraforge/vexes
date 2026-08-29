@@ -4,14 +4,16 @@ import { log } from '../core/logger.js';
 
 // Only accept concrete semver versions for OSV queries
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/;
+const NPM_NAME_RE = /^(?:@[a-z0-9._~-]+\/[a-z0-9._~-]+|[a-z0-9][a-z0-9._~-]*)$/i;
 
 /**
  * Parse an npm package-lock.json (v2 or v3) into a flat dependency list.
  *
  * @param {string} lockfilePath - Absolute path to package-lock.json
+ * @param {{ preserveOccurrences?: boolean }} [options]
  * @returns {Array<{ name: string, version: string, ecosystem: string, isDev: boolean, isDirect: boolean }>}
  */
-export function parseLockfile(lockfilePath) {
+export function parseLockfile(lockfilePath, { preserveOccurrences = false } = {}) {
   let raw;
   try {
     raw = readFileSync(lockfilePath, 'utf8');
@@ -28,56 +30,130 @@ export function parseLockfile(lockfilePath) {
 
   const deps = [];
   const seen = new Set();
+  let unresolvedEntries = 0;
   const dir = join(lockfilePath, '..');
   const directDeps = readDirectDeps(dir);
 
   const packages = data.packages;
-  if (packages) {
+  if (packages !== undefined) {
+    if (!packages || typeof packages !== 'object' || Array.isArray(packages)) {
+      throw new Error(`invalid package-lock schema in ${lockfilePath}: "packages" must be an object`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(packages, '')) {
+      throw new Error(`invalid package-lock schema in ${lockfilePath}: package root entry "" is missing`);
+    }
     for (const [key, entry] of Object.entries(packages)) {
       if (key === '') continue;
-      if (!entry.version) continue;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        unresolvedEntries++;
+        continue;
+      }
 
-      // Extract name after the last node_modules/ segment.
-      // npm registry normalizes names to lowercase; do the same for consistent OSV queries.
-      const rawName = key.split('node_modules/').pop();
-      if (!rawName) continue;
-      const name = rawName.toLowerCase();
+      // `entry.name` is the artifact identity for npm aliases. Falling back to
+      // the install folder would query `safe-alias@1.0.0` instead of the real
+      // registry artifact named by `npm:real-package@1.0.0`.
+      const folderName = key.includes('node_modules/') ? key.split('node_modules/').pop() : null;
+      const rawName = typeof entry.name === 'string' && entry.name ? entry.name : folderName;
+      const name = rawName?.toLowerCase();
+      const sourceType = npmSourceType(entry, key, name, entry.version);
+      const coordinateValid = SEMVER_RE.test(entry.version || '') && !!name && NPM_NAME_RE.test(name);
+      const sourceAnchored = sourceType === 'registry' &&
+        typeof entry.resolved === 'string' && entry.resolved.length > 0;
+      const isTopLevelOccurrence = !!folderName && key === `node_modules/${folderName}`;
 
-      const dedupKey = `${name}@${entry.version}`;
+      if (!coordinateValid || !sourceAnchored) unresolvedEntries++;
+      if ((!coordinateValid || !sourceAnchored) && !preserveOccurrences) continue;
+
+      const dedupKey = preserveOccurrences ? key : `${name}@${entry.version}`;
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
 
       deps.push({
-        name,
-        version: entry.version,
+        name: name || folderName || key,
+        version: entry.version || null,
         ecosystem: 'npm',
         isDev: entry.dev === true,
-        isDirect: directDeps.has(name),
+        isDirect: isTopLevelOccurrence && (directDeps.has(name) || directDeps.has(folderName)),
+        ...(preserveOccurrences ? { occurrence: key } : {}),
+        ...(entry.resolved ? { resolved: entry.resolved } : {}),
         ...(entry.integrity ? { integrity: entry.integrity } : {}),
+        sourceType,
       });
     }
 
     log.debug(`parsed ${deps.length} packages from ${lockfilePath} (lockfileVersion ${data.lockfileVersion})`);
+    attachParserStatus(deps, () => unresolvedEntries);
     return deps;
   }
 
   // Fallback: v1 lockfile with nested `dependencies` tree
-  if (data.dependencies) {
-    walkDependencyTree(data.dependencies, deps, seen, directDeps);
+  if (data.dependencies !== undefined) {
+    if (!data.dependencies || typeof data.dependencies !== 'object' || Array.isArray(data.dependencies)) {
+      throw new Error(`invalid package-lock schema in ${lockfilePath}: "dependencies" must be an object`);
+    }
+    if (preserveOccurrences) {
+      throw new Error(`legacy package-lock dependency trees cannot preserve occurrence identity for guard`);
+    }
+    const state = { unresolvedEntries: 0 };
+    walkDependencyTree(data.dependencies, deps, seen, directDeps, state);
     log.debug(`parsed ${deps.length} packages from ${lockfilePath} (legacy tree format)`);
+    attachParserStatus(deps, () => state.unresolvedEntries);
     return deps;
   }
 
-  log.warn(`no packages found in ${lockfilePath}`);
-  return deps;
+  throw new Error(`invalid package-lock schema in ${lockfilePath}: no recognized dependency graph`);
 }
 
-function walkDependencyTree(tree, deps, seen, directDeps) {
+function npmSourceType(entry, key, name, version) {
+  if (entry.link === true || (!key.includes('node_modules/') && key !== '')) return 'link';
+  const resolved = typeof entry.resolved === 'string' ? entry.resolved : '';
+  if (!resolved) return 'unknown';
+  if (/^(?:file:|\.\.?[/\\]|[/\\])/.test(resolved)) return 'file';
+  if (/^(?:git\+|git:|github:|gitlab:|bitbucket:)/i.test(resolved)) return 'git';
+  return isCanonicalNpmTarball(resolved, name, version) ? 'registry' : 'remote';
+}
+
+/** Bind a public-registry URL to the exact artifact identity being queried. */
+export function isCanonicalNpmTarball(
+  resolved,
+  name,
+  version,
+  { hosts = new Set(['registry.npmjs.org']) } = {},
+) {
+  if (typeof resolved !== 'string' || !NPM_NAME_RE.test(name || '') || !SEMVER_RE.test(version || '')) return false;
+  try {
+    const url = new URL(resolved);
+    if (url.protocol !== 'https:' || !hosts.has(url.hostname) ||
+        url.port || url.username || url.password || url.search) return false;
+    const decodedPath = decodeURIComponent(url.pathname);
+    const tarballName = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
+    return decodedPath === `/${name}/-/${tarballName}-${version}.tgz`;
+  } catch {
+    return false;
+  }
+}
+
+function attachParserStatus(deps, readUnresolved) {
+  Object.defineProperty(deps, 'unresolvedEntries', {
+    enumerable: false,
+    get: readUnresolved,
+  });
+}
+
+function walkDependencyTree(tree, deps, seen, directDeps, state) {
   for (const [name, entry] of Object.entries(tree)) {
-    if (!entry.version) continue;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      state.unresolvedEntries++;
+      continue;
+    }
+    const sourceType = npmSourceType(entry, `node_modules/${name}`, name, entry.version);
+    const coordinateValid = NPM_NAME_RE.test(name) && SEMVER_RE.test(entry.version || '');
+    const sourceAnchored = sourceType === 'registry' &&
+      typeof entry.resolved === 'string' && entry.resolved.length > 0;
+    if (!coordinateValid || !sourceAnchored) state.unresolvedEntries++;
 
     const dedupKey = `${name}@${entry.version}`;
-    if (!seen.has(dedupKey)) {
+    if (coordinateValid && sourceAnchored && !seen.has(dedupKey)) {
       seen.add(dedupKey);
       deps.push({
         name,
@@ -85,11 +161,14 @@ function walkDependencyTree(tree, deps, seen, directDeps) {
         ecosystem: 'npm',
         isDev: entry.dev === true,
         isDirect: directDeps.has(name),
+        resolved: entry.resolved,
+        ...(entry.integrity ? { integrity: entry.integrity } : {}),
+        sourceType,
       });
     }
 
-    if (entry.dependencies) {
-      walkDependencyTree(entry.dependencies, deps, seen, directDeps);
+    if (entry.dependencies && typeof entry.dependencies === 'object' && !Array.isArray(entry.dependencies)) {
+      walkDependencyTree(entry.dependencies, deps, seen, directDeps, state);
     }
   }
 }
@@ -107,10 +186,10 @@ function readDirectDeps(dir) {
     const raw = readFileSync(pkgPath, 'utf8');
     const pkg = JSON.parse(raw);
     if (pkg.dependencies && typeof pkg.dependencies === 'object') {
-      Object.keys(pkg.dependencies).forEach(n => names.add(n));
+      Object.keys(pkg.dependencies).forEach(n => names.add(n.toLowerCase()));
     }
     if (pkg.devDependencies && typeof pkg.devDependencies === 'object') {
-      Object.keys(pkg.devDependencies).forEach(n => names.add(n));
+      Object.keys(pkg.devDependencies).forEach(n => names.add(n.toLowerCase()));
     }
   } catch (err) {
     log.warn(`could not read package.json for direct dep identification: ${err.message}`);
@@ -158,20 +237,23 @@ export function parseManifest(pkgPath) {
         continue;
       }
 
-      // Strip leading semver range operators to extract a concrete version
-      const stripped = versionRange.replace(/^[\^~>=<\s]+/, '');
-      if (!SEMVER_RE.test(stripped)) {
-        log.debug(`skipping non-pinned dep: ${name}@${versionRange}`);
+      // A manifest range is not an installed version. Sending its lower bound
+      // to OSV creates both false positives and false negatives, so fallback
+      // scanning accepts only an explicitly pinned version. Lockfiles remain
+      // the authoritative source for resolved dependency versions.
+      if (!SEMVER_RE.test(versionRange)) {
+        log.debug(`skipping unresolved manifest dep: ${name}@${versionRange}`);
         continue;
       }
 
       deps.push({
         name,
-        version: stripped,
+        version: versionRange,
         ecosystem: 'npm',
         isDev,
         isDirect: true,
-        isRange: versionRange !== stripped,
+        isRange: false,
+        sourceType: 'registry',
       });
     }
   }

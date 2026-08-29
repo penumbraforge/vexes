@@ -1,6 +1,8 @@
 # Configuration
 
-vexes uses a layered configuration system: **defaults < user config < project config < CLI flags**.
+vexes uses a layered configuration system: **defaults < user config < allowed
+project policy < CLI flags**. Project config is deliberately narrower than user
+config because it comes from the repository being inspected.
 
 ## Project config: `.vexesrc.json`
 
@@ -16,11 +18,6 @@ Place in your project root. vexes walks up directories (up to 20 levels) to find
       "NO_REPOSITORY": "off"
     }
   },
-  "cache": {
-    "dir": "~/.cache/vexes",
-    "advisoryTtlMs": 3600000,
-    "metadataTtlMs": 86400000
-  },
   "output": {
     "color": "auto",
     "format": "text"
@@ -28,9 +25,24 @@ Place in your project root. vexes walks up directories (up to 20 levels) to find
 }
 ```
 
+Only reporting-policy keys are accepted from `.vexesrc.json`: `ecosystems`,
+`severity`, `ignore`, `strict`, `verbose`, `top`, the deprecated/no-op
+`minReachability`, `analyze.signals`, and output `color`/`format`. Repository
+config cannot enable sandbox execution, deep sampling, fix output, AI, or
+stale-cache use, and it cannot choose the cache database or TTLs.
+
+Pass `--no-project-config` when scanning an untrusted checkout for enforcement.
+Without it, the repository can legitimately change what an ordinary report
+shows by selecting ecosystems, adding ignores, or disabling signals.
+
 ## User config: `~/.config/vexes/config.json`
 
-Same format as project config. Applied before project config, so project settings take priority.
+User config may set the reporting keys above plus ordinary cache storage and TTL
+settings. It is applied before allowed project policy. Operational modes
+(`--sandbox`, `--deep`, `--fix`, `--ai`, and `--cached`) are deleted from both
+config sources and require an explicit flag on each invocation. Pass
+`--no-user-config` when a reproducible run must ignore this runner-account
+policy as well.
 
 ## Configuration options
 
@@ -72,11 +84,19 @@ Override signal behavior. Set to `"off"` to disable a signal entirely.
 |--------|---------|-------------|
 | `dir` | `~/.cache/vexes` | Cache directory (supports `~` expansion) |
 | `advisoryTtlMs` | `3600000` (1 hour) | How long advisory results are cached |
-| `metadataTtlMs` | `86400000` (24 hours) | How long registry metadata is cached |
+| `metadataTtlMs` | `86400000` (24 hours) | How long analysis-signal rows are reused (historical option name) |
 
-The cache uses SQLite (Node.js built-in `node:sqlite`). If the cache becomes corrupted, vexes automatically degrades to a no-op cache and continues scanning.
+The cache uses SQLite (Node.js built-in `node:sqlite`). Analyze fetches current
+registry metadata before reusing a signal row and requires its evidence
+fingerprint to match. The database has a metadata table/API, but current command
+paths do not populate it. A corrupt advisory row is deleted; corrupt
+metadata/signal rows are treated as misses. If the database cannot be opened,
+vexes falls back to a no-op cache and continues without caching.
 
-**TTL bounds:** Advisory TTL is clamped to a maximum of 7 days, metadata TTL to 30 days. This prevents config-based attacks that set extremely long TTLs to keep stale (potentially false-clean) results cached indefinitely.
+**TTL bounds:** Advisory TTL is clamped to a maximum of 7 days and the
+historically named metadata/analysis-signal TTL to 30 days. This limits stale
+reuse from an accidentally or deliberately large configured TTL; it does not
+make cached evidence current.
 
 ### `output`
 
@@ -94,12 +114,16 @@ The cache uses SQLite (Node.js built-in `node:sqlite`). If the cache becomes cor
 | `--severity <level>` | `severity` | Minimum severity |
 | `--json` | `output.format: "json"` | JSON output |
 | `--no-color` | `output.color: "never"` | Disable colors |
-| `--cached` | `useCache: true` | Use cached results without TTL check |
-| `--verbose` | `verbose: true` | Debug output |
-| `--strict` | `strict: true` | Fail on any signal |
-| `--deep` | `deep: true` | Download and inspect tarballs |
-| `--fix` | `fix: true` | Show fix commands in scan |
+| `--no-user-config` | no config equivalent | Ignore `~/.config/vexes/config.json` for this invocation |
+| `--no-project-config` | no config equivalent | Ignore `.vexesrc.json` for this invocation |
+| `--cached` | `useCache: true` | Accept cache hits without TTL check; misses can still query OSV |
+| `--verbose` | `verbose: true` | Verbose logging; analyze also includes the full parsed dependency set and LOW/UNKNOWN results |
+| `--strict` | `strict: true` | Fail on non-ignored results meeting the active severity filter |
+| `--deep` | `deep: true` | Download and inspect a bounded selected-file tarball sample |
+| `--fix` | `fix: true` | Show advisory-derived upgrade hints in scan |
 | `--explain <pkg>` | `explain: "pkg"` | Explain analysis for one package |
+| `--min-reachability <grade>` | `minReachability` | Deprecated: accepted for compatibility, warned, and ignored; import evidence never filters findings |
+| `--freshness <minutes>` | command flag | In monitor watch mode, poll npm/PyPI metadata using a persistent last-seen baseline |
 
 ## Environment variables
 
@@ -110,7 +134,16 @@ The cache uses SQLite (Node.js built-in `node:sqlite`). If the cache becomes cor
 ## Input validation
 
 vexes validates CLI inputs:
-- **Ecosystem names** are validated strictly. Invalid values via `--ecosystem` throw an error (with "did you mean?" suggestions). Invalid values from config files are silently dropped with a warning. If no valid ecosystems remain, vexes errors out rather than scanning nothing.
-- **Severity levels** are validated. Invalid values fall back to `moderate` with a warning.
+- **Ecosystem names** are validated strictly. Invalid values via `--ecosystem` throw an error (with "did you mean?" suggestions). Invalid values from config files are dropped with a warning. If no valid ecosystems remain, vexes errors out rather than scanning nothing.
+- **CLI severity flags** are validated. An invalid flag is ignored with a
+  warning, leaving the configured/default severity in effect.
 - **Paths** are verified to exist and be directories before scanning.
-- **Critical signals** (`KNOWN_COMPROMISED`, `PHANTOM_DEPENDENCY`, `CIRCULAR_STAGING`, `CAPABILITY_ESCALATION`) cannot be disabled via config.
+- **Signal switches** are all honored. The legacy `KNOWN_COMPROMISED` switch
+  also controls `KNOWN_MALICIOUS` and `KNOWN_VULNERABILITY` when their own
+  switches are absent. Project-local configuration can therefore suppress
+  ordinary report evidence; review it as policy or use `--no-project-config`.
+  Add `--no-user-config` when trusted runner-level policy must also be excluded.
+- **Operational modes** cannot be enabled from project or user config. Sandbox,
+  deep sampling, fix output, AI, and stale-cache use require explicit CLI flags.
+  Guard additionally clears configured ignores and signal suppression before
+  making its install decision.

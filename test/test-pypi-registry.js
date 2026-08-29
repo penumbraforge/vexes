@@ -30,7 +30,7 @@ const pypiData = {
   releases: {
     '1.0.0': file('2020-01-01T00:00:00Z'),
     '1.1.0': file('2020-06-01T00:00:00Z'),
-    // 20-month dormancy gap here — the event-stream shape
+    // 20-month dormancy gap exercises the long-gap shape.
     '2.0.0': file('2022-02-01T00:00:00Z'),
     '3.0.0': file('2022-03-01T00:00:00Z'),
   },
@@ -64,7 +64,7 @@ describe('PyPI metadata: release history now populated', () => {
     assert.equal(meta2.majorJump, 0);
   });
 
-  it('emits dormancyMs from the release-gap history (event-stream shape)', () => {
+  it('emits dormancyMs from a long release-gap history', () => {
     const meta = normalizeMetadata(pypiData, 'demo-pkg', '2.0.0');
     const twentyMonthsMs = new Date('2022-02-01T00:00:00Z') - new Date('2020-06-01T00:00:00Z');
     assert.equal(meta.dormancyMs, twentyMonthsMs);
@@ -85,9 +85,14 @@ describe('PyPI metadata: release history now populated', () => {
       'install-script detection on PyPI comes from --deep tarball inspection');
   });
 
-  it('unknown installed version falls back to latest and says so', () => {
+  it('never substitutes latest metadata for an unknown installed version', () => {
     const meta = normalizeMetadata(pypiData, 'demo-pkg', '9.9.9');
     assert.equal(meta.anchoredToInstalled, false);
-    assert.equal(meta.latestVersion, '3.0.0');
+    assert.equal(meta.requestedVersionFound, false);
+    assert.equal(meta.metadataComplete, false);
+    assert.equal(meta.latestVersion, '9.9.9');
+    assert.equal(meta.previousVersion, null);
+    assert.equal(meta.latestPublishTime, null);
+    assert.match(meta.anchorError, /absent from PyPI release metadata/);
   });
 });

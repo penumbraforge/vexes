@@ -1,13 +1,13 @@
 {
   "name": "@penumbraforge/vexes",
   "version": "0.6.1",
-  "description": "Cross-ecosystem dependency security scanner. Shakes the tree to see what falls. Zero dependencies.",
+  "description": "Experimental evidence-rich dependency risk CLI for local developers and coding agents.",
   "type": "module",
   "bin": {
     "vexes": "bin/vexes.js"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "test": "node --test test/test-*.js",

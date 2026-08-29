@@ -52,14 +52,23 @@ export function normalizeMetadata(data, packageName, requestedVersion) {
 
   const latestAvailable = info.version || versionList[versionList.length - 1];
 
-  // Anchor to the installed version when the release history knows it.
-  const anchoredToInstalled = requestedVersion != null && (releases[requestedVersion]?.length > 0);
-  const latestVersion = anchoredToInstalled ? requestedVersion : latestAvailable;
-  const anchorIdx = versionList.indexOf(latestVersion);
+  // An exact request is an evidence boundary. If PyPI's release history does
+  // not contain it, preserve the requested value and mark the result
+  // incomplete; silently analyzing the current latest would describe a
+  // different artifact from the one in the user's dependency file.
+  const versionWasRequested = requestedVersion != null && String(requestedVersion).trim() !== '';
+  const requestedVersionFound = versionWasRequested
+    ? releases[requestedVersion]?.length > 0
+    : null;
+  const anchoredToInstalled = versionWasRequested && requestedVersionFound === true;
+  const latestVersion = versionWasRequested ? requestedVersion : latestAvailable;
+  const anchorIdx = requestedVersionFound === false ? -1 : versionList.indexOf(latestVersion);
+  const metadataComplete = requestedVersionFound !== false && !!latestVersion && anchorIdx >= 0;
+  const anchorError = requestedVersionFound === false
+    ? `requested version ${packageName}@${requestedVersion} is absent from PyPI release metadata`
+    : (!metadataComplete ? `PyPI metadata has no release artifact for ${packageName}@${latestVersion || 'unknown'}` : null);
 
-  const previousVersion = anchorIdx > 0
-    ? versionList[anchorIdx - 1]
-    : (anchorIdx === -1 && versionList.length >= 2 ? versionList[versionList.length - 2] : null);
+  const previousVersion = anchorIdx > 0 ? versionList[anchorIdx - 1] : null;
 
   // Author / maintainer info
   const author = info.author || null;
@@ -68,7 +77,7 @@ export function normalizeMetadata(data, packageName, requestedVersion) {
   const maintainerEmail = info.maintainer_email || null;
 
   // Publish timestamps
-  const latestRelease = releases[latestVersion];
+  const latestRelease = metadataComplete ? releases[latestVersion] : null;
   const latestPublishTime = latestRelease?.[0]?.upload_time_iso_8601
     ? new Date(latestRelease[0].upload_time_iso_8601) : null;
 
@@ -97,9 +106,9 @@ export function normalizeMetadata(data, packageName, requestedVersion) {
   }
 
   // Dormancy: max gap between consecutive releases in the 5 up to the anchor
-  // — detects packages abandoned then suddenly reactivated (event-stream shape)
+  // — detects packages with a long release gap followed by new activity.
   let dormancyMs = null;
-  const historyUpToAnchor = anchorIdx >= 0 ? versionList.slice(0, anchorIdx + 1) : versionList;
+  const historyUpToAnchor = anchorIdx >= 0 ? versionList.slice(0, anchorIdx + 1) : [];
   if (historyUpToAnchor.length >= 2) {
     const recentVersions = historyUpToAnchor.slice(-5);
     for (let i = 1; i < recentVersions.length; i++) {
@@ -142,7 +151,11 @@ export function normalizeMetadata(data, packageName, requestedVersion) {
     name: packageName,
     latestVersion,       // the analyzed (anchor) version — installed when known
     latestAvailable,     // newest release on PyPI
+    requestedVersion: versionWasRequested ? requestedVersion : null,
+    requestedVersionFound,
     anchoredToInstalled,
+    metadataComplete,
+    anchorError,
     previousVersion,
     author,
     authorEmail,

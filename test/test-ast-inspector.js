@@ -11,6 +11,17 @@ const fixtures = join(__dirname, 'fixtures');
 // ── Malicious pattern detection ──────────────────────────────────────
 
 describe('AST Inspector — malicious patterns', () => {
+  it('parses ordinary Node hashbang entrypoints instead of flagging them as unparseable', () => {
+    const result = inspectJS('#!/usr/bin/env node\nconsole.log("hello");', 'bin/tool.js');
+    assert.equal(result.findings.some(f => f.pattern === 'UNPARSEABLE_CODE'), false);
+  });
+
+  it('reports one-based source lines rather than AST character offsets', () => {
+    const result = inspectJS('// harmless prefix\nconst value = 1;\neval(value);', 'lines.js');
+    const finding = result.findings.find(f => f.pattern === 'CODE_EXECUTION');
+    assert.equal(finding.line, 3);
+  });
+
   it('detects direct eval()', () => {
     const r = inspectJS('eval("alert(1)");');
     assert.ok(r.findings.some(f => f.pattern === 'CODE_EXECUTION'));
@@ -141,9 +152,9 @@ describe('AST Inspector — malicious patterns', () => {
   });
 });
 
-// ── False positive resistance ────────────────────────────────────────
+// ── Selected benign controls ─────────────────────────────────────────
 
-describe('AST Inspector — no false positives', () => {
+describe('AST Inspector — selected benign controls', () => {
   it('clean code produces zero findings', () => {
     const r = inspectJS('const x = 1 + 2; console.log(x);');
     assert.equal(r.findingCount, 0);

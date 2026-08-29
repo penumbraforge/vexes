@@ -1,8 +1,8 @@
 /**
  * Dynamic sandbox — experimental, NEVER default, refuse-by-default.
  *
- * Runs a candidate package's lifecycle scripts in an OS isolation primitive
- * (macOS sandbox-exec, Linux bwrap/unshare/firejail) under instrumentation:
+ * Runs one selected npm entrypoint in an OS isolation primitive under
+ * best-effort instrumentation:
  * process spawns, network attempts, and filesystem writes are recorded as
  * behavioral evidence, then the workdir is discarded.
  *
@@ -10,9 +10,9 @@
  *  - NOTHING executes unless an isolation host is detected AND the caller
  *    passes `allow: true` (inspect --sandbox / analyze --sandbox set this
  *    explicitly; the argv is built but never spawned otherwise).
- *  - A detected host MUST have filesystem write isolation (sandbox-exec,
- *    bwrap). Namespace-only primitives (unshare, firejail) are refused —
- *    package code must never reach the user's files under a "sandboxed" label.
+ *  - A detected host MUST contain writes and hide user/project/private host
+ *    paths. A small read-only OS runtime surface remains visible so Node can
+ *    start; this is not a claim that every host byte is hidden.
  *  - No acceptable host (Windows, no bwrap, sandbox-exec stripped) ⇒
  *    `refused`, never a fake "clean". A warning surfaces instead.
  *  - The address space is a throwaway temp dir; kills happen on timeout.
@@ -21,7 +21,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, realpathSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, realpathSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import os from 'node:os';
 import { log } from '../../core/logger.js';
@@ -31,31 +31,56 @@ import { log } from '../../core/logger.js';
 // binary's own help — never untrusted package code).
 const HOSTS = {
   darwin: ['sandbox-exec'],
-  linux: ['bwrap', 'unshare', 'firejail'],
+  linux: ['bwrap'],
+};
+
+const HOST_PATHS = {
+  'sandbox-exec': ['/usr/bin/sandbox-exec'],
+  bwrap: ['/usr/bin/bwrap', '/bin/bwrap'],
+  unshare: ['/usr/bin/unshare', '/bin/unshare'],
+  firejail: ['/usr/bin/firejail', '/bin/firejail'],
 };
 
 // What the user can actually count on, per host. sandbox-exec (Seatbelt) and
-// bwrap ro-bind root + writable workdir ⇒ FILE WRITES CANNOT ESCAPE the
+// bwrap's minimal runtime mounts + writable workdir ⇒ FILE WRITES CANNOT ESCAPE the
 // workdir. unshare/firejail isolate process/net namespaces only — they run on
 // the host filesystem, so writes are NOT contained. Only hosts with
 // writeIsolation: true are EVER accepted (detectSandboxHost refuses the rest):
 // "sandboxed" package code that can touch the user's home directory is not a
 // sandbox, and reporting it as one is the lie this module must never tell.
 const HOST_CAP = {
-  'sandbox-exec': { writeIsolation: true },
-  bwrap: { writeIsolation: true },
+  // The current Seatbelt profile must allow broad host reads for Node to
+  // start, so it is not acceptable for adversarial package execution.
+  'sandbox-exec': { writeIsolation: true, privateReadIsolation: false, readIsolation: false },
+  bwrap: { writeIsolation: true, privateReadIsolation: true, readIsolation: false },
   // Namespace-only primitives — accepted by nobody. Listed so the refusal
   // reason can name exactly why they were skipped.
-  unshare: { writeIsolation: false },
-  firejail: { writeIsolation: false },
+  unshare: { writeIsolation: false, privateReadIsolation: false, readIsolation: false },
+  firejail: { writeIsolation: false, privateReadIsolation: false, readIsolation: false },
 };
 
 function probe(host) {
-  // Cheap pre-check: sandbox-exec lives at a fixed path on macOS.
-  if (host === 'sandbox-exec' && existsSync('/usr/bin/sandbox-exec')) return { host, argv: [] };
-  const r = spawnSync(host, ['-h'], { timeout: 5000 });
-  if (r.error?.code === 'ENOENT') return null;
-  return { host, argv: [] };
+  const path = sandboxHostPath(host, { requireExisting: true });
+  if (!path) return null;
+  const r = spawnSync(path, ['-h'], {
+    timeout: 5000,
+    env: { PATH: '/usr/bin:/bin', HOME: os.tmpdir(), TMPDIR: os.tmpdir(), NO_COLOR: '1' },
+  });
+  if (r.error || (typeof r.status === 'number' && r.status > 1)) return null;
+  return { host, path };
+}
+
+/** Resolve isolation hosts from fixed system locations, never inherited PATH. */
+export function sandboxHostPath(host, { requireExisting = false } = {}) {
+  const candidates = HOST_PATHS[host] || [];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const real = realpathSync(candidate);
+      if (statSync(real).isFile()) return real;
+    } catch { /* keep looking */ }
+  }
+  return requireExisting ? null : (candidates[0] || null);
 }
 
 // Cache shorthand so per-process consumers (doctor, analyze, inspect, tests)
@@ -87,10 +112,18 @@ export function detectSandboxHost({ live = true } = {}) {
   if (cachedHost.done) return cachedHost.value;
   let value = null;
   for (const c of HOSTS[process.platform] || []) {
-    if (!probe(c)) continue;
-    if (!HOST_CAP[c]?.writeIsolation) continue; // cannot contain writes — refuse
-    if (live && !verifyPrimitive(c)) continue; // binary exists, can't isolate
-    value = { host: c, writeIsolation: true };
+    if (!HOST_CAP[c]?.writeIsolation || !HOST_CAP[c]?.privateReadIsolation) continue;
+    const candidate = probe(c);
+    if (!candidate) continue;
+    if (live && !verifyPrimitive(candidate)) continue; // binary exists, can't isolate
+    value = {
+      host: c,
+      path: candidate.path,
+      writeIsolation: true,
+      privateReadIsolation: true,
+      readIsolation: false,
+      runtimeReadOnlyMounts: ['/usr', '/bin', '/lib*'],
+    };
     break;
   }
   cachedHost = { done: true, value };
@@ -101,17 +134,22 @@ export function detectSandboxHost({ live = true } = {}) {
  * Run a benign `node -e 'vexes-p'` under the candidate primitive. True only if
  * the command actually executes under isolation and its output comes back.
  */
-function verifyPrimitive(hostName) {
+function verifyPrimitive(hostInfo) {
   let workdir;
   try { workdir = mkdtempSync(join(os.tmpdir(), 'vexes-probe-')); } catch { return false; }
   try {
     const argv = buildSandboxCmd({
-      host: hostName,
+      host: hostInfo.host,
       workdir,
-      command: ['node', '-e', 'process.stdout.write("vexes-p")'],
+      command: [process.execPath, '-e', 'process.stdout.write("vexes-p")'],
     });
     if (!argv) return false;
-    const r = spawnSync(argv[0], argv.slice(1), { cwd: workdir, timeout: 8000, encoding: 'utf8' });
+    const r = spawnSync(argv[0], argv.slice(1), {
+      cwd: workdir,
+      timeout: 8000,
+      encoding: 'utf8',
+      env: sandboxEnvironment(workdir),
+    });
     return !!(r.stdout && r.stdout.includes('vexes-p'));
   } catch {
     return false;
@@ -156,13 +194,15 @@ function seatbeltProfile(workdir, tmpdir) {
 }
 
 /**
- * bwrap (bubblewrap) low-level namespace wrapper: full isolation.
- * Writable binds: only the workdir + OS temp escape the read-only root. Each
+ * bwrap (bubblewrap) low-level namespace wrapper: scoped runtime isolation.
+ * Writable binds: only the workdir + OS temp are exposed writable. Each
  * ro-bind target is guarded with existsSync so a missing /lib64 doesn't abort.
+ * `/etc`, user homes, the calling project, and other host paths are not
+ * mounted. `/usr`, `/bin`, and loader libraries remain readable at runtime.
  */
 function bwrapArgv(workdir, tmpdir) {
-  const argv = ['bwrap', '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin'];
-  for (const d of ['/lib', '/lib64', '/lib32', '/etc']) {
+  const argv = [sandboxHostPath('bwrap'), '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin'];
+  for (const d of ['/lib', '/lib64', '/lib32']) {
     if (existsSync(d)) argv.push('--ro-bind', d, d);
   }
   argv.push('--dev', '/dev', '--proc', '/proc', '--unshare-all', '--new-session');
@@ -185,15 +225,10 @@ export function buildSandboxCmd(ctx) {
   switch (host) {
     case 'sandbox-exec': {
       const profile = seatbeltProfile(workdir || process.cwd(), tmpdir || '/tmp');
-      return ['sandbox-exec', '-p', profile, ...rest];
+      return [sandboxHostPath('sandbox-exec'), '-p', profile, ...rest];
     }
     case 'bwrap':
       return [...bwrapArgv(workdir || '.', tmpdir || '/tmp'), '--', ...rest];
-    case 'unshare':
-      // unshare with UTS/PID/net + map current user so file writes stay owned.
-      return ['unshare', '--mount', '--ipc', '--pid', '--net', '--fork', ...rest];
-    case 'firejail':
-      return ['firejail', '--quiet', '--net=none', '--noprofile', '--', ...rest];
     default:
       return null;
   }
@@ -218,13 +253,20 @@ export function runSandboxed(opts = {}) {
   // to force the refusal path.
   const host = forcedHost !== undefined ? forcedHost : detectSandboxHost();
   const hostName = host?.host || null;
-  const writeIsolation = !!host?.writeIsolation;
+  // Capability assertions never come from callers/config. The static table is
+  // authoritative; otherwise a forged `{host:'unshare', writeIsolation:true}`
+  // could turn a namespace-only process into alleged filesystem isolation.
+  const writeIsolation = HOST_CAP[hostName]?.writeIsolation === true;
+  const privateReadIsolation = HOST_CAP[hostName]?.privateReadIsolation === true;
+  const readIsolation = HOST_CAP[hostName]?.readIsolation === true;
+  const runtimeReadOnlyMounts = hostName === 'bwrap' ? ['/usr', '/bin', '/lib*'] : [];
 
   if (!hostName) {
     return {
       status: 'refused', host: null, stdout: '', stderr: '',
-      spawns: [], code: null, writeIsolation: false,
-      reason: 'no isolation host with filesystem write isolation (need sandbox-exec on macOS, or bwrap on Linux — unshare/firejail cannot contain writes)',
+      spawns: [], code: null, writeIsolation: false, privateReadIsolation: false, readIsolation: false,
+      runtimeReadOnlyMounts: [],
+      reason: 'no isolation host that contains writes and hides user/project host paths (bwrap on Linux is currently required)',
     };
   }
   // Hard floor, independent of detection: a host that cannot contain
@@ -234,44 +276,86 @@ export function runSandboxed(opts = {}) {
   if (!writeIsolation) {
     return {
       status: 'refused', host: hostName, stdout: '', stderr: '',
-      spawns: [], code: null, writeIsolation: false,
+      spawns: [], code: null, writeIsolation: false, privateReadIsolation: false, readIsolation: false,
+      runtimeReadOnlyMounts,
       reason: `${hostName} cannot contain filesystem writes (process/net namespaces only) — refusing to run package code`,
+    };
+  }
+  if (!privateReadIsolation) {
+    return {
+      status: 'refused', host: hostName, stdout: '', stderr: '',
+      spawns: [], code: null, writeIsolation, privateReadIsolation: false, readIsolation: false,
+      runtimeReadOnlyMounts,
+      reason: `${hostName} does not hide user/project/private host paths — refusing to run package code`,
     };
   }
   if (!allow) {
     return {
       status: 'refused', host: hostName, stdout: '', stderr: '',
       spawns: [], code: null, writeIsolation,
+      privateReadIsolation,
+      readIsolation,
+      runtimeReadOnlyMounts,
       reason: 'sandbox is experimental and not opted in (pass --sandbox explicitly)',
     };
   }
 
   const argv = buildSandboxCmd({ host: hostName, command, workdir });
-  if (!argv) return { status: 'failed', host: hostName, reason: 'no handler for host', writeIsolation, spawns: [], code: null, stdout: '', stderr: '' };
+  if (!argv) return { status: 'failed', host: hostName, reason: 'no handler for host', writeIsolation, privateReadIsolation, readIsolation, runtimeReadOnlyMounts, spawns: [], code: null, stdout: '', stderr: '' };
 
   log.debug(`sandbox exec: ${argv.join(' ')}`);
   try {
-    const r = spawnSync(argv[0], argv.slice(1), {
+    const spawn = opts.spawn || spawnSync;
+    const r = spawn(argv[0], argv.slice(1), {
       cwd: workdir,
       timeout: timeoutMs,
       encoding: 'utf8',
+      // Candidate code gets a deliberately tiny environment. Inheriting the
+      // parent process wholesale would expose registry tokens, cloud keys,
+      // SSH agent paths, proxy credentials, and arbitrary application secrets
+      // even though filesystem/network isolation is active.
+      env: sandboxEnvironment(workdir),
     });
     const timedOut = r.error?.code === 'ETIMEDOUT' || r.signal === 'SIGTERM';
     const spawnFailed = !!r.error && !timedOut; // ENOENT etc — host binary itself missing
+    const nonZero = typeof r.status === 'number' && r.status !== 0;
+    const failed = spawnFailed || timedOut || nonZero;
     return {
-      status: spawnFailed ? 'failed' : 'ran',
+      status: failed ? 'failed' : 'ran',
       host: hostName,
       writeIsolation,
+      privateReadIsolation,
+      readIsolation,
+      runtimeReadOnlyMounts,
       stdout: r.stdout || '',
       stderr: r.stderr || '',
       code: typeof r.status === 'number' ? r.status : (spawnFailed ? null : (timedOut ? 124 : null)),
       spawns: [], // host-primitive spawns captured by the wrapper layer (future)
-      reason: timedOut ? `timed out after ${timeoutMs}ms (killed)` : (spawnFailed ? r.error.message : undefined),
+      reason: timedOut ? `timed out after ${timeoutMs}ms (killed)`
+        : spawnFailed ? r.error.message
+          : nonZero ? `sandboxed command exited with status ${r.status}`
+            : undefined,
     };
   } catch (err) {
     log.warn(`sandbox run failed: ${err.message}`);
-    return { status: 'failed', host: hostName, reason: err.message, spawns: [], code: null, stdout: '', stderr: '', writeIsolation };
+    return { status: 'failed', host: hostName, reason: err.message, spawns: [], code: null, stdout: '', stderr: '', writeIsolation, privateReadIsolation, readIsolation, runtimeReadOnlyMounts };
   }
+}
+
+/** Minimal, non-secret environment passed to untrusted package code. */
+export function sandboxEnvironment(workdir) {
+  const env = {
+    PATH: '/usr/bin:/bin',
+    HOME: workdir,
+    TMPDIR: workdir,
+    TMP: workdir,
+    TEMP: workdir,
+    NO_COLOR: '1',
+  };
+  for (const key of ['LANG', 'LC_ALL', 'LC_CTYPE', 'TZ']) {
+    if (typeof process.env[key] === 'string') env[key] = process.env[key];
+  }
+  return env;
 }
 
 export { seatbeltProfile, bwrapArgv };

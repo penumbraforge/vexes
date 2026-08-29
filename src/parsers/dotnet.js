@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import { log } from '../core/logger.js';
 import { extractVersionFromSpec, isPinnedVersionSpec } from './version-spec.js';
 
+const NUGET_VERSION_RE = /^\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/;
+
 /**
  * Parse packages.lock.json (NuGet) into dependency list.
  *
@@ -23,18 +25,24 @@ export function parseLockfile(filePath) {
 
   const deps = [];
   const seen = new Set();
+  let unresolvedEntries = 0;
   const frameworks = data.dependencies;
 
-  if (!frameworks || typeof frameworks !== 'object') {
-    log.warn(`no dependencies found in ${filePath}`);
-    return deps;
+  if (!Number.isInteger(data.version) || !frameworks || typeof frameworks !== 'object' || Array.isArray(frameworks)) {
+    throw new Error(`invalid packages.lock.json schema in ${filePath}: numeric version and dependencies object are required`);
   }
 
   for (const [, packages] of Object.entries(frameworks)) {
-    if (!packages || typeof packages !== 'object') continue;
+    if (!packages || typeof packages !== 'object' || Array.isArray(packages)) {
+      throw new Error(`invalid packages.lock.json schema in ${filePath}: target framework entries must be objects`);
+    }
 
     for (const [name, entry] of Object.entries(packages)) {
-      if (!entry.resolved) continue;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+          typeof entry.resolved !== 'string' || !NUGET_VERSION_RE.test(entry.resolved)) {
+        unresolvedEntries++;
+        continue;
+      }
 
       const dedupKey = `${name}@${entry.resolved}`;
       if (seen.has(dedupKey)) continue;
@@ -47,10 +55,15 @@ export function parseLockfile(filePath) {
         isDirect: entry.type === 'Direct',
         isPinned: true,
       });
+      // packages.lock.json records a content hash but not the package feed.
+      // Retain the coordinate for advisory leads while keeping coverage
+      // incomplete until public NuGet artifact identity can be cross-checked.
+      unresolvedEntries++;
     }
   }
 
   log.debug(`parsed ${deps.length} deps from ${filePath}`);
+  Object.defineProperty(deps, 'unresolvedEntries', { enumerable: false, value: unresolvedEntries });
   return deps;
 }
 
@@ -72,7 +85,9 @@ export function parseManifest(filePath) {
 
   const addDep = (name, spec) => {
     const version = extractVersionFromSpec(spec);
-    if (!name || !version) return;
+    // NuGet ranges are constraints rather than installed versions. A project
+    // manifest can safely contribute only exact PackageReference pins.
+    if (!name || !version || !isPinnedVersionSpec(spec, version)) return;
 
     const dedupKey = `${name}@${version}`;
     if (seen.has(dedupKey)) return;
@@ -83,7 +98,7 @@ export function parseManifest(filePath) {
       version,
       ecosystem: 'nuget',
       isDirect: true,
-      isPinned: isPinnedVersionSpec(spec, version),
+      isPinned: true,
     });
   };
 

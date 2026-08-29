@@ -33,16 +33,16 @@ import * as pubParser from '../parsers/pub.js';
  */
 
 const PARSER_CHECKS = [
-  ['npm (package-lock-v3.json)', npmParser.parseLockfile, 'package-lock-v3.json'],
-  ['pypi (requirements.txt)', pypiParser.parseRequirements, 'requirements.txt'],
-  ['cargo (Cargo.lock)', cargoParser.parseLockfile, 'Cargo.lock'],
-  ['go (go.mod)', goParser.parseManifest, 'go.mod'],
-  ['ruby (Gemfile)', rubyParser.parseManifest, 'Gemfile'],
-  ['php (composer.json)', phpParser.parseManifest, 'composer.json'],
-  ['dotnet (Example.csproj)', dotnetParser.parseManifest, 'Example.csproj'],
-  ['java (pom.xml)', javaParser.parseManifest, 'pom.xml'],
-  ['hex (mix.lock)', hexParser.parseLockfile, 'mix.lock'],
-  ['pub (pubspec.lock)', pubParser.parseLockfile, 'pubspec.lock'],
+  { name: 'npm (package-lock-v3.json)', parseFn: npmParser.parseLockfile, file: 'package-lock-v3.json', minCount: 5, expected: { name: '@babel/core', version: '7.20.12' } },
+  { name: 'pypi (requirements.txt)', parseFn: pypiParser.parseRequirements, file: 'requirements.txt', minCount: 4, expected: { name: 'requests', version: '2.31.0' } },
+  { name: 'cargo (Cargo.lock)', parseFn: cargoParser.parseLockfile, file: 'Cargo.lock', minCount: 2, expected: { name: 'serde', version: '1.0.193' } },
+  { name: 'go (go.mod)', parseFn: goParser.parseManifest, file: 'go.mod', minCount: 3, expected: { name: 'github.com/gin-gonic/gin', version: 'v1.10.0' } },
+  { name: 'ruby (Gemfile)', parseFn: rubyParser.parseManifest, file: 'Gemfile', minCount: 1, expected: { name: 'puma', version: '6.4.2' } },
+  { name: 'php (composer.json)', parseFn: phpParser.parseManifest, file: 'composer.json', minCount: 1, expected: { name: 'guzzlehttp/guzzle', version: '7.8.1' } },
+  { name: 'dotnet (Example.csproj)', parseFn: dotnetParser.parseManifest, file: 'Example.csproj', minCount: 2, expected: { name: 'Newtonsoft.Json', version: '13.0.3' } },
+  { name: 'java (pom.xml)', parseFn: javaParser.parseManifest, file: 'pom.xml', minCount: 2, expected: { name: 'org.springframework:spring-core', version: '6.1.5' } },
+  { name: 'hex (mix.lock)', parseFn: hexParser.parseLockfile, file: 'mix.lock', minCount: 3, expected: { name: 'jason', version: '1.4.4' } },
+  { name: 'pub (pubspec.lock)', parseFn: pubParser.parseLockfile, file: 'pubspec.lock', minCount: 3, expected: { name: 'args', version: '2.4.2' } },
 ];
 
 // Fixture paths resolve relative to the PACKAGE ROOT (this module lives at
@@ -52,18 +52,51 @@ const PARSER_CHECKS = [
 // check and reported the tool untrustworthy.
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-// `fixturesDir` is injectable so tests can exercise the fail-loud path (all
-// parser checks failing ⇒ EXIT.ERROR) without relying on the caller's cwd.
-async function runParserChecks(fixturesDir = join(PACKAGE_ROOT, 'test', 'fixtures')) {
+// `fixturesDir` and `parserChecks` are injectable so tests can exercise the
+// fail-loud path without relying on the caller's cwd or mutating real fixtures.
+export async function runParserChecks(
+  fixturesDir = join(PACKAGE_ROOT, 'test', 'fixtures'),
+  parserChecks = PARSER_CHECKS,
+) {
   const checks = [];
-  for (const [name, parseFn, file] of PARSER_CHECKS) {
+  for (const { name, parseFn, file, minCount, expected, intentionalEmpty = false } of parserChecks) {
     const path = join(fixturesDir, file);
+    const expectedCoordinate = expected ? `${expected.name}@${expected.version}` : null;
     try {
       const deps = parseFn(path);
-      const count = Array.isArray(deps) ? deps.length : 'parsed';
-      checks.push({ name: `parser ${name}`, ok: true, detail: `${count} dep(s)` });
+      if (!Array.isArray(deps)) {
+        throw new Error('parser returned a non-array result');
+      }
+      if (intentionalEmpty && deps.length !== 0) {
+        throw new Error(`intentional empty fixture returned ${deps.length} dep(s)`);
+      }
+      if (deps.length < minCount) {
+        throw new Error(`returned ${deps.length} dep(s); expected at least ${minCount}`);
+      }
+      if (!intentionalEmpty && !expected) {
+        throw new Error('doctor fixture is missing an expected dependency coordinate');
+      }
+      if (expected && !deps.some(dep => dep?.name === expected.name && dep?.version === expected.version)) {
+        throw new Error(`missing expected coordinate ${expectedCoordinate}`);
+      }
+      checks.push({
+        name: `parser ${name}`,
+        ok: true,
+        detail: intentionalEmpty
+          ? 'intentional empty fixture returned 0 dep(s)'
+          : `${deps.length} dep(s); found ${expectedCoordinate}`,
+        actualCount: deps.length,
+        expectedMinimum: minCount,
+        expectedCoordinate,
+      });
     } catch (err) {
-      checks.push({ name: `parser ${name}`, ok: false, detail: err.message });
+      checks.push({
+        name: `parser ${name}`,
+        ok: false,
+        detail: err.message,
+        expectedMinimum: minCount,
+        expectedCoordinate,
+      });
     }
   }
   return checks;
@@ -102,7 +135,7 @@ async function probeReachable(url) {
   }
 }
 
-export async function runDoctor(flags, args, { fixturesDir } = {}) {
+export async function runDoctor(flags, args, { fixturesDir, parserChecks } = {}) {
   const targetDir = resolve(flags.path || process.cwd());
   const config = loadConfig(targetDir, flags);
   const isJSON = config.output?.format === 'json';
@@ -111,7 +144,7 @@ export async function runDoctor(flags, args, { fixturesDir } = {}) {
     out(`\n  ${C.bold}vexes doctor${C.reset} v${VERSION} ${C.dim}— self test${C.reset}\n`);
   }
 
-  const checks = await runParserChecks(fixturesDir);
+  const checks = await runParserChecks(fixturesDir, parserChecks);
   const parserOk = checks.filter(c => c.name.startsWith('parser')).every(c => c.ok);
 
   const cacheCheck = await runCacheCheck();
@@ -154,7 +187,7 @@ export async function runDoctor(flags, args, { fixturesDir } = {}) {
     }
     out(`\n  ${passed}/${checks.length} checks passed\n`);
     if (!requiredOk) {
-      out(`  ${C.red}${C.bold}! DOCTOR FAILED${C.reset} ${C.red}— the scanner may not be trustworthy.${C.reset}\n`);
+      out(`  ${C.red}${C.bold}! DOCTOR FAILED${C.reset} ${C.red}— one or more required smoke checks failed.${C.reset}\n`);
     }
   }
 

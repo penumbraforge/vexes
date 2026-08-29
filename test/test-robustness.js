@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadConfig } from '../src/cli/config.js';
 import { parseArgs } from '../src/cli/parse-args.js';
 import { inspectJS } from '../src/analysis/ast-inspector.js';
@@ -26,6 +29,16 @@ describe('Ecosystem validation', () => {
     // A security tool must reject invalid ecosystems — silently scanning nothing
     // and reporting "clean" is a total bypass
     assert.throws(() => loadConfig('/tmp', { ecosystem: 'nmp' }), /unknown ecosystem/);
+  });
+
+  it('rejects a string ecosystems config instead of iterating its characters', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vexes-config-shape-'));
+    try {
+      writeFileSync(join(dir, '.vexesrc.json'), JSON.stringify({ ecosystems: 'npm' }));
+      assert.throws(() => loadConfig(dir, {}), /ecosystems must be an array/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

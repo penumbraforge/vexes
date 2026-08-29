@@ -23,9 +23,8 @@ export const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
 
 // deps.dev (Google, no auth key) — package metadata including declared licenses.
 // GA endpoint v3: systems/{system}/packages/{name}/versions/{version}.
-// Unauthenticated rate limit is ~20 req/min/1k-1h — the client throttles well under it.
 export const DEPS_DEV_URL = 'https://api.deps.dev/v3';
-export const DEPS_DEV_MIN_INTERVAL_MS = 80; // 12.5 req/sec burst cap; comfy under 20/min long-run
+export const DEPS_DEV_MIN_INTERVAL_MS = 3000; // conservative unauthenticated pacing: 20 requests/minute
 export const DEPS_DEV_SUPPORTED = Object.freeze({
   npm: 'npm',
   pypi: 'pypi',
@@ -126,6 +125,8 @@ export const SEVERITY = Object.freeze({
 export const FETCH_TIMEOUT_MS = 15_000;
 export const FETCH_RETRIES = 3;
 export const FETCH_BACKOFF_MS = 1000;
+export const MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 // Analysis concurrency
 export const ANALYZE_CONCURRENCY = 10;
+export const DEEP_ANALYZE_CONCURRENCY = 2;

@@ -2,7 +2,8 @@ const VERSION_TOKEN_RE = /v?\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.+-]+)?/;
 
 /**
  * Extract a concrete version token from a loose manifest spec.
- * Used for best-effort manifest fallbacks when a lockfile is unavailable.
+ * Used to recognize a candidate token in manifest syntax. Callers must still
+ * use `isPinnedVersionSpec` before treating that token as an installed version.
  */
 export function extractVersionFromSpec(spec) {
   if (typeof spec !== 'string') return null;

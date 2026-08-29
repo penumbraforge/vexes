@@ -1,6 +1,6 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { runDoctor } from '../src/commands/doctor.js';
+import { runDoctor, runParserChecks } from '../src/commands/doctor.js';
 
 function stubResponse(body, { ok = true, status = 200 } = {}) {
   return {
@@ -45,6 +45,62 @@ describe('doctor: self test', () => {
     // All non-optional checks must pass for complete:true
     const required = env.checks.filter(c => !c.optional);
     assert.ok(required.every(c => c.ok), `required checks all ok: ${JSON.stringify(required)}`);
+    const parserChecks = required.filter(c => c.name.startsWith('parser '));
+    assert.ok(parserChecks.every(c => c.actualCount >= c.expectedMinimum));
+    assert.ok(parserChecks.every(c => typeof c.expectedCoordinate === 'string' && c.expectedCoordinate.includes('@')));
+  });
+
+  it('fails when a parser silently returns an empty result', async () => {
+    let output = '';
+    const originalOut = process.stdout.write;
+    process.stdout.write = (s) => { output += String(s); return true; };
+    let code;
+    try {
+      code = await runDoctor({ path: '.', json: true }, [], {
+        fixturesDir: '.',
+        parserChecks: [{
+          name: 'regression fixture',
+          file: 'ignored',
+          parseFn: () => [],
+          minCount: 1,
+          expected: { name: 'known-package', version: '1.2.3' },
+        }],
+      });
+    } finally {
+      process.stdout.write = originalOut;
+    }
+
+    assert.equal(code, 2);
+    const env = JSON.parse(output.trim());
+    assert.equal(env.complete, false);
+    const parserCheck = env.checks.find(c => c.name === 'parser regression fixture');
+    assert.equal(parserCheck.ok, false);
+    assert.match(parserCheck.detail, /returned 0 dep\(s\); expected at least 1/);
+  });
+
+  it('fails when the expected fixture coordinate disappears despite a nonempty result', async () => {
+    const [check] = await runParserChecks('.', [{
+      name: 'coordinate regression fixture',
+      file: 'ignored',
+      parseFn: () => [{ name: 'wrong-package', version: '1.2.3' }],
+      minCount: 1,
+      expected: { name: 'known-package', version: '1.2.3' },
+    }]);
+    assert.equal(check.ok, false);
+    assert.match(check.detail, /missing expected coordinate known-package@1\.2\.3/);
+  });
+
+  it('supports fixtures explicitly declared as intentionally empty', async () => {
+    const [check] = await runParserChecks('.', [{
+      name: 'intentional empty fixture',
+      file: 'ignored',
+      parseFn: () => [],
+      minCount: 0,
+      expected: null,
+      intentionalEmpty: true,
+    }]);
+    assert.equal(check.ok, true);
+    assert.equal(check.actualCount, 0);
   });
 
   it('reports EXIT.ERROR when a parser check fails (fail-loud, never a fake clean)', async () => {

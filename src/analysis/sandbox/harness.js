@@ -87,6 +87,7 @@ export function buildRecorderShim({ evidencePath, workdir }) {
     '    fs.writeSync(_recFd, JSON.stringify(line) + \'\\n\');',
     '  } catch { /* evidence unavailable — drop, never crash the candidate */ }',
     '}',
+    'rec({ t: \'recorder_ready\' });',
     '',
     'function hint() {',
     '  try {',
@@ -297,7 +298,31 @@ export function runHarnessed(opts = {}) {
     allow,
     timeoutMs,
     host: opts.host, // undefined ⇒ detect; null ⇒ forced refusal
+    spawn: opts.spawn, // test-only injection; production always uses spawnSync
   });
+  let evidenceComplete = false;
+  try { evidenceComplete = existsSync(evPath) && statSync(evPath).size > 0; } catch { evidenceComplete = false; }
   const evidence = readEvidenceFile(evPath, workdir);
-  return { ...child, evidence };
+  if (child.status === 'ran' && !evidenceComplete) {
+    return {
+      ...child,
+      status: 'failed',
+      reason: 'recorder evidence is missing or was modified by the candidate',
+      evidence,
+      evidenceComplete: false,
+      evidenceTrusted: false,
+      negativeEvidenceTrusted: false,
+    };
+  }
+  return {
+    ...child,
+    evidence,
+    evidenceComplete,
+    // The recorder runs in the candidate process and its file lives in the
+    // candidate-writable workdir. Positive observations are useful, but a
+    // hostile package can bypass or tamper with the recorder; empty evidence
+    // is therefore never trusted as proof of benign behavior.
+    evidenceTrusted: false,
+    negativeEvidenceTrusted: false,
+  };
 }

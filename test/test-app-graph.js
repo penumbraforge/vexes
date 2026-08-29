@@ -8,6 +8,7 @@ import {
   extractImports,
   findEntryPoints,
   buildAppGraph,
+  importEvidenceOf,
   reachabilityOf,
 } from '../src/analysis/app-graph.js';
 
@@ -100,7 +101,11 @@ describe('app-graph: full graph', () => {
       assert.equal(reachabilityOf(graph, 'npm', 'lodash'), 'reachable', 'static require');
       assert.equal(reachabilityOf(graph, 'npm', 'chunk'), 'lazy', 'dynamic import only');
       assert.equal(reachabilityOf(graph, 'npm', 'leftpad'), 'dead', 'no project source reference');
-      assert.equal(reachabilityOf(graph, 'cargo', 'cargo-crate'), 'dead', 'no .rs source uses it');
+      assert.equal(reachabilityOf(graph, 'cargo', 'cargo-crate'), 'unknown', 'no Rust source means no evidence');
+      assert.equal(importEvidenceOf(graph, 'npm', 'axios'), 'found_static');
+      assert.equal(importEvidenceOf(graph, 'npm', 'chunk'), 'found_dynamic');
+      assert.equal(importEvidenceOf(graph, 'npm', 'leftpad'), 'not_found');
+      assert.equal(importEvidenceOf(graph, 'cargo', 'cargo-crate'), 'unknown');
       assert.ok(graph.sourceFiles >= 2, 'parses both files');
       assert.ok(graph.entryPoints.includes(join(dir, 'index.js')), 'entrypoint found via package.json');
     } finally {
@@ -180,6 +185,44 @@ describe('app-graph: full graph', () => {
       assert.equal(reachabilityOf(graph, 'npm', 'axios'), 'reachable');
       assert.equal(reachabilityOf(graph, 'go', 'github.com/some/mod'), 'unknown', 'go is never graded');
       assert.equal(graph.categories.unknown, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns unknown rather than a negative verdict when the project has zero source files', () => {
+    const dir = makeProject({
+      'package.json': JSON.stringify({ name: 'config-only', version: '1.0.0' }),
+    });
+    try {
+      const deps = [{ name: 'transitive-only', version: '1.0.0', ecosystem: 'npm' }];
+      const graph = buildAppGraph(dir, deps);
+      assert.equal(graph.sourceFiles, 0);
+      assert.equal(importEvidenceOf(graph, 'npm', 'transitive-only'), 'unknown');
+      assert.equal(reachabilityOf(graph, 'npm', 'transitive-only'), 'unknown');
+      assert.deepEqual(graph.importEvidenceCategories, {
+        foundStatic: 0,
+        foundDynamic: 0,
+        notFound: 0,
+        unknown: 1,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns unknown when JavaScript source exists but cannot be parsed', () => {
+    const dir = makeProject({
+      'package.json': JSON.stringify({ name: 'broken-source', version: '1.0.0', main: 'index.js' }),
+      'index.js': 'const = ;;;',
+    });
+    try {
+      const deps = [{ name: 'possibly-loaded', version: '1.0.0', ecosystem: 'npm' }];
+      const graph = buildAppGraph(dir, deps);
+      assert.equal(graph.sourceFiles, 1, 'the source file was discovered');
+      assert.equal(graph.sourceFilesByEcosystem.npm, 0, 'unparsed source is not usable negative evidence');
+      assert.equal(importEvidenceOf(graph, 'npm', 'possibly-loaded'), 'unknown');
+      assert.equal(reachabilityOf(graph, 'npm', 'possibly-loaded'), 'unknown');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

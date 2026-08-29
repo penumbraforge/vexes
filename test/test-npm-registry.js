@@ -38,6 +38,11 @@ const packument = {
       scripts: {},
       dependencies: { lodash: '^4.0.0' },
       license: 'MIT',
+      dist: {
+        tarball: 'https://registry.npmjs.org/pkg/-/pkg-1.2.3.tgz',
+        integrity: 'sha512-installed',
+        shasum: '1111111111111111111111111111111111111111',
+      },
     },
     '9.0.0': {
       version: '9.0.0',
@@ -66,6 +71,16 @@ describe('npm metadata version anchoring', () => {
     assert.equal(meta.maintainerChanged, false, 'no publisher change at 1.2.3');
     assert.deepEqual(meta.addedDeps, [], 'evil-helper was added in 9.0.0, not 1.2.3');
     assert.equal(meta.majorJump, 0);
+    assert.equal(meta.metadataComplete, true);
+    assert.equal(meta.requestedVersionFound, true);
+    assert.deepEqual(meta.artifact, {
+      tarball: 'https://registry.npmjs.org/pkg/-/pkg-1.2.3.tgz',
+      integrity: 'sha512-installed',
+      shasum: '1111111111111111111111111111111111111111',
+    });
+    assert.equal(meta.tarball, meta.artifact.tarball);
+    assert.equal(meta.integrity, meta.artifact.integrity);
+    assert.equal(meta.shasum, meta.artifact.shasum);
   });
 
   it('analyzing latest still surfaces the hijack signals', () => {
@@ -86,10 +101,20 @@ describe('npm metadata version anchoring', () => {
     assert.equal(meta.publishIntervalMs, 31 * 24 * 60 * 60 * 1000);
   });
 
-  it('unknown installed version falls back to latest and says so', () => {
+  it('unknown installed version stays unanchored and never substitutes latest', () => {
     const meta = normalizeMetadata(packument, 'pkg', '7.7.7-not-published');
     assert.equal(meta.anchoredToInstalled, false);
-    assert.equal(meta.latestVersion, '9.0.0');
+    assert.equal(meta.requestedVersionFound, false);
+    assert.equal(meta.latestVersion, '7.7.7-not-published');
+    assert.equal(meta.latestAvailable, '9.0.0');
+    assert.equal(meta.metadataComplete, false);
+    assert.match(meta.anchorError, /absent from the registry packument/);
+    assert.equal(meta.previousVersion, null);
+    assert.equal(meta.hasInstallScripts, false);
+    assert.equal(meta.latestPublisher, null);
+    assert.deepEqual(meta.dependencies, []);
+    assert.equal(meta.dormancyMs, null);
+    assert.deepEqual(meta.artifact, { tarball: null, integrity: null, shasum: null });
   });
 
   it('no version argument preserves the legacy latest-based behavior', () => {
@@ -97,6 +122,62 @@ describe('npm metadata version anchoring', () => {
     assert.equal(meta.anchoredToInstalled, false);
     assert.equal(meta.latestVersion, '9.0.0');
     assert.equal(meta.previousVersion, '1.2.3');
+  });
+});
+
+describe('npm lifecycle hook trust boundaries', () => {
+  it('keeps registry install, non-registry install, and producer hooks separate', () => {
+    const data = {
+      'dist-tags': { latest: '1.0.0' },
+      time: { created: '2026-01-01T00:00:00Z', '1.0.0': '2026-01-01T00:00:00Z' },
+      versions: {
+        '1.0.0': {
+          version: '1.0.0',
+          scripts: {
+            preinstall: 'node preinstall.js',
+            install: 'node install.js',
+            postinstall: 'node postinstall.js',
+            prepare: 'node prepare.js',
+            prepublish: 'node legacy-project-hook.js',
+            dependencies: 'node dependencies.js',
+            prepublishOnly: 'node before-publish.js',
+            prepack: 'node before-pack.js',
+            postpack: 'node after-pack.js',
+            publish: 'node publish.js',
+            postpublish: 'node after-publish.js',
+          },
+        },
+      },
+    };
+
+    const meta = normalizeMetadata(data, 'hooky', '1.0.0');
+    assert.deepEqual(Object.keys(meta.installScripts), ['preinstall', 'install', 'postinstall']);
+    assert.deepEqual(meta.nonRegistryInstallScripts, { prepare: 'node prepare.js' });
+    assert.deepEqual(Object.keys(meta.projectLifecycleScripts), ['prepublish', 'dependencies']);
+    assert.deepEqual(Object.keys(meta.publishScripts), [
+      'prepublishOnly', 'prepack', 'postpack', 'publish', 'postpublish',
+    ]);
+    assert.equal(meta.hasInstallScripts, true);
+    assert.equal(meta.hasNonRegistryInstallScripts, true);
+    assert.equal(meta.hasPublishScripts, true);
+  });
+
+  it('does not call publish-only automation a consumer install script', () => {
+    const data = {
+      'dist-tags': { latest: '1.0.0' },
+      time: { created: '2026-01-01T00:00:00Z', '1.0.0': '2026-01-01T00:00:00Z' },
+      versions: {
+        '1.0.0': {
+          version: '1.0.0',
+          scripts: { prepack: 'npm run build', prepublishOnly: 'npm test' },
+        },
+      },
+    };
+
+    const meta = normalizeMetadata(data, 'publisher-tools', '1.0.0');
+    assert.equal(meta.hasInstallScripts, false);
+    assert.deepEqual(meta.installScripts, {});
+    assert.equal(meta.hasPublishScripts, true);
   });
 });
 

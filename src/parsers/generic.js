@@ -52,6 +52,15 @@ export function selectGenericFiles(dir, ecosystem) {
   if (!parser) return { files: [], usingManifestFallback: false };
 
   const { lockfiles, manifests } = parser.discover(dir);
+  // go.mod is the selected module graph. go.sum is checksum history and may
+  // retain stale modules that are no longer dependencies, so prefer go.mod
+  // whenever it exists instead of presenting go.sum as an installed graph.
+  if (ecosystem === 'go' && manifests.length > 0) {
+    return {
+      files: manifests.map(path => ({ path, kind: 'manifest' })),
+      usingManifestFallback: false,
+    };
+  }
   if (lockfiles.length > 0) {
     return {
       files: lockfiles.map(path => ({ path, kind: 'lockfile' })),

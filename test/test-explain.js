@@ -1,6 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { complete, hasApiKey } from '../src/ai/claude.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { runExplain, validateScanReport } from '../src/commands/explain.js';
 
 /**
  * AI TRIAGE (vexes explain)
@@ -138,5 +142,53 @@ describe('claude client: request shaping', () => {
         else process.env.VEXES_AI_MODEL = prev;
       }
     });
+  });
+});
+
+function scanEnvelope({ complete = true, findings = [] } = {}) {
+  const warnings = complete ? [] : ['OSV lookup incomplete'];
+  return {
+    schemaVersion: '1.0',
+    generator: { name: 'vexes', version: '0.6.1', engine: process.version },
+    timestamp: new Date().toISOString(),
+    command: 'scan',
+    target: { dir: '/tmp/project', lockfiles: [], ecosystems: ['npm'] },
+    complete,
+    warnings,
+    result: { complete, warnings },
+    summary: { total: findings.length, vulnerable: findings.length },
+    findings,
+    vulnerabilities: findings.map(f => ({ ...f })),
+  };
+}
+
+describe('explain: scan-envelope trust boundary', () => {
+  it('rejects incomplete and cross-field inconsistent reports', () => {
+    assert.equal(validateScanReport(scanEnvelope({ complete: false })).ok, false);
+    const inconsistent = scanEnvelope();
+    inconsistent.summary.vulnerable = 1;
+    assert.equal(validateScanReport(inconsistent).ok, false);
+  });
+
+  it('exits 2 and never prints a green no-vulnerabilities claim for incomplete input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vexes-explain-incomplete-'));
+    const reportPath = join(dir, 'scan.json');
+    writeFileSync(reportPath, JSON.stringify(scanEnvelope({ complete: false })));
+    const previousBase = process.env.VEXES_AI_BASE;
+    process.env.VEXES_AI_BASE = 'http://127.0.0.1:9';
+    let stdout = '';
+    const originalOut = process.stdout.write;
+    process.stdout.write = s => { stdout += String(s); return true; };
+    try {
+      const code = await runExplain({ input: reportPath }, []);
+      assert.equal(code, 2);
+    } finally {
+      process.stdout.write = originalOut;
+      if (previousBase === undefined) delete process.env.VEXES_AI_BASE;
+      else process.env.VEXES_AI_BASE = previousBase;
+      rmSync(dir, { recursive: true, force: true });
+    }
+    assert.match(stdout, /incomplete/);
+    assert.doesNotMatch(stdout, /No vulnerabilities to triage/);
   });
 });

@@ -27,18 +27,86 @@ const cleanCacheWith = (fingerprint, stored = null) => ({
 });
 let capturedWrite = null;
 
+function registryPack(scripts = {}) {
+  return {
+    'dist-tags': { latest: '1.0.0' },
+    time: { created: '2020-01-01T00:00:00Z', modified: '2020-01-01T00:00:00Z', '1.0.0': '2020-01-01T00:00:00Z' },
+    versions: {
+      '1.0.0': {
+        name: 'some-pkg', version: '1.0.0', scripts, dependencies: {},
+        _npmUser: { name: 'publisher' },
+        dist: {
+          tarball: 'https://registry.npmjs.org/some-pkg/-/some-pkg-1.0.0.tgz',
+          integrity: 'sha512-dGVzdA==',
+        },
+      },
+    },
+    maintainers: [{ name: 'publisher' }],
+    repository: { url: 'https://github.com/example/some-pkg' },
+  };
+}
+
+function response(body) {
+  return { ok: true, status: 200, async text() { return JSON.stringify(body); } };
+}
+
 describe('analyzeSinglePackage: signal cache vs fresh OSV evidence', () => {
-  it('serves a cache hit only when the fresh OSV evidence matches the fingerprint', async () => {
-    const cached = {
-      name: 'some-pkg', version: '1.0.0', ecosystem: 'npm',
-      signals: [], riskScore: 0, riskLevel: 'NONE', warnings: [],
-      osvFingerprint: '',
+  it('passes the configured metadata TTL to signal-cache reads', async () => {
+    const previousFetch = global.fetch;
+    global.fetch = async () => response(registryPack());
+    let observedTtl;
+    const cache = {
+      getSignals: (_eco, _name, _version, ttl) => { observedTtl = ttl; return null; },
+      setSignals() {},
     };
-    const cache = cleanCacheWith('', cached);
-    const out = await analyzeSinglePackage(dep, osvDataFor([]), {}, cache);
-    // The internal fingerprint field must not leak into the output contract
-    assert.equal(out.osvFingerprint, undefined);
-    assert.equal(out.riskLevel, 'NONE');
+    try {
+      await analyzeSinglePackage(dep, osvDataFor([]), { cache: { metadataTtlMs: 1234 } }, cache);
+      assert.equal(observedTtl, 1234);
+    } finally {
+      global.fetch = previousFetch;
+    }
+  });
+
+  it('serves a cache hit only when the fresh OSV evidence matches the fingerprint', async () => {
+    const previousFetch = global.fetch;
+    global.fetch = async () => response(registryPack());
+    let stored = null;
+    const cache = {
+      getSignals: () => stored,
+      setSignals: (_eco, _name, _version, value) => { stored = value; },
+    };
+    try {
+      const first = await analyzeSinglePackage(dep, osvDataFor([]), {}, cache);
+      assert.equal(first.riskLevel, 'NONE');
+      assert.equal(typeof stored.analysisFingerprint, 'string');
+      stored.cacheMarker = 'served';
+      const out = await analyzeSinglePackage(dep, osvDataFor([]), {}, cache);
+      assert.equal(out.cacheMarker, 'served');
+      assert.equal(out.osvFingerprint, undefined);
+      assert.equal(out.analysisFingerprint, undefined);
+    } finally {
+      global.fetch = previousFetch;
+    }
+  });
+
+  it('invalidates a cached clean verdict when registry signal metadata changes', async () => {
+    const previousFetch = global.fetch;
+    let pack = registryPack();
+    global.fetch = async () => response(pack);
+    let stored = null;
+    const cache = {
+      getSignals: () => stored,
+      setSignals: (_eco, _name, _version, value) => { stored = value; },
+    };
+    try {
+      const first = await analyzeSinglePackage(dep, osvDataFor([]), {}, cache);
+      assert.equal(first.signals.some(signal => signal.signal === 'POSTINSTALL_SCRIPT'), false);
+      pack = registryPack({ postinstall: 'node setup.js' });
+      const second = await analyzeSinglePackage(dep, osvDataFor([]), {}, cache);
+      assert.equal(second.signals.some(signal => signal.signal === 'POSTINSTALL_SCRIPT'), true);
+    } finally {
+      global.fetch = previousFetch;
+    }
   });
 
   it('re-analyzes (never trusts cache) when a new advisory appeared since caching', async () => {

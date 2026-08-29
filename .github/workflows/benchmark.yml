@@ -2,15 +2,15 @@ name: Benchmark
 
 on:
   workflow_dispatch:
-  # Weekly freshness check of the OSV ground truth + benign FP rate
+  # Weekly freshness check of OSV ground truth + pinned sampled FP controls
   schedule:
     - cron: '37 6 * * 1'
   pull_request:
     branches: [main]
-    paths: ['src/**', 'benchmark/**']
+    paths: ['src/**', 'benchmark/**', 'test/test-benchmark.js', 'test/test-signal-semantics.js', 'BENCHMARK.md', '.github/workflows/benchmark.yml']
   push:
     branches: [main]
-    paths: ['src/**', 'benchmark/**']
+    paths: ['src/**', 'benchmark/**', 'test/test-benchmark.js', 'test/test-signal-semantics.js', 'BENCHMARK.md', '.github/workflows/benchmark.yml']
 
 jobs:
   benchmark:
@@ -23,15 +23,20 @@ jobs:
         with:
           node-version: 24
 
-      # PRs: the gate only (known compromises must be flagged; the full run
-      # also gates on this but takes longer — it inspects ten live packages).
-      - name: Known-bad flagging (gate)
+      # PRs run the deterministic/OSV gates separately so a failure names the
+      # affected trust boundary. Part C is network-heavier and runs on main.
+      - name: Part A — exact advisory identity gate
         if: github.event_name == 'pull_request'
         run: node benchmark/run.mjs --part a
 
-      # main pushes + scheduled: full run. The run exits nonzero if any
-      # known-bad package goes unflagged; technique detection and the benign
-      # FP rate are published to the job summary as tuning targets.
-      - name: Full benchmark
+      - name: Part B — technique and negative-control gate
+        if: github.event_name == 'pull_request'
+        run: node benchmark/run.mjs --part b
+
+      # Main pushes and the weekly schedule run all three gates. Part C is
+      # digest-pinned bounded sampling: it reports status INCOMPLETE/exit 0
+      # when its measurement succeeds, but execution errors, current blocking
+      # advisories, and FP-ceiling regressions still fail this job.
+      - name: Full benchmark — all gates
         if: github.event_name != 'pull_request'
         run: node benchmark/run.mjs

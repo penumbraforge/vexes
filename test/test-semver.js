@@ -29,8 +29,11 @@ describe('compareSemver', () => {
     assert.equal(compareSemver('^2.0.0', 'v2.0.0'), 0);
   });
 
-  it('ignores pre-release / build metadata for core ordering', () => {
-    assert.equal(compareSemver('1.2.3-rc.1', '1.2.3'), 0);
+  it('applies pre-release precedence and ignores build metadata', () => {
+    assert.ok(compareSemver('1.2.3-rc.1', '1.2.3') < 0);
+    assert.ok(compareSemver('1.2.3-rc.2', '1.2.3-rc.10') < 0);
+    assert.ok(compareSemver('1.2.3-1', '1.2.3-alpha') < 0);
+    assert.equal(compareSemver('1.2.3+one', '1.2.3+two'), 0);
     assert.ok(compareSemver('2.0.0-beta', '1.9.9') > 0);
   });
 

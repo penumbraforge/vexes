@@ -21,12 +21,12 @@ jobs:
           node bin/vexes.js scan --path demo || code=$?
           test "${code:-0}" -le 1
 
-      - name: "Step 2: Deep behavioral analysis (4-layer engine)"
+      - name: "Step 2: Heuristic registry and install-script analysis"
         run: |
           node bin/vexes.js analyze --path demo || code=$?
           test "${code:-0}" -le 1
 
-      - name: "Step 3: Verified fix recommendations"
+      - name: "Step 3: OSV-cross-checked fix candidates"
         run: |
           node bin/vexes.js fix --path demo || code=$?
           test "${code:-0}" -le 1

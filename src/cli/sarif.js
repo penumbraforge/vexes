@@ -52,6 +52,14 @@ function reachabilityFor(v) {
   return v.reachability || 'unknown';
 }
 
+function importEvidenceFor(v) {
+  if (v.importEvidence) return v.importEvidence;
+  if (v.reachability === 'reachable') return 'found_static';
+  if (v.reachability === 'lazy') return 'found_dynamic';
+  if (v.reachability === 'dead') return 'not_found';
+  return 'unknown';
+}
+
 function securitySeverityFor(severity) {
   return SECURITY_SEVERITY[String(severity).toUpperCase()] || '0.0';
 }
@@ -115,9 +123,11 @@ export function toSarif(scanResult = {}) {
       partialFingerprints: {
         'vexes/packageVulnerability/v1': `${v.ecosystem}:${v.package}:${v.id}`,
       },
-      // Tier A reachability grade flows into SARIF properties so CI triage
-      // rules can branch on it (e.g. ignore `dead` in auto-PR decoration).
+      // Canonical Tier A direct-import evidence is contextual only and must
+      // never suppress a security finding. `reachability` remains additive
+      // compatibility data for older SARIF consumers.
       properties: {
+        importEvidence: importEvidenceFor(v),
         reachability: reachabilityFor(v),
       },
     };

@@ -11,8 +11,8 @@
  *    mirroring the user's claude-cluster config.
  *
  * Gated entirely on env: with no key/token/base configured, vexes makes no AI
- * calls at all (the caller degrades to a pointer message). The scanner's core
- * is deterministic and offline; this is strictly an opt-in layer on top.
+ * calls at all (the caller degrades to a pointer message). This model path is
+ * opt-in; scanner commands can independently contact OSV and registries.
  *
  * @module ai/claude
  */

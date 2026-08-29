@@ -127,3 +127,25 @@ describe('OSV severity: entry-shape dispatch', () => {
     assert.equal(severityOf(withSeverity([])), 'CRITICAL');
   });
 });
+
+describe('OSV fixed-version hints', () => {
+  it('selects the next fixed event after the installed version across multiple intervals', () => {
+    const vuln = {
+      id: 'TEST-MULTI-RANGE',
+      summary: 'multi-range advisory',
+      database_specific: { severity: 'HIGH' },
+      affected: [{
+        package: { ecosystem: 'npm', name: 'demo' },
+        ranges: [{
+          type: 'SEMVER',
+          events: [
+            { introduced: '0' }, { fixed: '1.0.0' },
+            { introduced: '2.0.0' }, { fixed: '3.0.0' },
+          ],
+        }],
+      }],
+    };
+    const normalized = normalizeVuln(vuln, { name: 'demo', version: '2.5.0', ecosystem: 'npm' });
+    assert.equal(normalized.fixed, '>= 3.0.0');
+  });
+});

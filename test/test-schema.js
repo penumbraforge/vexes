@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   SCHEMA_VERSION,
   CONFIDENCE,
+  IMPORT_EVIDENCE,
   REACHABILITY,
   buildEnvelope,
   normalizeFinding,
@@ -68,13 +69,21 @@ describe('schema: finding normalization', () => {
     assert.equal(f.severity, 'CRITICAL'); // field passthrough
   });
 
-  it('adds severityLevel, confidence, reachability, advisories, llmSummary', () => {
-    const f = normalizeFinding(VULN, { direct: true, reachability: REACHABILITY.REACHABLE });
+  it('adds severityLevel, confidence, compatibility reachability, direct-import evidence, advisories, and llmSummary', () => {
+    const f = normalizeFinding(VULN, {
+      direct: true,
+      reachability: REACHABILITY.REACHABLE,
+      fixCommand: 'npm install axios@1.14.2',
+    });
     assert.deepEqual(f.severityLevel, { level: 'CRITICAL', order: 4 });
     assert.equal(f.confidence, CONFIDENCE.PROVEN);
     assert.equal(f.reachability, REACHABILITY.REACHABLE);
+    assert.equal(f.importEvidence, IMPORT_EVIDENCE.FOUND_STATIC);
     assert.deepEqual(f.advisories, ['GHSA-aaaa', 'CVE-2026-0001']);
     assert.equal(f.direct, true);
+    assert.equal(f.fixCandidate.status, 'advisory-fixed-version-hint');
+    assert.equal(f.fixCandidate.osvCrossChecked, false);
+    assert.equal(f.fixCandidate.remediationVerified, false);
     assert.match(f.llmSummary, /Blocker: yes\./);
   });
 
@@ -89,17 +98,17 @@ describe('schema: llmSummary', () => {
   it('answers the blocker question and is one sentence', () => {
     const s = llmSummary(VULN, null, { reachability: REACHABILITY.REACHABLE });
     assert.match(s, /\[CRITICAL\] axios@1\.14\.1 \(npm\)/);
-    assert.match(s, /Fixed in >= 1\.14\.2/);
+    assert.match(s, /OSV records a fixed event at >= 1\.14\.2/);
     assert.match(s, /Imported by this project's code/);
     assert.match(s, /Blocker: yes\.$/);
   });
 
-  it('notes dead deps as non-blocking', () => {
+  it('describes not-found import evidence without claiming runtime unreachability', () => {
     const s = llmSummary({ severity: 'CRITICAL', package: 'x', version: '1', ecosystem: 'npm', id: 'A' },
       null, { reachability: REACHABILITY.DEAD });
     assert.match(s, /No direct import found/);
     // The old wording claimed the package is "not reachable" — overclaiming.
-    // Dead is import evidence, not proof the code can never execute.
+    // The legacy dead value maps to canonical not_found import evidence.
     assert.doesNotMatch(s, /not reachable/);
   });
 });

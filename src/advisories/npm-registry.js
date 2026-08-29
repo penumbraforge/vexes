@@ -2,6 +2,25 @@ import { NPM_REGISTRY_URL, NPM_ATTESTATIONS_URL } from '../core/constants.js';
 import { fetchJSON } from '../core/fetcher.js';
 import { log } from '../core/logger.js';
 
+// npm's package metadata contains several script families with materially
+// different trust boundaries.  A registry tarball can execute only the
+// dependency install hooks below when consumed normally.  `prepare` can run
+// for git/file/link installs, while publish/pack hooks run on the producer's
+// machine.  Treating all of them as "postinstall" made harmless release
+// automation look like consumer-side code execution.
+export const REGISTRY_INSTALL_HOOKS = Object.freeze([
+  'preinstall', 'install', 'postinstall',
+]);
+export const NON_REGISTRY_INSTALL_HOOKS = Object.freeze([
+  'prepare',
+]);
+export const PROJECT_LIFECYCLE_HOOKS = Object.freeze([
+  'prepublish', 'preprepare', 'postprepare', 'dependencies',
+]);
+export const PUBLISH_PACK_HOOKS = Object.freeze([
+  'prepublishOnly', 'prepack', 'postpack', 'publish', 'postpublish',
+]);
+
 /**
  * Encode npm package name for use in registry URLs.
  * Scoped packages need special handling: @scope/name → @scope%2fname
@@ -75,16 +94,23 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
 
   const latestAvailable = latestTag || versionList[versionList.length - 1];
 
-  // Anchor to the installed version when the packument knows it; otherwise
-  // fall back to latest (and say so via anchoredToInstalled).
-  const anchoredToInstalled = requestedVersion !== null && versions[requestedVersion] !== undefined;
-  const latestVersion = anchoredToInstalled ? requestedVersion : latestAvailable;
-  const anchorIdx = versionList.indexOf(latestVersion);
-
-  const latestData = versions[latestVersion] || {};
-  const previousVersion = anchorIdx > 0
-    ? versionList[anchorIdx - 1]
-    : (anchorIdx === -1 && versionList.length >= 2 ? versionList[versionList.length - 2] : null);
+  // When a caller requests an exact version, NEVER substitute dist-tags.latest.
+  // A guard that asked about x@1.2.3 must not silently approve x@9.0.0's
+  // metadata.  Keep latestAvailable for display, but make the missing anchor
+  // explicit and leave all signal-feeding version data empty/fail-closed.
+  const versionWasRequested = requestedVersion !== null;
+  const requestedVersionFound = versionWasRequested
+    ? Object.hasOwn(versions, requestedVersion)
+    : null;
+  const anchoredToInstalled = versionWasRequested && requestedVersionFound === true;
+  const latestVersion = versionWasRequested ? requestedVersion : latestAvailable;
+  const anchorIdx = requestedVersionFound === false ? -1 : versionList.indexOf(latestVersion);
+  const latestData = requestedVersionFound === false ? {} : (versions[latestVersion] || {});
+  const metadataComplete = requestedVersionFound !== false && !!latestVersion && !!versions[latestVersion];
+  const anchorError = requestedVersionFound === false
+    ? `requested npm version ${packageName}@${requestedVersion} is absent from the registry packument`
+    : null;
+  const previousVersion = anchorIdx > 0 ? versionList[anchorIdx - 1] : null;
   const previousData = previousVersion ? versions[previousVersion] : null;
 
   // Extract maintainer info
@@ -97,22 +123,17 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
   const latestPublisher = latestData._npmUser?.name || latestData._npmUser?.email || null;
   const previousPublisher = previousData?._npmUser?.name || previousData?._npmUser?.email || null;
 
-  // Extract scripts from latest version.
-  // Check ALL lifecycle scripts that can execute code, not just pre/install/postinstall.
-  // `prepare` is critical: runs after install from git dependencies.
+  // Separate consumer install hooks from producer/local lifecycle hooks.  Only
+  // REGISTRY_INSTALL_HOOKS execute when this published registry artifact is
+  // installed as a normal dependency.
   const scripts = latestData.scripts || {};
-  const LIFECYCLE_SCRIPTS = [
-    'preinstall', 'install', 'postinstall',
-    'prepare',          // Runs after install (especially from git deps)
-    'prepublish',       // Deprecated but still honored
-    'prepublishOnly',   // Runs only during npm publish
-    'prepack', 'postpack',  // Runs around tarball creation
-    'dependencies',     // npm v7+ — runs after dep tree resolved
-  ];
-  const installScripts = {};
-  for (const hook of LIFECYCLE_SCRIPTS) {
-    if (scripts[hook]) installScripts[hook] = scripts[hook];
-  }
+  const pickScripts = (hooks, source = scripts) => Object.fromEntries(
+    hooks.filter(hook => source[hook]).map(hook => [hook, source[hook]])
+  );
+  const installScripts = pickScripts(REGISTRY_INSTALL_HOOKS);
+  const nonRegistryInstallScripts = pickScripts(NON_REGISTRY_INSTALL_HOOKS);
+  const projectLifecycleScripts = pickScripts(PROJECT_LIFECYCLE_HOOKS);
+  const publishScripts = pickScripts(PUBLISH_PACK_HOOKS);
   const hasInstallScripts = Object.keys(installScripts).length > 0;
 
   // Previous version's lifecycle scripts — lets behavioral analysis run a
@@ -120,13 +141,22 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
   // null = previous version unknown (no diff possible); {} = previous version
   // known to have no lifecycle scripts (a meaningful, diffable fact).
   let previousInstallScripts = null;
+  let previousNonRegistryInstallScripts = null;
+  let previousPublishScripts = null;
   if (previousData) {
-    previousInstallScripts = {};
     const prevScripts = previousData.scripts || {};
-    for (const hook of LIFECYCLE_SCRIPTS) {
-      if (prevScripts[hook]) previousInstallScripts[hook] = prevScripts[hook];
-    }
+    previousInstallScripts = pickScripts(REGISTRY_INSTALL_HOOKS, prevScripts);
+    previousNonRegistryInstallScripts = pickScripts(NON_REGISTRY_INSTALL_HOOKS, prevScripts);
+    previousPublishScripts = pickScripts(PUBLISH_PACK_HOOKS, prevScripts);
   }
+
+  // Exact artifact identity used by guard/preflight.  Expose both a grouped
+  // object and stable top-level fields for simple callers.
+  const artifact = {
+    tarball: latestData.dist?.tarball || null,
+    integrity: latestData.dist?.integrity || null,
+    shasum: latestData.dist?.shasum || null,
+  };
 
   // Extract dependencies diff (latest vs previous)
   const latestDeps = Object.keys(latestData.dependencies || {});
@@ -164,7 +194,11 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
   // version can't say anything about how it arrived.
   // This detects packages that were abandoned then suddenly reactivated
   let dormancyMs = null;
-  const historyUpToAnchor = anchorIdx >= 0 ? versionList.slice(0, anchorIdx + 1) : versionList;
+  // A missing exact target has no trustworthy version history anchor.  Do not
+  // derive dormancy or release-gap facts from whatever happens to be latest.
+  const historyUpToAnchor = requestedVersionFound === false
+    ? []
+    : (anchorIdx >= 0 ? versionList.slice(0, anchorIdx + 1) : versionList);
   if (historyUpToAnchor.length >= 2) {
     const recentVersions = historyUpToAnchor.slice(-5);
     for (let i = 1; i < recentVersions.length; i++) {
@@ -179,9 +213,13 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
 
   return {
     name: packageName,
-    latestVersion,       // the analyzed (anchor) version — installed when known
+    latestVersion,       // analyzed target; exact requested value is never replaced
     latestAvailable,     // dist-tags.latest, for outdated-version signals
+    requestedVersion,
+    requestedVersionFound,
     anchoredToInstalled,
+    metadataComplete,
+    anchorError,
     previousVersion,
     maintainers,
     latestPublisher,
@@ -189,8 +227,19 @@ export function normalizeMetadata(data, packageName, requestedVersion = null) {
     maintainerChanged: latestPublisher !== null && previousPublisher !== null && latestPublisher !== previousPublisher,
     hasInstallScripts,
     installScripts,
+    hasNonRegistryInstallScripts: Object.keys(nonRegistryInstallScripts).length > 0,
+    nonRegistryInstallScripts,
+    projectLifecycleScripts,
+    hasPublishScripts: Object.keys(publishScripts).length > 0,
+    publishScripts,
     previousInstallScripts,
+    previousNonRegistryInstallScripts,
+    previousPublishScripts,
     scripts,
+    artifact,
+    tarball: artifact.tarball,
+    integrity: artifact.integrity,
+    shasum: artifact.shasum,
     dependencies: latestDeps,
     addedDeps,
     removedDeps,

@@ -1,14 +1,15 @@
 import { fetchJSON } from '../core/fetcher.js';
 import { NPM_REGISTRY_URL } from '../core/constants.js';
 import { log } from '../core/logger.js';
+import { REGISTRY_INSTALL_HOOKS } from '../advisories/npm-registry.js';
 
 /**
  * Dependency graph analyzer.
  *
- * Goes beyond "did a new dep appear" — profiles WHAT the new dep is.
- * This layer would have caught the axios attack: plain-crypto-js was
- * 18 hours old, had zero dependents, and was published by the same
- * compromised account.
+ * Goes beyond "did a new dep appear" — profiles what the new dependency is.
+ * The resulting age, adoption, and publisher signals are review prompts;
+ * they do not prove malicious intent or that a past incident would have
+ * been detected before disclosure.
  */
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -151,6 +152,11 @@ async function profileDependency(packageName) {
     const created = timeMap.created ? new Date(timeMap.created) : null;
     const latestTag = data['dist-tags']?.latest;
     const latestData = latestTag ? data.versions?.[latestTag] : null;
+    const installScripts = Object.fromEntries(
+      REGISTRY_INSTALL_HOOKS
+        .filter(hook => latestData?.scripts?.[hook])
+        .map(hook => [hook, latestData.scripts[hook]])
+    );
 
     return {
       name: packageName,
@@ -159,14 +165,8 @@ async function profileDependency(packageName) {
       versionCount: versions.length,
       latestPublisher: latestData?._npmUser?.name || null,
       latestPublishTime: latestTag && timeMap[latestTag] ? new Date(timeMap[latestTag]) : null,
-      hasInstallScripts: !!(latestData?.scripts?.preinstall || latestData?.scripts?.install ||
-        latestData?.scripts?.postinstall || latestData?.scripts?.prepare ||
-        latestData?.scripts?.prepublish || latestData?.scripts?.prepack),
-      installScripts: Object.fromEntries(
-        ['preinstall', 'install', 'postinstall', 'prepare', 'prepublish', 'prepublishOnly', 'prepack', 'postpack', 'dependencies']
-          .filter(hook => latestData?.scripts?.[hook])
-          .map(hook => [hook, latestData.scripts[hook]])
-      ),
+      hasInstallScripts: Object.keys(installScripts).length > 0,
+      installScripts,
     };
   } catch (err) {
     log.debug(`failed to profile dependency ${packageName}: ${err.message}`);

@@ -1,25 +1,33 @@
 import { resolve, basename, join } from 'node:path';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { loadConfig } from '../cli/config.js';
 import { buildEnvelope } from '../cli/schema.js';
 import { C, createSpinner, header, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
-import { VERSION, EXIT, SEVERITY, ANALYZE_CONCURRENCY } from '../core/constants.js';
-import { discover as discoverNpm, parseLockfile as parseNpmLock } from '../parsers/npm.js';
+import { VERSION, EXIT, SEVERITY, ANALYZE_CONCURRENCY, DEEP_ANALYZE_CONCURRENCY } from '../core/constants.js';
+import { discover as discoverNpm, parseLockfile as parseNpmLock, parseManifest as parseNpmManifest } from '../parsers/npm.js';
 import { discover as discoverPnpm, parseLockfile as parsePnpmLock } from '../parsers/pnpm.js';
 import { discover as discoverYarn, parseLockfile as parseYarnLock } from '../parsers/yarn.js';
 import { discover as discoverPypi, parseFile as parsePypiFile } from '../parsers/pypi.js';
 import { queryBatch } from '../advisories/osv.js';
 import { fetchNpmMetadata } from '../advisories/npm-registry.js';
 import { fetchPypiMetadata } from '../advisories/pypi-registry.js';
-import { checkProvenance, detectProvenanceSpoof } from '../analysis/provenance.js';
+import { checkProvenance, detectAttestationIdentityMismatch } from '../analysis/provenance.js';
 import { analyzePackage, scoreToLevel, SIGNAL_CONFIDENCE } from '../analysis/signals.js';
-import { inspectTarball, getTarballUrl, getPypiTarballUrl, downloadAndExtractToDisk } from '../analysis/tarball-inspector.js';
+import { inspectTarball, getPypiTarballUrl, downloadAndExtractToDisk } from '../analysis/tarball-inspector.js';
 import { detectSandboxHost } from '../analysis/sandbox/index.js';
 import { runHarnessed, pickEntryScript, buildSandboxSignal } from '../analysis/sandbox/harness.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { partitionByIgnore } from '../core/ignore.js';
+
+/** Honor explicit per-signal policy for command-added detection layers. */
+export function isAnalysisSignalEnabled(config, signal, compatibilityNames = []) {
+  const configured = config?.analyze?.signals || {};
+  if (configured[signal] !== undefined) return configured[signal] !== 'off';
+  return !compatibilityNames.some(name => configured[name] === 'off');
+}
 
 /**
  * `vexes analyze` — Deep behavioral analysis of dependency supply chain.
@@ -48,6 +56,12 @@ export async function runAnalyze(flags, args) {
 
   const warnings = [];
   let parseFailures = 0;
+  let sandboxIncomplete = false;
+  let deepIncomplete = false;
+  let provenanceIncomplete = false;
+  let parsedDependencyFiles = 0;
+  let unresolvedManifestInputs = 0;
+  const dependencyFiles = new Set();
 
   // 1. Discover and parse lockfiles
   const allDeps = [];
@@ -56,30 +70,78 @@ export async function runAnalyze(flags, args) {
   for (const ecoName of config.ecosystems) {
     if (ecoName === 'npm') {
       // Discover from all npm-ecosystem lockfiles: npm, pnpm, yarn
+      let npmLockfileCount = 0;
       for (const [discFn, parseFn] of [[discoverNpm, parseNpmLock], [discoverPnpm, parsePnpmLock], [discoverYarn, parseYarnLock]]) {
         const { lockfiles } = discFn(targetDir);
+        npmLockfileCount += lockfiles.length;
         for (const lf of lockfiles) {
+          dependencyFiles.add(basename(lf));
           try {
             const deps = parseFn(lf);
+            parsedDependencyFiles++;
+            if (deps.unresolvedEntries > 0) {
+              unresolvedManifestInputs++;
+              warnings.push(`${basename(lf)} contains ${deps.unresolvedEntries} local, linked, remote, or unanchored npm entr${deps.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not analyzed`);
+            }
             // For analyze, focus on direct deps by default (transitive deps = too much noise)
             const directDeps = deps.filter(d => d.isDirect);
-          const depsToAnalyze = verbose ? deps : (directDeps.length > 0 ? directDeps : deps);
-          allDeps.push(...depsToAnalyze);
-          ecosystemsFound.add('npm');
-        } catch (err) {
-          warnings.push(`failed to parse ${basename(lf)}: ${err.message}`);
-          log.error(warnings[warnings.length - 1]);
-          parseFailures++;
+            const depsToAnalyze = verbose ? deps : (directDeps.length > 0 ? directDeps : deps);
+            allDeps.push(...depsToAnalyze);
+            ecosystemsFound.add('npm');
+          } catch (err) {
+            warnings.push(`failed to parse ${basename(lf)}: ${err.message}`);
+            log.error(warnings[warnings.length - 1]);
+            parseFailures++;
+          }
         }
       }
+
+      // Without a lockfile, exact manifest pins are usable but ranges are not.
+      // Never turn a range-only package.json into a complete empty analysis.
+      if (npmLockfileCount === 0) {
+        const { manifests } = discoverNpm(targetDir);
+        if (manifests.length > 0) {
+          unresolvedManifestInputs++;
+          warnings.push('no npm lockfile found — exact package.json pins can be analyzed, but resolved/transitive coverage is incomplete');
+        }
+        for (const mf of manifests) {
+          dependencyFiles.add(basename(mf));
+          try {
+            const deps = parseNpmManifest(mf);
+            parsedDependencyFiles++;
+            if (hasUnresolvedManifestEntries(mf, 'npm', 'package.json', deps.length)) {
+              unresolvedManifestInputs++;
+              warnings.push(`${basename(mf)} contains dependencies without exact registry versions — add a lockfile or exact pins; those entries were not analyzed`);
+            }
+            const directDeps = deps.filter(d => d.isDirect);
+            const depsToAnalyze = verbose ? deps : (directDeps.length > 0 ? directDeps : deps);
+            allDeps.push(...depsToAnalyze);
+            ecosystemsFound.add('npm');
+          } catch (err) {
+            warnings.push(`failed to parse ${basename(mf)}: ${err.message}`);
+            log.error(warnings[warnings.length - 1]);
+            parseFailures++;
+          }
+        }
       }
     }
     if (ecoName === 'pypi') {
       const { lockfiles, manifests } = discoverPypi(targetDir);
       const files = lockfiles.length > 0 ? lockfiles : manifests;
+      if (lockfiles.length === 0 && manifests.length > 0) {
+        unresolvedManifestInputs++;
+        warnings.push('no PyPI lockfile found — exact manifest pins can be analyzed, but resolved/transitive coverage is incomplete');
+      }
       for (const file of files) {
+        dependencyFiles.add(basename(file.path));
         try {
           const deps = parsePypiFile(file.path, file.format);
+          parsedDependencyFiles++;
+          if (hasUnresolvedManifestEntries(file.path, 'pypi', file.format, deps)) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(file.path)} contains dependencies without exact public-PyPI identities — those entries were not analyzed`);
+            for (const failure of deps.includeFailures || []) warnings.push(`${basename(file.path)}: ${failure}`);
+          }
           const directDeps = deps.filter(d => d.isDirect);
           const depsToAnalyze = verbose ? deps : (directDeps.length > 0 ? directDeps : deps);
           allDeps.push(...depsToAnalyze);
@@ -94,16 +156,31 @@ export async function runAnalyze(flags, args) {
   }
 
   if (allDeps.length === 0) {
-    if (!isJSON) out(`  ${C.dim}No dependencies found to analyze in ${targetDir}${C.reset}\n`);
-    else out(JSON.stringify(buildEnvelope({
-      command: 'analyze',
-      target: { dir: targetDir, lockfiles: [], ecosystems: [...config.ecosystems] },
-      complete: true,
-      warnings,
-      findings: [],
-      extra: { version: VERSION, results: [] },
-    }), null, 2));
-    return EXIT.OK;
+    const complete = parseFailures === 0 && parsedDependencyFiles > 0 && unresolvedManifestInputs === 0;
+    if (dependencyFiles.size === 0) {
+      warnings.push('no supported dependency lockfile or manifest found — analysis did not run');
+    } else if (parsedDependencyFiles === 0) {
+      warnings.push('no dependency file could be parsed — analysis did not run');
+    }
+
+    if (isJSON) {
+      out(JSON.stringify(buildEnvelope({
+        command: 'analyze',
+        target: { dir: targetDir, lockfiles: [...dependencyFiles], ecosystems: [...config.ecosystems] },
+        complete,
+        warnings,
+        summary: { total: 0, flagged: 0 },
+        findings: [],
+        extra: { version: VERSION, results: [] },
+      }), null, 2));
+    } else if (complete) {
+      out(`  ${C.dim}No dependencies found in the parsed dependency file(s)${C.reset}\n`);
+    } else {
+      out(`  ${C.red}! Analysis incomplete — no usable dependency data was available${C.reset}`);
+      for (const warning of warnings) out(`  ${C.yellow}! ${warning}${C.reset}`);
+      out('');
+    }
+    return complete ? EXIT.OK : EXIT.ERROR;
   }
 
   // Deduplicate
@@ -187,10 +264,18 @@ export async function runAnalyze(flags, args) {
           chunk.map(pkg => checkProvenance(pkg.name, pkg.version).then(prov => ({ pkg, prov })))
         );
 
-        for (const r of provResults) {
-          if (r.status !== 'fulfilled') continue;
+        for (let j = 0; j < provResults.length; j++) {
+          const r = provResults[j];
+          if (r.status !== 'fulfilled') {
+            provenanceIncomplete = true;
+            chunk[j].warnings.push(`provenance attestation lookup incomplete: ${r.reason?.message || 'unknown error'}`);
+            continue;
+          }
           const { pkg, prov } = r.value;
-          if (prov?.hasProvenance === false) {
+          if (!prov || prov.attestationStatus === 'unavailable') {
+            provenanceIncomplete = true;
+            pkg.warnings.push('provenance attestation lookup incomplete');
+          } else if (prov?.hasAttestation === false && isAnalysisSignalEnabled(config, 'MISSING_PROVENANCE')) {
             // Only flag at MODERATE if the package already has other signals
             // Standalone MISSING_PROVENANCE is LOW — <5% of npm has provenance
             const hasOtherSignals = pkg.signals.length > 0;
@@ -199,26 +284,42 @@ export async function runAnalyze(flags, args) {
               signal: 'MISSING_PROVENANCE',
               severity,
               confidence: SIGNAL_CONFIDENCE.MISSING_PROVENANCE,
-              description: 'No Sigstore provenance attestation — package was not verifiably built from source',
+              description: 'No npm provenance attestation was published for this package version',
               evidence: { standalone: !hasOtherSignals },
               layer: 4,
             });
             pkg.riskScore += SEVERITY[severity].weight;
-          } else if (prov?.hasProvenance === true) {
-            pkg.provenance = { sourceRepo: prov.sourceRepo, buildType: prov.buildType };
-
-            // 5a. Provenance ≠ trust: xref the attestation's certified artifact
-            // names (and claimed build repo) against the package's actual
-            // identity + declared repo. Replay and repo-mismatch → signal.
-            const spoof = detectProvenanceSpoof({
-              packageName: pkg.name,
-              subjects: prov.subjects,
+          } else if (prov?.hasAttestation === true) {
+            if (prov.attestationDecoded !== true) {
+              provenanceIncomplete = true;
+              pkg.warnings.push('provenance attestation was present but its payload could not be decoded');
+            }
+            pkg.provenance = {
+              attestationStatus: prov.attestationStatus,
+              attestationDecoded: prov.attestationDecoded,
+              verificationStatus: prov.verificationStatus,
+              cryptographicallyVerified: false,
+              transparencyLogEntryPresent: prov.transparencyLogEntryPresent,
+              claimedSourceRepo: prov.claimedSourceRepo,
+              claimedBuildType: prov.claimedBuildType,
+              // Compatibility names: decoded claims, not verified facts.
               sourceRepo: prov.sourceRepo,
-              declaredRepo: pkg.declaredRepository,
-            });
-            if (spoof) {
-              pkg.signals.push(spoof);
-              pkg.riskScore += SEVERITY[spoof.severity].weight;
+              buildType: prov.buildType,
+            };
+
+            // 5a. Compare decoded claims with package identity. This can find a
+            // mismatch; it does not authenticate the attestation itself.
+            if (isAnalysisSignalEnabled(config, 'ATTESTATION_IDENTITY_MISMATCH', ['SIGNATURE_SPOOF'])) {
+              const mismatch = detectAttestationIdentityMismatch({
+                packageName: pkg.name,
+                subjects: prov.subjects,
+                sourceRepo: prov.sourceRepo,
+                declaredRepo: pkg.declaredRepository,
+              });
+              if (mismatch) {
+                pkg.signals.push(mismatch);
+                pkg.riskScore += SEVERITY[mismatch.severity].weight;
+              }
             }
           }
         }
@@ -227,38 +328,62 @@ export async function runAnalyze(flags, args) {
       provSpinner?.stop(`Provenance checked for ${highRiskNpm.length} packages`);
     }
 
-    // 5b. Deep tarball inspection
-    // --deep: inspect ALL packages. Default: only high-risk (score >= 15)
+    // 5b. Deep tarball inspection is explicit. Default analysis stays at the
+    // metadata/OSV boundary and never surprises the user with package-code
+    // downloads merely because a heuristic score crossed a threshold.
     const tarballCandidates = config.deep
       ? results.filter(r => r.ecosystem === 'npm' || r.ecosystem === 'pypi')
-      : results.filter(r => r.ecosystem === 'npm' && r.riskScore >= 15 && r.signals.length > 0);
+      : [];
 
     if (tarballCandidates.length > 0) {
-      const label = config.deep ? 'all' : 'high-risk';
-      const tarSpinner = isJSON ? null : createSpinner(`Deep code inspection for ${tarballCandidates.length} ${label} packages...`);
+      const tarSpinner = isJSON ? null : createSpinner(`Deep code inspection for ${tarballCandidates.length} packages...`);
 
-      for (let i = 0; i < tarballCandidates.length; i += ANALYZE_CONCURRENCY) {
-        const chunk = tarballCandidates.slice(i, i + ANALYZE_CONCURRENCY);
+      for (let i = 0; i < tarballCandidates.length; i += DEEP_ANALYZE_CONCURRENCY) {
+        const chunk = tarballCandidates.slice(i, i + DEEP_ANALYZE_CONCURRENCY);
         const tarResults = await Promise.allSettled(
           chunk.map(async (pkg) => {
             let tarUrl;
             if (pkg.ecosystem === 'pypi') {
               tarUrl = await getPypiTarballUrl(pkg.name, pkg.version);
             } else {
-              tarUrl = getTarballUrl({ name: pkg.name }, pkg.version);
+              tarUrl = pkg.registryArtifact?.tarball || null;
             }
-            if (!tarUrl) return null;
-            return inspectTarball(tarUrl, pkg.name);
+            if (!tarUrl) return { error: 'could not determine tarball URL' };
+            return inspectTarball(tarUrl, pkg.name, pkg.ecosystem === 'npm'
+              ? {
+                  integrity: pkg.registryArtifact?.integrity || null,
+                  shasum: pkg.registryArtifact?.shasum || null,
+                }
+              : undefined);
           })
         );
 
         for (let j = 0; j < chunk.length; j++) {
           const pkg = chunk[j];
           const r = tarResults[j];
-          if (r.status !== 'fulfilled' || !r.value) continue;
+          if (r.status !== 'fulfilled') {
+            warnings.push(`deep inspection: ${pkg.name}@${pkg.version}: ${r.reason?.message || 'inspection failed'}`);
+            deepIncomplete = true;
+            continue;
+          }
+          if (r.value?.error) {
+            warnings.push(`deep inspection: ${pkg.name}@${pkg.version}: ${r.value.error}`);
+            deepIncomplete = true;
+            continue;
+          }
 
           const tarResult = r.value;
-          if (tarResult.findings.length > 0) {
+          for (const warning of tarResult.warnings || []) {
+            warnings.push(`deep inspection: ${pkg.name}@${pkg.version}: ${warning}`);
+          }
+          pkg.deepInspection = {
+            requested: !!config.deep,
+            coverage: tarResult.coverage || { mode: 'unknown', packageComplete: false },
+            packageComplete: tarResult.coverage?.packageComplete === true,
+          };
+          if (pkg.deepInspection.packageComplete !== true) deepIncomplete = true;
+          if (tarResult.findings.length > 0 && isAnalysisSignalEnabled(config, 'TARBALL_DANGEROUS_PATTERN')) {
+            let addedRisk = 0;
             for (const finding of tarResult.findings) {
               pkg.signals.push({
                 signal: 'TARBALL_DANGEROUS_PATTERN',
@@ -268,9 +393,9 @@ export async function runAnalyze(flags, args) {
                 evidence: { file: finding.file, pattern: finding.pattern },
                 layer: 1,
               });
+              addedRisk += SEVERITY[finding.severity]?.weight || 0;
             }
-            // Recalculate risk score with new signals
-            pkg.riskScore += tarResult.findings.length * SEVERITY.HIGH.weight;
+            pkg.riskScore += addedRisk;
           }
 
           if (tarResult.inspectedFiles.length > 0) {
@@ -283,15 +408,17 @@ export async function runAnalyze(flags, args) {
     }
 
     // 5c. Dynamic sandbox evidence (--sandbox, experimental, opt-in).
-    // RUNS candidate code in the OS isolation primitive under a recorder shim
+    // RUNS candidate code with contained writes and hidden user/project paths
+    // on the accepted bwrap host, under a positive-only recorder shim.
     // and attaches captured behavior (SANDBOX_BEHAVIOR + sandboxEvidence) to
     // the record. Refuse-by-default: no isolation host / any failure pushes a
-    // warning, never a signal, never fails the deterministic pass. spawnSync
+    // warning, never a signal, and marks the requested dynamic stage incomplete
+    // while preserving deterministic findings. spawnSync
     // is blocking, so the pass is bounded to the top-N by risk score.
     if (config.sandbox) {
       const TOP_N = 5;
       const candidates = results
-        .filter(r => (r.ecosystem === 'npm' || r.ecosystem === 'pypi') && r.riskScore >= 15 && r.signals.length > 0)
+        .filter(r => r.ecosystem === 'npm' && r.riskScore >= 15 && r.signals.length > 0)
         .sort((a, b) => b.riskScore - a.riskScore)
         .slice(0, TOP_N);
       // Refuse-by-default pre-flight: resolve the effective isolation host
@@ -302,8 +429,16 @@ export async function runAnalyze(flags, args) {
       let hostRefusalReported = config.sandboxHost !== undefined
         ? !config.sandboxHost
         : !detectSandboxHost();
+      if (results.some(r => r.ecosystem === 'pypi' && r.riskScore >= 15 && r.signals.length > 0)) {
+        sandboxIncomplete = true;
+        warnings.push('sandbox: PyPI dynamic extraction/execution is unsupported and was refused');
+      }
       if (hostRefusalReported) {
-        warnings.push('sandbox skipped — no isolation host with filesystem write isolation (need sandbox-exec on macOS, or bwrap on Linux)');
+        sandboxIncomplete = true;
+        warnings.push('sandbox skipped — no bwrap host that contains writes and hides user/project host paths');
+      } else if (candidates.length === 0) {
+        sandboxIncomplete = true;
+        warnings.push('sandbox skipped — no packages met the execution threshold (riskScore >= 15)');
       }
 
       for (const pkg of candidates) {
@@ -312,22 +447,24 @@ export async function runAnalyze(flags, args) {
         const tmp = mkdtempSync(join(tmpdir(), 'vexes-sandbox-'));
         const sbSpinner = isJSON ? null : createSpinner(`Sandboxing ${label}...`);
         try {
-          let tarUrl;
-          if (pkg.ecosystem === 'pypi') tarUrl = await getPypiTarballUrl(pkg.name, pkg.version);
-          else tarUrl = getTarballUrl({ name: pkg.name }, pkg.version);
-          if (!tarUrl) { warnings.push(`sandbox: no tarball URL for ${label} — skipped`); continue; }
-
-          await downloadAndExtractToDisk(tarUrl, pkg.name, tmp);
-
-          if (pkg.ecosystem === 'pypi') {
-            // v1: extraction-only. The recorder shim is Node; we never claim
-            // ran behavior we didn't execute.
-            warnings.push(`sandbox: ${label} (pypi) extracted but not executed — sandbox run is npm-only for now`);
+          const tarUrl = pkg.registryArtifact?.tarball || null;
+          if (!tarUrl) {
+            sandboxIncomplete = true;
+            warnings.push(`sandbox: no tarball URL for ${label} — skipped`);
             continue;
           }
 
+          await downloadAndExtractToDisk(tarUrl, pkg.name, tmp, {
+            integrity: pkg.registryArtifact?.integrity || null,
+            shasum: pkg.registryArtifact?.shasum || null,
+          });
+
           const entry = pickEntryScript(tmp);
-          if (!entry) { warnings.push(`sandbox: no runnable entrypoint in ${label} — skipped`); continue; }
+          if (!entry) {
+            sandboxIncomplete = true;
+            warnings.push(`sandbox: no runnable entrypoint in ${label} — skipped`);
+            continue;
+          }
 
           const child = runHarnessed({
             workdir: tmp,
@@ -338,6 +475,7 @@ export async function runAnalyze(flags, args) {
           });
 
           if (child.status === 'refused') {
+            sandboxIncomplete = true;
             // Host-wide refusal (no isolation primitive) is one report, not one
             // per candidate; an opt-in refusal is reported per candidate.
             if (/no isolation host/.test(child.reason || '')) {
@@ -348,19 +486,31 @@ export async function runAnalyze(flags, args) {
             continue;
           }
 
-          const signal = buildSandboxSignal({ name: pkg.name, version: pkg.version, evidence: child.evidence });
+          if (child.status === 'failed') {
+            sandboxIncomplete = true;
+            warnings.push(`sandbox: ${label} harness failed (${child.reason || 'dynamic evidence incomplete'})`);
+            continue;
+          }
+
+          // Recorder hooks share a process and writable workdir with the
+          // candidate. Positive observations are useful, but absence can be
+          // bypassed or tampered with, so a requested sandbox pass never acts
+          // as negative proof or makes the overall assessment complete.
+          sandboxIncomplete = true;
+          warnings.push(`sandbox: ${label} produced positive-only behavioral observations; empty recorder evidence is not trusted as proof of benign behavior`);
+
+          const signal = isAnalysisSignalEnabled(config, 'SANDBOX_BEHAVIOR')
+            ? buildSandboxSignal({ name: pkg.name, version: pkg.version, evidence: child.evidence })
+            : null;
           if (signal) {
             pkg.signals.push(signal);
             pkg.sandboxEvidence = signal.evidence.dynamic;
             pkg.riskScore += SEVERITY[signal.severity].weight;
-          } else if (child.status === 'failed' && child.reason) {
-            // crash ≠ behavior; the sandbox still isolated it. Only surfaced
-            // verbosely so the deterministic pass stays quiet.
-            if (config.verbose) warnings.push(`sandbox: ${label} harness failed (${child.reason})`);
           } else if (config.verbose) {
             warnings.push(`sandbox: ${label} ran with no behavior recorded`);
           }
         } catch (err) {
+          sandboxIncomplete = true;
           log.debug(`sandbox step failed for ${label}: ${err.message}`);
           warnings.push(`sandbox: ${label} skipped (${err.message})`);
         } finally {
@@ -392,7 +542,8 @@ export async function runAnalyze(flags, args) {
       }
     }
 
-    const complete = parseFailures === 0 && incompleteResults.length === 0 && osvData.failures.length === 0;
+    const complete = parseFailures === 0 && unresolvedManifestInputs === 0 && incompleteResults.length === 0 &&
+      osvData.failures.length === 0 && !sandboxIncomplete && !deepIncomplete;
 
     // 8. Filter — default shows only packages with signals
     const minSeverity = config.severity?.toUpperCase() || 'MODERATE';
@@ -420,7 +571,7 @@ export async function runAnalyze(flags, args) {
       // agents that iterate findings uniformly never mis-parse analyze's shape.
       out(JSON.stringify(buildEnvelope({
         command: 'analyze',
-        target: { dir: targetDir, lockfiles: [], ecosystems: [...config.ecosystems] },
+        target: { dir: targetDir, lockfiles: [...dependencyFiles], ecosystems: [...config.ecosystems] },
         complete,
         warnings,
         summary: {
@@ -431,7 +582,19 @@ export async function runAnalyze(flags, args) {
           high: flaggedResults.filter(r => r.riskLevel === 'HIGH').length,
         },
         findings: [],
-        extra: { version: VERSION, results: flaggedResults },
+        extra: {
+          version: VERSION,
+          results: flaggedResults,
+          stages: {
+            deep: { requested: !!config.deep, complete: !config.deep || !deepIncomplete, packageComplete: !config.deep || !deepIncomplete },
+            sandbox: { requested: !!config.sandbox, complete: !config.sandbox || !sandboxIncomplete },
+            provenance: {
+              requested: highRiskNpm.length > 0,
+              complete: !provenanceIncomplete,
+              cryptographicVerificationPerformed: false,
+            },
+          },
+        },
       }), null, 2));
     } else {
       // Explain mode: detailed breakdown for a single package
@@ -564,14 +727,15 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
   const osvResult = osvCovered ? (osvData.results.get(key) || []) : null;
   const osvFingerprint = osvCovered ? osvResult.map(v => v.id).sort().join(',') : 'uncovered';
 
-  // Check signal cache — a hit is valid ONLY if its OSV fingerprint matches
-  // the fresh evidence ('uncovered' never matches a cached fingerprint, so a
-  // degraded OSV run always re-analyzes instead of trusting stale signals).
-  const cachedSignals = cache.getSignals(dep.ecosystem, dep.name, dep.version);
-  if (cachedSignals && cachedSignals.osvFingerprint === osvFingerprint) {
-    const { osvFingerprint: _evidence, ...output } = cachedSignals;
-    return output;
-  }
+  // Read the signal cache now, but do not return it until registry anchoring is
+  // checked below. A cached verdict must never mask an exact version that is
+  // absent from today's registry metadata.
+  const cachedSignals = cache.getSignals(
+    dep.ecosystem,
+    dep.name,
+    dep.version,
+    config?.cache?.metadataTtlMs,
+  );
 
   // Fetch registry metadata
   let metadata = null;
@@ -579,6 +743,35 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
     metadata = await fetchNpmMetadata(dep.name, dep.version);
   } else if (dep.ecosystem === 'pypi' || dep.ecosystem === 'PyPI') {
     metadata = await fetchPypiMetadata(dep.name, dep.version);
+  }
+
+  const metadataAnchorIncomplete = metadata !== null && (
+    metadata.metadataComplete === false ||
+    (dep.version && (
+      metadata.requestedVersionFound === false ||
+      metadata.anchoredToInstalled === false
+    ))
+  );
+  const registryArtifact = dep.ecosystem === 'npm' ? registryArtifactFromMetadata(metadata) : null;
+  const analysisFingerprint = metadata === null
+    ? null
+    : analysisEvidenceFingerprint(metadata, config);
+
+  if (metadata !== null &&
+      !metadataAnchorIncomplete &&
+      cachedSignals &&
+      cachedSignals.osvFingerprint === osvFingerprint &&
+      cachedSignals.analysisFingerprint === analysisFingerprint) {
+    const {
+      osvFingerprint: _osvEvidence,
+      analysisFingerprint: _analysisEvidence,
+      ...output
+    } = cachedSignals;
+    return {
+      ...output,
+      declaredRepository: metadata?.repository || output.declaredRepository || null,
+      registryArtifact,
+    };
   }
 
   // Run all signal detectors
@@ -593,6 +786,7 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
     ecosystem: dep.ecosystem,
     isDirect: dep.isDirect,
     declaredRepository: metadata?.repository || null,
+    registryArtifact,
     signals: result.signals,
     riskScore: result.riskScore,
     riskLevel: result.riskLevel,
@@ -602,21 +796,63 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
   if (!osvCovered) {
     output.warnings.push('OSV vulnerability lookup incomplete');
   }
+  if (metadataAnchorIncomplete) {
+    output.warnings.push(metadata.anchorError ||
+      `registry metadata is not anchored to requested version ${dep.name}@${dep.version}`);
+  }
 
   // Only cache complete results — never cache degraded analysis
   // A transient network failure must not poison the cache with false-clean for 24 hours.
   // The stored copy carries osvFingerprint so a later run can tell whether the
   // advisory landscape this verdict was formed on still matches today's.
-  const isDegraded = !osvCovered || metadata === null || output.riskLevel === 'UNKNOWN' || (output.warnings?.length > 0);
+  const isDegraded = !osvCovered || metadata === null || metadataAnchorIncomplete ||
+    output.riskLevel === 'UNKNOWN' || (output.warnings?.length > 0);
   if (!isDegraded) {
     try {
-      cache.setSignals(dep.ecosystem, dep.name, dep.version, { ...output, osvFingerprint });
+      cache.setSignals(dep.ecosystem, dep.name, dep.version, {
+        ...output,
+        osvFingerprint,
+        analysisFingerprint,
+      });
     } catch (err) {
       log.debug(`cache write failed for signals ${key}: ${err.message}`);
     }
   }
 
   return output;
+}
+
+/**
+ * Bind cached signal results to every input that can affect signal semantics.
+ * Registry metadata can change without the package version changing (for
+ * example, corrected publisher or install-script metadata), and local signal
+ * policy can change between runs. Both must match before reusing a verdict.
+ */
+export function analysisEvidenceFingerprint(metadata, config = {}) {
+  const stableMetadata = { ...metadata };
+  if (Number.isFinite(stableMetadata.packageAgeMs)) {
+    // Registry normalizers expose a relative age. Recover the stable creation
+    // instant (rounded to registry timestamp precision) so two immediate
+    // fetches can share a cache entry without freezing time-sensitive signals.
+    stableMetadata.packageCreatedAtMs = Math.round((Date.now() - stableMetadata.packageAgeMs) / 1000) * 1000;
+    delete stableMetadata.packageAgeMs;
+  }
+  const evidence = {
+    analyzerVersion: VERSION,
+    analysisClockMinute: Math.floor(Date.now() / 60_000),
+    metadata: stableMetadata,
+    signalPolicy: config?.analyze?.signals || {},
+  };
+  return createHash('sha256').update(canonicalJson(evidence)).digest('hex');
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (value instanceof Date) return JSON.stringify(value.toISOString());
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value).sort().map(key =>
+    `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+  ).join(',')}}`;
 }
 
 /**
@@ -632,7 +868,9 @@ function printExplain(result) {
   out(`  Direct dependency: ${result.isDirect ? 'yes' : 'no (transitive)'}`);
 
   if (result.provenance) {
-    out(`  Provenance: ${C.green}\u2713 verified${C.reset} (${sanitize(result.provenance.sourceRepo || 'unknown source')})`);
+    const source = sanitize(result.provenance.claimedSourceRepo || 'unknown claimed source');
+    const decoded = result.provenance.attestationDecoded ? 'payload decoded' : 'payload not decoded';
+    out(`  Attestation: ${C.cyan}present; ${decoded}${C.reset} (${source}; cryptographic verification not performed)`);
   }
 
   if (result.signals.length === 0) {
@@ -679,4 +917,53 @@ function riskBar(score) {
   const empty = maxBars - filled;
   const color = filled >= 6 ? C.red : filled >= 3 ? C.yellow : C.cyan;
   return `${color}${'█'.repeat(filled)}${C.dim}${'░'.repeat(empty)}${C.reset}`;
+}
+
+/** Identify manifest declarations that could not be anchored to exact versions. */
+function hasUnresolvedManifestEntries(filePath, ecosystem, format, parsed) {
+  try {
+    const parsedCount = Array.isArray(parsed) ? parsed.length : parsed;
+    if (ecosystem === 'npm') {
+      const pkg = JSON.parse(readFileSync(filePath, 'utf8'));
+      let declared = 0;
+      for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+        const entries = pkg[section];
+        if (entries && typeof entries === 'object') declared += Object.keys(entries).length;
+      }
+      return declared > parsedCount;
+    }
+
+    const content = readFileSync(filePath, 'utf8');
+    if (Array.isArray(parsed) && parsed.unresolvedEntries > 0) return true;
+    if (format === 'requirements.txt') {
+      return content.split('\n').some(raw => {
+        const line = raw.split('#')[0].trim();
+        if (!line || (/^--?/.test(line) && !/^(?:-e|--editable)\b/.test(line))) return false;
+        const stripped = line.replace(/\[.*?\]/, '');
+        const match = stripped.match(/^([a-zA-Z0-9._-]+)\s*(?:([=!<>~]+)\s*(.+?))?(?:\s*;.*)?$/);
+        if (!match) return true;
+        const op = match[2] || '';
+        const value = match[3]?.trim()?.split(',')[0]?.trim() || '';
+        return !((op === '==' || op === '===') && /^[A-Za-z0-9][A-Za-z0-9.!+_-]*$/.test(value) && !value.includes('*'));
+      });
+    }
+
+    if (format === 'pyproject.toml' && parsedCount === 0) {
+      return /^\s*dependencies\s*=\s*\[\s*["']/m.test(content) ||
+        /^\s*\[project\.optional-dependencies\]\s*$/m.test(content) ||
+        /^\s*\[tool\.poetry\.(?:dev-)?dependencies\]\s*$/m.test(content);
+    }
+  } catch {
+    // The parser reports malformed/unreadable files separately.
+  }
+  return false;
+}
+
+function registryArtifactFromMetadata(metadata) {
+  if (!metadata) return null;
+  return {
+    tarball: metadata.artifact?.tarball || metadata.tarball || null,
+    integrity: metadata.artifact?.integrity || metadata.integrity || null,
+    shasum: metadata.artifact?.shasum || metadata.shasum || null,
+  };
 }

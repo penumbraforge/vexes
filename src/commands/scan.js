@@ -1,5 +1,5 @@
 import { resolve, basename } from 'node:path';
-import { statSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import { loadConfig } from '../cli/config.js';
 import { toSarif } from '../cli/sarif.js';
 import { buildEnvelope, normalizeFinding, REACHABILITY } from '../cli/schema.js';
@@ -15,8 +15,9 @@ import { GENERIC_ECOSYSTEM_PARSERS, parseGenericFile, selectGenericFiles } from 
 import { queryBatch, filterBySeverity, isQueryComplete } from '../advisories/osv.js';
 import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { compareSemver } from '../core/semver.js';
+import { buildUpgradeCommand } from '../core/upgrade-command.js';
 import { partitionByIgnore } from '../core/ignore.js';
-import { buildAppGraph, reachabilityOf } from '../analysis/app-graph.js';
+import { buildAppGraph, importEvidenceOf, reachabilityOf } from '../analysis/app-graph.js';
 import { triageFindings } from '../analysis/exploitability.js';
 
 /**
@@ -62,6 +63,7 @@ export async function runScan(flags, args) {
       direct: directKeys.has(`${v.ecosystem}:${v.package}@${v.version}`),
       fixCommand: fixCommandFor(v, fixable),
       reachability: reachabilityOf(appGraph, v.ecosystem, v.package),
+      importEvidence: importEvidenceOf(appGraph, v.ecosystem, v.package),
     }));
     out(JSON.stringify(buildEnvelope({
       command: 'scan',
@@ -70,10 +72,11 @@ export async function runScan(flags, args) {
       warnings: scanResult.warnings,
       summary: {
         ...scanResult.summary,
-        reachable: appGraph?.categories?.reachable ?? 0,
-        lazy: appGraph?.categories?.lazy ?? 0,
-        dead: appGraph?.categories?.dead ?? 0,
-        unreachable: appGraph?.categories?.dead ?? 0, // legacy name for the dead bucket
+        directImportEvidence: appGraph?.importEvidenceCategories || { foundStatic: 0, foundDynamic: 0, notFound: 0, unknown: 0 },
+        reachable: appGraph?.categories?.reachable ?? 0, // legacy compatibility
+        lazy: appGraph?.categories?.lazy ?? 0,           // legacy compatibility
+        dead: appGraph?.categories?.dead ?? 0,           // legacy compatibility; means import not found
+        unreachable: 0, // no runtime-unreachable conclusion is made
       },
       findings,
       extra: { version: VERSION, vulnerabilities: scanResult.vulnerabilities },
@@ -101,6 +104,7 @@ export async function runScan(flags, args) {
   const ecosystemsFound = new Set();
   let dependencyFileCount = 0;
   let parseFailures = 0;
+  let unresolvedManifestInputs = 0;
 
   for (const ecoName of config.ecosystems) {
     if (ecoName === 'npm') {
@@ -109,6 +113,10 @@ export async function runScan(flags, args) {
       for (const lf of lockfiles) {
         try {
           const deps = parseNpmLock(lf);
+          if (deps.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(lf)} contains ${deps.unresolvedEntries} local, linked, remote, or unanchored npm entr${deps.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
           seenFiles.add(basename(lf));
@@ -126,6 +134,10 @@ export async function runScan(flags, args) {
       for (const lf of pnpmLocks) {
         try {
           const deps = parsePnpmLock(lf);
+          if (deps.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(lf)} contains ${deps.unresolvedEntries} non-registry or unanchored npm entr${deps.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
           seenFiles.add(basename(lf));
@@ -141,6 +153,10 @@ export async function runScan(flags, args) {
       for (const lf of yarnLocks) {
         try {
           const deps = parseYarnLock(lf);
+          if (deps.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(lf)} contains ${deps.unresolvedEntries} non-registry or unanchored npm entr${deps.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
           allDeps.push(...deps);
           ecosystemsFound.add('npm');
           seenFiles.add(basename(lf));
@@ -155,6 +171,10 @@ export async function runScan(flags, args) {
 
       // Fallback to package.json if no lockfile
       if (lockfiles.length === 0 && pnpmLocks.length === 0 && yarnLocks.length === 0) {
+        if (manifests.length > 0) {
+          unresolvedManifestInputs++;
+          warnings.push('no npm lockfile found — package.json exact pins can be checked, but resolved/transitive coverage is incomplete');
+        }
         for (const mf of manifests) {
           try {
             const deps = parseNpmManifest(mf);
@@ -162,9 +182,11 @@ export async function runScan(flags, args) {
             ecosystemsFound.add('npm');
             seenFiles.add(basename(mf));
             dependencyFileCount++;
-            const msg = 'no lockfile found — scanning package.json (version ranges, lower confidence)';
-            if (!quietStdout) out(`  ${C.yellow}! ${msg}${C.reset}`);
-            warnings.push(msg);
+            if (!quietStdout) out(`  ${C.yellow}! no npm lockfile found — scanning exact package.json pins only${C.reset}`);
+            if (hasUnresolvedManifestEntries(mf, 'npm', 'package.json', deps.length)) {
+              unresolvedManifestInputs++;
+              warnings.push(`${basename(mf)} contains dependencies without exact registry versions — add a lockfile or exact pins; those entries were not scanned`);
+            }
           } catch (err) {
             const msg = `failed to parse ${basename(mf)}: ${err.message}`;
             log.error(msg);
@@ -178,6 +200,10 @@ export async function runScan(flags, args) {
       const { lockfiles, manifests } = discoverPypi(targetDir);
       // Prefer lockfiles over manifests
       const files = lockfiles.length > 0 ? lockfiles : manifests;
+      if (lockfiles.length === 0 && manifests.length > 0) {
+        unresolvedManifestInputs++;
+        warnings.push('no PyPI lockfile found — exact manifest pins can be checked, but resolved/transitive coverage is incomplete');
+      }
       for (const file of files) {
         try {
           const deps = parsePypiFile(file.path, file.format);
@@ -185,6 +211,11 @@ export async function runScan(flags, args) {
           ecosystemsFound.add('pypi');
           seenFiles.add(basename(file.path));
           dependencyFileCount++;
+          if (hasUnresolvedManifestEntries(file.path, 'pypi', file.format, deps)) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(file.path)} contains dependencies without exact public-PyPI identities — those entries were not scanned`);
+            for (const failure of deps.includeFailures || []) warnings.push(`${basename(file.path)}: ${failure}`);
+          }
         } catch (err) {
           const msg = `failed to parse ${basename(file.path)}: ${err.message}`;
           log.error(msg);
@@ -199,6 +230,10 @@ export async function runScan(flags, args) {
       for (const lf of lockfiles) {
         try {
           const deps = parseCargoLock(lf);
+          if (deps.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(lf)} contains ${deps.unresolvedEntries} non-crates.io or unanchored entr${deps.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
           allDeps.push(...deps);
           ecosystemsFound.add('cargo');
           seenFiles.add(basename(lf));
@@ -216,14 +251,19 @@ export async function runScan(flags, args) {
       const { files, usingManifestFallback } = selectGenericFiles(targetDir, ecoName);
       if (usingManifestFallback) {
         const manifestList = files.map(file => basename(file.path)).join(', ');
-        const msg = `no lockfile found — scanning ${manifestList} (best-effort manifest fallback, lower confidence)`;
+        const msg = `no lockfile found — scanning exact pins from ${manifestList}; manifest fallback is not a resolved dependency graph, so coverage is incomplete`;
         warnings.push(msg);
+        unresolvedManifestInputs++;
         if (!quietStdout) out(`  ${C.yellow}! ${msg}${C.reset}`);
       }
 
       for (const file of files) {
         try {
           const deps = parseGenericFile(ecoName, file);
+          if (deps.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(file.path)} contains ${deps.unresolvedEntries} replaced or otherwise unanchored module entr${deps.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
           allDeps.push(...deps);
           ecosystemsFound.add(ecoName);
           seenFiles.add(basename(file.path));
@@ -240,7 +280,7 @@ export async function runScan(flags, args) {
   }
 
   // Distinguish "no dependency files found" from "files found but parsing failed"
-  if (allDeps.length === 0 && parseFailures > 0) {
+  if (allDeps.length === 0 && (parseFailures > 0 || unresolvedManifestInputs > 0)) {
     if (quietStdout) {
       emitStructured({
         version: VERSION, timestamp: new Date().toISOString(), command: 'scan', complete: false,
@@ -248,7 +288,8 @@ export async function runScan(flags, args) {
         warnings, vulnerabilities: [],
       });
     } else {
-      out(`\n  ${C.red}! Dependency files were found but all failed to parse — cannot determine vulnerability status${C.reset}\n`);
+      out(`\n  ${C.red}! Dependency inputs did not provide exact resolved versions — cannot determine vulnerability status${C.reset}\n`);
+      for (const warning of warnings) out(`  ${C.yellow}! ${warning}${C.reset}`);
     }
     return EXIT.ERROR;
   }
@@ -281,16 +322,12 @@ export async function runScan(flags, args) {
     uniqueDeps.filter(d => d.isDirect).map(d => `${d.ecosystem}:${d.name}@${d.version}`),
   );
 
-  // Tier A direct-import evidence — map each dependency to
-  // reachable/lazy/dead/unknown by parsing the project's OWN source, not
-  // recursing into node_modules. This is IMPORT EVIDENCE, not proven
-  // runtime reachability: "dead" means "no project source we parsed imports
-  // it", which is not the same as "can never execute" (tooling, plugin
-  // loaders, and manifest-referenced files can still load it).
+  // Tier A direct-import evidence parses only the project's OWN source, not
+  // node_modules. It is context attached to findings, never a suppression rule.
   appGraph = buildAppGraph(targetDir, uniqueDeps);
   if (!quietStdout) {
-    const c = appGraph.categories;
-    out(`  ${C.dim}direct-import evidence: ${c.reachable} imported · ${c.lazy} dynamic-only · ${c.dead} not imported${C.reset}`);
+    const c = appGraph.importEvidenceCategories;
+    out(`  ${C.dim}direct-import evidence: ${c.foundStatic} static · ${c.foundDynamic} dynamic-only · ${c.notFound} not found · ${c.unknown} unknown${C.reset}`);
   }
 
   if (!quietStdout) {
@@ -391,12 +428,11 @@ export async function runScan(flags, args) {
       return bOrder - aOrder;
     });
 
-    // 7a. Tier A reachability filter. `--min-reachability reachable` keeps only
-    // live findings; `lazy` adds dynamically/conditionally loaded ones; `dead`
-    // (default) keeps the full archive — each still graded in the output.
+    // Direct-import evidence must never suppress a security finding. Keep the
+    // historical option as a warned no-op so existing automation fails visible
+    // rather than silently losing advisories.
     if (config.minReachability) {
-      severityFiltered = severityFiltered.filter(v =>
-        atLeast(reachabilityOf(appGraph, v.ecosystem, v.package), config.minReachability));
+      warnings.push(`--min-reachability=${config.minReachability} is deprecated and ignored — direct-import evidence never filters security findings`);
     }
 
     // 7b. Apply the `ignore` config — suppress by advisory ID, package name,
@@ -415,6 +451,7 @@ export async function runScan(flags, args) {
     // prefers this field when present.
     for (const v of filtered) {
       v.reachability = reachabilityOf(appGraph, v.ecosystem, v.package);
+      v.importEvidence = importEvidenceOf(appGraph, v.ecosystem, v.package);
     }
 
     // 7d. Tier B (--ai, opt-in): LLM exploitability verdicts on TOP of the
@@ -438,7 +475,7 @@ export async function runScan(flags, args) {
     }
 
     // 8. Determine completeness — did all queries succeed?
-    const isComplete = queryComplete && parseFailures === 0;
+    const isComplete = queryComplete && parseFailures === 0 && unresolvedManifestInputs === 0;
 
     // 9. Format output
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
@@ -476,12 +513,12 @@ export async function runScan(flags, args) {
           if (topN != null && shownCount >= topN) break;
           shownCount++;
           out(formatVuln(v));
-          const reach = reachabilityOf(appGraph, v.ecosystem, v.package);
-          if (reach === 'dead') {
+          const importEvidence = importEvidenceOf(appGraph, v.ecosystem, v.package);
+          if (importEvidence === 'not_found') {
             out(`    ${C.dim}no direct import found in project source (may still load via tooling or dynamic paths)${C.reset}`);
-          } else if (reach === 'lazy') {
+          } else if (importEvidence === 'found_dynamic') {
             out(`    ${C.dim}only dynamically imported (lazy)${C.reset}`);
-          } else if (reach === 'reachable') {
+          } else if (importEvidence === 'found_static') {
             out(`    ${C.yellow}imported by project code${C.reset}`);
           }
           // Tier B (--ai): per-finding verdict, clearly advisory — it never
@@ -506,9 +543,10 @@ export async function runScan(flags, args) {
         out(`  ${C.dim}… ${filtered.length - shownCount} more finding(s) not shown (--top ${topN}); JSON output has everything${C.reset}`);
       }
 
-      // Show fix commands if --fix was used
+      // Show advisory-derived upgrade hints if --fix was used. These versions
+      // are not registry-checked and the proposed graph has not been rescanned.
       if (config.fix && filtered.some(v => v.fixed)) {
-        out(header('Fix Commands'));
+        out(header('Advisory Upgrade Hints'));
         const fixable = new Map();
         for (const v of filtered) {
           if (!v.fixed) continue;
@@ -521,12 +559,11 @@ export async function runScan(flags, args) {
           }
         }
         for (const { pkg, ver, ecosystem } of fixable.values()) {
-          const cmd = ecosystem === 'npm' ? `npm install ${sanitize(pkg)}@${sanitize(ver)}`
-                    : ecosystem === 'pypi' ? `pip install ${sanitize(pkg)}==${sanitize(ver)}`
-                    : ecosystem === 'cargo' ? `cargo update -p ${sanitize(pkg)} --precise ${sanitize(ver)}`
-                    : `# upgrade ${sanitize(pkg)} to ${sanitize(ver)}`;
-          out(`  ${C.cyan}${cmd}${C.reset}`);
+          const cmd = buildUpgradeCommand(pkg, ver, ecosystem);
+          if (cmd) out(`  ${C.cyan}${sanitize(cmd)}${C.reset}`);
+          else out(`  ${C.yellow}manual review required for invalid or unsupported coordinate${C.reset}`);
         }
+        out(`  ${C.dim}Hints come from OSV fixed events; generate the lockfile and rescan before treating them as remediation.${C.reset}`);
         out('');
       }
 
@@ -599,16 +636,8 @@ function aiLabel(t) {
   return `AI triage: ${t.total - t.errored}/${t.total} judged${t.errored ? ` · ${t.errored} errored` : ''}`;
 }
 
-// Reachability ordering for the --min-reachability filter. Unknown is treated
-// as always-passing (we don't filter out what we couldn't grade).
-const REACH_ORDER = { dead: 0, lazy: 1, reachable: 2 };
-function atLeast(actual, min) {
-  if (actual === 'unknown') return true;
-  return (REACH_ORDER[actual] ?? 0) >= (REACH_ORDER[min] ?? 0);
-}
-
 /**
- * Highest verified fix version per package, keyed `ecosystem:name`.
+ * Highest advisory fixed-event version per package, keyed `ecosystem:name`.
  * String '>' would rank '9.0.0' above '10.0.0' — use real semver compare.
  */
 function buildFixCommands(vulns) {
@@ -632,9 +661,50 @@ function buildFixCommands(vulns) {
 function fixCommandFor(v, fixable) {
   const fix = fixable.get(`${v.ecosystem}:${v.package}`);
   if (!fix) return undefined;
-  const { pkg, ver, ecosystem } = fix;
-  if (ecosystem === 'npm') return `npm install ${pkg}@${ver}`;
-  if (ecosystem === 'pypi') return `pip install ${pkg}==${ver}`;
-  if (ecosystem === 'cargo') return `cargo update -p ${pkg} --precise ${ver}`;
-  return `# upgrade ${pkg} to ${ver}`;
+  return buildUpgradeCommand(fix.pkg, fix.ver, fix.ecosystem) || undefined;
+}
+
+/**
+ * Detect manifest declarations the fallback parser could not turn into exact
+ * registry coordinates. A range is not evidence of an installed version, so
+ * silently treating an empty fallback parse as an empty dependency graph would
+ * be a false clean.
+ */
+function hasUnresolvedManifestEntries(filePath, ecosystem, format, parsed) {
+  try {
+    const parsedCount = Array.isArray(parsed) ? parsed.length : parsed;
+    if (ecosystem === 'npm') {
+      const pkg = JSON.parse(readFileSync(filePath, 'utf8'));
+      let declared = 0;
+      for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+        const entries = pkg[section];
+        if (entries && typeof entries === 'object') declared += Object.keys(entries).length;
+      }
+      return declared > parsedCount;
+    }
+
+    const content = readFileSync(filePath, 'utf8');
+    if (Array.isArray(parsed) && parsed.unresolvedEntries > 0) return true;
+    if (format === 'requirements.txt') {
+      return content.split('\n').some(raw => {
+        const line = raw.split('#')[0].trim();
+        if (!line || (/^--?/.test(line) && !/^(?:-e|--editable)\b/.test(line))) return false;
+        const stripped = line.replace(/\[.*?\]/, '');
+        const match = stripped.match(/^([a-zA-Z0-9._-]+)\s*(?:([=!<>~]+)\s*(.+?))?(?:\s*;.*)?$/);
+        if (!match) return true;
+        const op = match[2] || '';
+        const value = match[3]?.trim()?.split(',')[0]?.trim() || '';
+        return !((op === '==' || op === '===') && /^[A-Za-z0-9][A-Za-z0-9.!+_-]*$/.test(value) && !value.includes('*'));
+      });
+    }
+
+    if (format === 'pyproject.toml' && parsedCount === 0) {
+      return /^\s*dependencies\s*=\s*\[\s*["']/m.test(content) ||
+        /^\s*\[project\.optional-dependencies\]\s*$/m.test(content) ||
+        /^\s*\[tool\.poetry\.(?:dev-)?dependencies\]\s*$/m.test(content);
+    }
+  } catch {
+    // The parser reports malformed/unreadable files separately.
+  }
+  return false;
 }

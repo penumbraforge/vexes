@@ -19,24 +19,43 @@ export function parseLockfile(filePath) {
   catch (err) { throw new Error(`cannot read ${filePath}: ${err.code || err.message}`); }
 
   const deps = [];
+  let recognized = false;
+  let unrecognized = 0;
+  let unresolvedEntries = 0;
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     if (trimmed.startsWith('#')) continue;
-    if (trimmed === 'empty=' || trimmed.startsWith('empty=')) continue;
+    if (trimmed === 'empty=' || trimmed.startsWith('empty=')) {
+      recognized = true;
+      continue;
+    }
 
     // Format: group:artifact:version=configurations
     const eqIdx = trimmed.indexOf('=');
-    const coordinate = eqIdx !== -1 ? trimmed.slice(0, eqIdx) : trimmed;
+    if (eqIdx <= 0) {
+      unrecognized++;
+      continue;
+    }
+    const coordinate = trimmed.slice(0, eqIdx);
 
     const parts = coordinate.split(':');
-    if (parts.length < 3) continue;
+    if (parts.length !== 3) {
+      unrecognized++;
+      continue;
+    }
 
-    const version = parts[parts.length - 1];
-    const name = parts.slice(0, parts.length - 1).join(':');
+    const version = parts[2];
+    const name = `${parts[0]}:${parts[1]}`;
 
-    if (!name || !version) continue;
+    if (!/^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/.test(name) ||
+        !/^[0-9A-Za-z][0-9A-Za-z._+-]*$/.test(version)) {
+      unrecognized++;
+      continue;
+    }
+
+    recognized = true;
 
     deps.push({
       name,
@@ -45,9 +64,17 @@ export function parseLockfile(filePath) {
       isDirect: false,
       isPinned: true,
     });
+    // Gradle's lockfile does not identify the repository/artifact origin.
+    // The public Maven coordinate remains a lead, never complete proof.
+    unresolvedEntries++;
+  }
+
+  if (!recognized || unrecognized > 0) {
+    throw new Error(`invalid or unsupported gradle.lockfile schema in ${filePath}`);
   }
 
   log.debug(`parsed ${deps.length} deps from ${filePath}`);
+  Object.defineProperty(deps, 'unresolvedEntries', { enumerable: false, value: unresolvedEntries });
   return deps;
 }
 

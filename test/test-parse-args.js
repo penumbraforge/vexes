@@ -75,4 +75,10 @@ describe('Argument parser', () => {
     const r = parseArgs(['SCAN']);
     assert.equal(r.command, 'scan');
   });
+
+  it('does not silently treat an unknown command as successful help', () => {
+    const r = parseArgs(['scna']);
+    assert.equal(r.command, 'unknown');
+    assert.deepEqual(r.args, ['scna']);
+  });
 });

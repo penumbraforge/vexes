@@ -10,8 +10,10 @@ import { log } from '../core/logger.js';
 // CRITICALs for every PYSEC/RUSTSEC/GO advisory. v3 invalidates signal rows
 // written before the osvFingerprint field existed — those carry no record of
 // which advisory evidence they were formed against, so they cannot be
-// reconciled with fresh OSV results and must be re-analyzed.
-const CACHE_SCHEMA_VERSION = 3;
+// reconciled with fresh OSV results and must be re-analyzed. v5 additionally
+// binds signal rows to current registry metadata/config and rejects malformed
+// advisory/signal records before they can influence a clean result.
+const CACHE_SCHEMA_VERSION = 5;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS advisories (
@@ -37,6 +39,14 @@ const SCHEMA = `
     analyzed_at INTEGER NOT NULL,
     PRIMARY KEY (ecosystem, name, version)
   );
+  CREATE TABLE IF NOT EXISTS freshness (
+    ecosystem     TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    latest_version TEXT NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL,
+    PRIMARY KEY (ecosystem, name)
+  );
 `;
 
 /**
@@ -51,6 +61,8 @@ export class NoOpCache {
   setMetadata() {}
   getSignals() { return null; }
   setSignals() {}
+  getFreshnessState() { return null; }
+  setFreshnessState() {}
   prune() {}
   stats() { return { advisories: 0, metadata: 0, signals: 0 }; }
   close() {}
@@ -70,7 +82,7 @@ export class AdvisoryCache {
 
     const { user_version: storedVersion } = this.#db.prepare('PRAGMA user_version').get();
     if (storedVersion !== CACHE_SCHEMA_VERSION) {
-      this.#db.exec('DROP TABLE IF EXISTS advisories; DROP TABLE IF EXISTS metadata; DROP TABLE IF EXISTS signals;');
+      this.#db.exec('DROP TABLE IF EXISTS advisories; DROP TABLE IF EXISTS metadata; DROP TABLE IF EXISTS signals; DROP TABLE IF EXISTS freshness;');
       this.#db.exec(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
       if (storedVersion > 0) {
         log.debug(`cache schema ${storedVersion} → ${CACHE_SCHEMA_VERSION}, stale entries dropped`);
@@ -105,6 +117,16 @@ export class AdvisoryCache {
         `INSERT OR REPLACE INTO signals (ecosystem, name, version, data, analyzed_at)
          VALUES (?, ?, ?, ?, ?)`
       ),
+      getFreshness: this.#db.prepare(
+        'SELECT latest_version, first_seen_at, last_seen_at FROM freshness WHERE ecosystem = ? AND name = ?'
+      ),
+      setFreshness: this.#db.prepare(
+        `INSERT INTO freshness (ecosystem, name, latest_version, first_seen_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(ecosystem, name) DO UPDATE SET
+           latest_version = excluded.latest_version,
+           last_seen_at = excluded.last_seen_at`
+      ),
       countAdvisories: this.#db.prepare('SELECT COUNT(*) as count FROM advisories'),
       countMetadata: this.#db.prepare('SELECT COUNT(*) as count FROM metadata'),
       countSignals: this.#db.prepare('SELECT COUNT(*) as count FROM signals'),
@@ -126,15 +148,43 @@ export class AdvisoryCache {
     }
   }
 
+  #validAdvisories(value) {
+    return Array.isArray(value) && value.every(vuln =>
+      vuln && typeof vuln === 'object' && !Array.isArray(vuln) &&
+      typeof vuln.id === 'string' && vuln.id.trim().length > 0
+    );
+  }
+
+  #validSignals(value, ecosystem, name, version) {
+    const levels = new Set(['NONE', 'LOW', 'MODERATE', 'HIGH', 'CRITICAL', 'UNKNOWN']);
+    return value && typeof value === 'object' && !Array.isArray(value) &&
+      value.ecosystem === ecosystem && value.name === name && value.version === version &&
+      Array.isArray(value.signals) && value.signals.every(signal =>
+        signal && typeof signal === 'object' && !Array.isArray(signal) &&
+        typeof signal.signal === 'string' && typeof signal.severity === 'string'
+      ) &&
+      Number.isFinite(value.riskScore) && value.riskScore >= 0 &&
+      levels.has(value.riskLevel) &&
+      Array.isArray(value.warnings) && value.warnings.every(warning => typeof warning === 'string') &&
+      typeof value.osvFingerprint === 'string' &&
+      typeof value.analysisFingerprint === 'string';
+  }
+
+  #validTtl(ttlMs) {
+    return typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs >= 0;
+  }
+
   getAdvisories(ecosystem, name, version, ttlMs = ADVISORY_TTL_MS) {
     try {
+      if (!this.#validTtl(ttlMs)) return null;
       const row = this.#stmts.getAdvisory.get(ecosystem, name, version);
       if (!row) return null;
       if (Date.now() - row.fetched_at > ttlMs) return null;
       const parsed = this.#safeJsonParse(row.vulns, `${ecosystem}:${name}@${version}`);
-      if (parsed === null) {
+      if (!this.#validAdvisories(parsed)) {
         // Corrupt entry — delete it
         this.#stmts.deleteAdvisory.run(ecosystem, name, version);
+        return null;
       }
       return parsed;
     } catch (err) {
@@ -144,6 +194,7 @@ export class AdvisoryCache {
   }
 
   setAdvisories(ecosystem, name, version, vulns) {
+    if (!this.#validAdvisories(vulns)) throw new Error('advisory cache rows must be arrays of records with string ids');
     this.#stmts.setAdvisory.run(ecosystem, name, version, JSON.stringify(vulns), Date.now());
   }
 
@@ -152,8 +203,9 @@ export class AdvisoryCache {
       const row = this.#stmts.getAdvisory.get(ecosystem, name, version);
       if (!row) return null;
       const parsed = this.#safeJsonParse(row.vulns, `${ecosystem}:${name}@${version}`);
-      if (parsed === null) {
+      if (!this.#validAdvisories(parsed)) {
         this.#stmts.deleteAdvisory.run(ecosystem, name, version);
+        return null;
       }
       return parsed;
     } catch (err) {
@@ -164,6 +216,7 @@ export class AdvisoryCache {
 
   getMetadata(ecosystem, name, ttlMs = METADATA_TTL_MS) {
     try {
+      if (!this.#validTtl(ttlMs)) return null;
       const row = this.#stmts.getMetadata.get(ecosystem, name);
       if (!row) return null;
       if (Date.now() - row.fetched_at > ttlMs) return null;
@@ -180,10 +233,12 @@ export class AdvisoryCache {
 
   getSignals(ecosystem, name, version, ttlMs = METADATA_TTL_MS) {
     try {
+      if (!this.#validTtl(ttlMs)) return null;
       const row = this.#stmts.getSignals.get(ecosystem, name, version);
       if (!row) return null;
       if (Date.now() - row.analyzed_at > ttlMs) return null;
-      return this.#safeJsonParse(row.data, `signals:${ecosystem}:${name}@${version}`);
+      const parsed = this.#safeJsonParse(row.data, `signals:${ecosystem}:${name}@${version}`);
+      return this.#validSignals(parsed, ecosystem, name, version) ? parsed : null;
     } catch (err) {
       log.debug(`cache read error: ${err.message}`);
       return null;
@@ -191,7 +246,29 @@ export class AdvisoryCache {
   }
 
   setSignals(ecosystem, name, version, signals) {
+    if (!this.#validSignals(signals, ecosystem, name, version)) {
+      throw new Error('signal cache row failed schema validation');
+    }
     this.#stmts.setSignals.run(ecosystem, name, version, JSON.stringify(signals), Date.now());
+  }
+
+  getFreshnessState(ecosystem, name) {
+    try {
+      const row = this.#stmts.getFreshness.get(ecosystem, name);
+      if (!row) return null;
+      return {
+        latestVersion: row.latest_version,
+        firstSeenAt: row.first_seen_at,
+        lastSeenAt: row.last_seen_at,
+      };
+    } catch (err) {
+      log.debug(`freshness cache read error: ${err.message}`);
+      return null;
+    }
+  }
+
+  setFreshnessState(ecosystem, name, latestVersion, now = Date.now()) {
+    this.#stmts.setFreshness.run(ecosystem, name, latestVersion, now, now);
   }
 
   prune(maxAgeMs) {

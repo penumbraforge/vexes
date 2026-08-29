@@ -136,7 +136,10 @@ describe('vexes licenses (CLI)', () => {
         lockfileVersion: 3,
         packages: {
           '': { name: 'app', dependencies: { lodash: '^4.17.21' } },
-          'node_modules/lodash': { version: '4.17.21' },
+          'node_modules/lodash': {
+            version: '4.17.21',
+            resolved: 'https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz',
+          },
         },
       }),
     });
@@ -160,7 +163,10 @@ describe('vexes licenses (CLI)', () => {
         lockfileVersion: 3,
         packages: {
           '': { name: 'app', dependencies: { boom: '^9.9.9' } },
-          'node_modules/boom': { version: '9.9.9' },
+          'node_modules/boom': {
+            version: '9.9.9',
+            resolved: 'https://registry.npmjs.org/boom/-/boom-9.9.9.tgz',
+          },
         },
       }),
     });
@@ -179,7 +185,10 @@ describe('vexes licenses (CLI)', () => {
         lockfileVersion: 3,
         packages: {
           '': { name: 'app', dependencies: { 'deep-extend': '^0.6.0' } },
-          'node_modules/deep-extend': { version: '0.6.0' },
+          'node_modules/deep-extend': {
+            version: '0.6.0',
+            resolved: 'https://registry.npmjs.org/deep-extend/-/deep-extend-0.6.0.tgz',
+          },
         },
       }),
     });
@@ -197,5 +206,17 @@ describe('vexes licenses (CLI)', () => {
     assert.equal(code, 0);
     assert.equal(env.complete, true);
     assert.equal(env.summary.total, 0);
+  });
+
+  it('fails incomplete instead of treating unresolved manifest ranges as no dependencies', async () => {
+    const dir = fixtureDir({
+      'package.json': JSON.stringify({ dependencies: { lodash: '^4.17.0' } }),
+    });
+    dirs.push(dir);
+    const { code, env } = await captureJson(dir);
+    assert.equal(code, 2);
+    assert.equal(env.complete, false);
+    assert.equal(env.summary.total, 0);
+    assert.ok(env.warnings.some(w => /no resolved lockfile graph/i.test(w)));
   });
 });

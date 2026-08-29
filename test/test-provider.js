@@ -282,9 +282,9 @@ describe('provider: reachability prompt builder', () => {
   it('builds a bounded, injection-safe prompt shape', () => {
     const p = buildReachabilityPrompt({
       graph: { imports: ['./src/index.js'] },
-      advisory: { package: 'axios', version: '1.14.1', ecosystem: 'npm', summary: '*injected* \x1b[31mred\x1b[0m text' },
+      advisory: { package: 'example-package', version: '1.2.3', ecosystem: 'npm', summary: '*injected* \x1b[31mred\x1b[0m text' },
     });
-    assert.ok(p.user.includes('axios'));
+    assert.ok(p.user.includes('example-package'));
     assert.ok(!p.user.includes('\x1b['), 'no escape sequences reach the model');
   });
 });

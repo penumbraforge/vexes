@@ -8,7 +8,8 @@
  * version-range handling difference worth pinning down.
  *
  * Dev-only diagnostic (osv-scanner must be on PATH: brew install osv-scanner).
- * Exits 0 regardless of differences — the value is the report, not a gate.
+ * Advisory-set differences are reported rather than gated, but malformed or
+ * incomplete scanner output fails nonzero instead of becoming an empty set.
  *
  * Usage: node benchmark/parity.mjs [--json]
  */
@@ -40,11 +41,19 @@ const PINNED = [
 
 const dir = mkdtempSync(join(tmpdir(), 'vexes-parity-'));
 const lockfile = join(dir, 'package-lock.json');
-const packages = {};
+const packages = {
+  '': {
+    name: 'vexes-parity-check',
+    version: '1.0.0',
+    dependencies: Object.fromEntries(PINNED),
+  },
+};
 const dependencies = {};
 for (const [name, version] of PINNED) {
-  packages[`node_modules/${name}`] = { version };
-  dependencies[name] = { version };
+  const tarballName = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
+  const resolved = `https://registry.npmjs.org/${name}/-/${tarballName}-${version}.tgz`;
+  packages[`node_modules/${name}`] = { version, resolved };
+  dependencies[name] = { version, resolved };
 }
 writeFileSync(lockfile, JSON.stringify({
   name: 'vexes-parity-check',
@@ -57,13 +66,26 @@ writeFileSync(lockfile, JSON.stringify({
 
 try {
   // vexes scan
-  const vexesRun = spawnSync(process.execPath, [join(ROOT, 'bin', 'vexes.js'), 'scan', '--path', dir, '--json', '--severity', 'low'], { encoding: 'utf8', timeout: 120_000 });
+  const vexesRun = spawnSync(process.execPath, [
+    join(ROOT, 'bin', 'vexes.js'),
+    'scan', '--path', dir, '--format', 'json', '--severity', 'low',
+    '--no-project-config', '--no-user-config',
+  ], { encoding: 'utf8', timeout: 120_000 });
+  if (vexesRun.error) throw new Error(`vexes scan failed to start: ${vexesRun.error.message}`);
+  if (![0, 1].includes(vexesRun.status)) {
+    throw new Error(`vexes scan was incomplete (exit ${vexesRun.status ?? 'unknown'}): ${vexesRun.stderr.trim() || 'no diagnostic'}`);
+  }
   // Advisory identity is fuzzy: the same advisory may surface as a GHSA or
   // a CVE depending on which OSV record the tool got. Match on the full
   // identifier set (id + aliases), never a single key.
   const vexesVulns = []; // [{ ids: Set, package, severity }]
   try {
     const report = JSON.parse(vexesRun.stdout);
+    if (report?.schemaVersion !== '1.0' || report?.generator?.name !== 'vexes' ||
+        report?.command !== 'scan' || report?.complete !== true || report?.result?.complete !== true ||
+        !Array.isArray(report.findings)) {
+      throw new Error('output was not a complete vexes scan envelope');
+    }
     for (const f of report.findings || []) {
       if (!f.id) continue;
       vexesVulns.push({
@@ -72,20 +94,22 @@ try {
         severity: f.severity,
       });
     }
-  } catch {
-    console.error('vexes scan output unparseable');
-    process.exit(1);
+  } catch (error) {
+    throw new Error(`vexes scan output invalid: ${error.message}`);
   }
 
   // osv-scanner
   const osvRun = spawnSync('osv-scanner', ['--lockfile', lockfile, '--format', 'json'], { encoding: 'utf8', timeout: 120_000 });
+  if (osvRun.error) throw new Error(`osv-scanner failed to start: ${osvRun.error.message}`);
+  if (![0, 1].includes(osvRun.status)) {
+    throw new Error(`osv-scanner failed (exit ${osvRun.status ?? 'unknown'}): ${osvRun.stderr.trim() || 'no diagnostic'}`);
+  }
   // osv-scanner exits 1 when it finds vulns — parse stdout regardless.
   // Output is pretty-printed JSON; logs go to stderr.
   const osvOut = osvRun.stdout || '';
   const start = osvOut.indexOf('{');
   if (start === -1) {
-    console.error('osv-scanner output unparseable (is it installed? brew install osv-scanner)');
-    process.exit(1);
+    throw new Error('osv-scanner output unparseable (is it installed? brew install osv-scanner)');
   }
   const parsed = JSON.parse(osvOut.slice(start));
   const osvVulns = []; // [{ ids: Set, package }]
@@ -100,23 +124,52 @@ try {
     }
   }
 
-  const matches = (a, b) => [...a.ids].some(x => b.ids.has(x));
+  const matches = (a, b) => a.package === b.package && [...a.ids].some(x => b.ids.has(x));
+
+  // OSV can expose alias-linked records at different granularities. Collapse
+  // overlapping identifier sets per package before comparing them so two raw
+  // records for one advisory family do not inflate or contradict the parity
+  // count. This remains a package+identity comparison, not a count-only check.
+  const collapseIdentities = (records) => {
+    const groups = [];
+    for (const record of records) {
+      const current = { package: record.package, ids: new Set(record.ids) };
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (let i = groups.length - 1; i >= 0; i--) {
+          if (matches(current, groups[i])) {
+            for (const id of groups[i].ids) current.ids.add(id);
+            groups.splice(i, 1);
+            changed = true;
+          }
+        }
+      }
+      groups.push(current);
+    }
+    return groups;
+  };
+
+  const vexesIdentities = collapseIdentities(vexesVulns);
+  const osvIdentities = collapseIdentities(osvVulns);
   const unmatched = (aList, bList) => aList.filter(a => !bList.some(b => matches(a, b)));
 
-  const onlyInVexes = unmatched(vexesVulns, osvVulns).map(v => ({
+  const onlyInVexes = unmatched(vexesIdentities, osvIdentities).map(v => ({
     id: [...v.ids].find(i => i.startsWith('GHSA-')) || v.ids.values().next().value,
     package: v.package,
   }));
-  const onlyInOsv = unmatched(osvVulns, vexesVulns).map(v => ({
+  const onlyInOsv = unmatched(osvIdentities, vexesIdentities).map(v => ({
     id: [...v.ids].find(i => i.startsWith('GHSA-')) || v.ids.values().next().value,
     package: v.package,
   }));
-  const shared = vexesVulns.length - onlyInVexes.length;
+  const shared = vexesIdentities.length - onlyInVexes.length;
 
   if (asJSON) {
     console.log(JSON.stringify({
-      vexesCount: vexesVulns.length,
-      osvScannerCount: osvVulns.length,
+      vexesCount: vexesIdentities.length,
+      osvScannerCount: osvIdentities.length,
+      vexesRawCount: vexesVulns.length,
+      osvScannerRawCount: osvVulns.length,
       shared,
       onlyInVexes,
       onlyInOsvScanner: onlyInOsv,
@@ -125,7 +178,7 @@ try {
     const lines = [];
     lines.push('# OSV parity: vexes scan vs osv-scanner');
     lines.push('');
-    lines.push(`vexes: ${vexesVulns.length} advisories | osv-scanner: ${osvVulns.length} | shared: ${shared}`);
+    lines.push(`vexes: ${vexesIdentities.length} identities (${vexesVulns.length} raw) | osv-scanner: ${osvIdentities.length} identities (${osvVulns.length} raw) | shared: ${shared}`);
     lines.push('');
     lines.push('| advisory | package | in vexes | in osv-scanner |');
     lines.push('|---|---|---|---|');

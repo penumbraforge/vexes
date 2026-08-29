@@ -1,10 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectProvenanceSpoof, checkProvenance } from '../src/analysis/provenance.js';
+import {
+  checkProvenance,
+  detectAttestationIdentityMismatch,
+  detectProvenanceSpoof,
+} from '../src/analysis/provenance.js';
 
 /**
- * PROVENANCE-SPOOF LAYER (TanStack-family vector: valid signature, wrong
- * package / wrong repo). Pure detector tests below touch no network; the
+ * DECODED PROVENANCE IDENTITY MISMATCHES (wrong package / wrong repo fields;
+ * no cryptographic verification). Pure detector tests below touch no network; the
  * checkProvenance subject-capture test stubs global.fetch so the registry is
  * never reached.
  */
@@ -37,7 +41,8 @@ describe('detectProvenanceSpoof', () => {
   it('flags a replayed attestation (subject = a DIFFERENT package) as HIGH', () => {
     const r = detectProvenanceSpoof(spoofCtx({ subjects: ['pkg:npm/lodash@4.17.21'] }));
     assert.ok(r, 'expected a signal');
-    assert.equal(r.signal, 'SIGNATURE_SPOOF');
+    assert.equal(r.signal, 'ATTESTATION_IDENTITY_MISMATCH');
+    assert.equal(r.legacySignal, 'SIGNATURE_SPOOF');
     assert.equal(r.severity, 'HIGH');
     assert.equal(r.confidence, 'deterministic');
     assert.equal(r.evidence.kind, 'subject-mismatch');
@@ -127,15 +132,21 @@ describe('checkProvenance: subject capture (stubbed fetch)', () => {
     };
   }
 
-  it('extracts the certified subject name from a verified attestation', async () => {
+  it('decodes subject claims without claiming cryptographic verification', async () => {
     const prev = global.fetch;
     global.fetch = makeFetch({ subjectName: 'pkg:npm/tar@6.1.2', sourceRepo: 'https://github.com/isaacs/node-tar', buildType: 'slsa-github-generator' });
     try {
       const prov = await checkProvenance('tar', '6.1.2');
       assert.equal(prov.hasProvenance, true);
+      assert.equal(prov.hasAttestation, true);
+      assert.equal(prov.attestationDecoded, true);
+      assert.equal(prov.attestationStatus, 'decoded');
+      assert.equal(prov.verificationStatus, 'not-performed');
+      assert.equal(prov.cryptographicallyVerified, false);
       assert.deepEqual(prov.subjects, ['pkg:npm/tar@6.1.2']);
       assert.equal(prov.sourceRepo, 'https://github.com/isaacs/node-tar');
-      assert.equal(prov.transparency, 'verified');
+      assert.equal(prov.transparency, 'entry-present');
+      assert.equal(prov.transparencyLogEntryPresent, true);
     } finally {
       global.fetch = prev;
     }
@@ -146,14 +157,14 @@ describe('checkProvenance: subject capture (stubbed fetch)', () => {
     global.fetch = makeFetch({ subjectName: 'pkg:npm/lodash@4.17.21', sourceRepo: 'https://github.com/evilcorp/oops', buildType: 'slsa-github-generator' });
     try {
       const prov = await checkProvenance('tar', '6.1.2');
-      const spoof = detectProvenanceSpoof({
+      const spoof = detectAttestationIdentityMismatch({
         packageName: 'tar',
         subjects: prov.subjects,
         sourceRepo: prov.sourceRepo,
         declaredRepo: 'https://github.com/isaacs/node-tar',
       });
       assert.ok(spoof);
-      assert.equal(spoof.signal, 'SIGNATURE_SPOOF');
+      assert.equal(spoof.signal, 'ATTESTATION_IDENTITY_MISMATCH');
       assert.equal(spoof.evidence.kind, 'subject-mismatch');
     } finally {
       global.fetch = prev;
@@ -165,7 +176,10 @@ describe('checkProvenance: subject capture (stubbed fetch)', () => {
     global.fetch = async () => stubResponse({ attestations: [] });
     try {
       const prov = await checkProvenance('tar', '6.1.2');
-      assert.equal(prov.hasProvenance, false); // no attestations → not verified
+      assert.equal(prov.hasProvenance, false); // compatibility presence field
+      assert.equal(prov.hasAttestation, false);
+      assert.equal(prov.attestationStatus, 'absent');
+      assert.equal(prov.cryptographicallyVerified, false);
       assert.deepEqual(prov.subjects, []);
     } finally {
       global.fetch = prev;

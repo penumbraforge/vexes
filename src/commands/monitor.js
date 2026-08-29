@@ -4,7 +4,7 @@ import { loadConfig } from '../cli/config.js';
 import { C, createSpinner, header, formatVuln, summary, out, sanitize } from '../cli/output.js';
 import { log } from '../core/logger.js';
 import { VERSION, EXIT, SEVERITY, ECOSYSTEMS } from '../core/constants.js';
-import { discover as discoverNpm, parseLockfile as parseNpmLock } from '../parsers/npm.js';
+import { discover as discoverNpm, parseLockfile as parseNpmLock, parseManifest as parseNpmManifest } from '../parsers/npm.js';
 import { discover as discoverPnpm, parseLockfile as parsePnpmLock } from '../parsers/pnpm.js';
 import { discover as discoverYarn, parseLockfile as parseYarnLock } from '../parsers/yarn.js';
 import { discover as discoverPypi, parseFile as parsePypiFile } from '../parsers/pypi.js';
@@ -51,8 +51,8 @@ export async function runMonitor(flags, args) {
   ${C.bold}WATCH OPTIONS${C.reset}
     --path <dir>         Target directory ${C.dim}(default: cwd)${C.reset}
     --interval <min>     OSV poll interval in minutes ${C.dim}(default: 60)${C.reset}
-    --freshness <min>    Registry poll interval — detects suspicious NEW
-                         releases within minutes (default: off). Combine with
+    --freshness <min>    Registry poll interval — assesses newly observed
+                         releases (default: off). Combine with
                          --interval for the full real-time layer.
 
   ${C.bold}CI EXAMPLE${C.reset}
@@ -83,7 +83,7 @@ async function runCI(flags) {
   const allDeps = parseResult.deps;
   const warnings = [...parseResult.warnings];
   if (allDeps.length === 0) {
-    const complete = parseResult.parseFailures === 0;
+    const complete = parseResult.parseFailures === 0 && parseResult.unresolvedManifestInputs === 0;
     if (isSARIF) {
       out(JSON.stringify(toSarif({ complete, summary: { total: 0, vulnerable: 0 }, warnings, vulnerabilities: [] }), null, 2));
     } else if (isJSON) {
@@ -110,7 +110,8 @@ async function runCI(flags) {
   // Query OSV
   const osvResult = await queryBatch(allDeps);
   warnings.push(...osvResult.failures);
-  const complete = parseResult.parseFailures === 0 && isQueryComplete(osvResult, allDeps.length);
+  const complete = parseResult.parseFailures === 0 && parseResult.unresolvedManifestInputs === 0 &&
+    isQueryComplete(osvResult, allDeps.length);
 
   // Collect and filter vulns
   const allVulns = [];
@@ -153,7 +154,7 @@ async function runCI(flags) {
     }
 
     if (filtered.length === 0 && warnings.length === 0) {
-      out('::notice::All dependencies passed security scan');
+      out('::notice::Requested checks completed; no vulnerabilities found at the active threshold');
     }
 
     if (warnings.length > 0) {
@@ -194,12 +195,17 @@ async function runWatch(flags) {
   const initialParse = parseAllEcosystems(targetDir, config.ecosystems);
   let currentDeps = initialParse.deps;
   let currentSnapshot = toSnapshot(currentDeps);
+  let dependencyInputComplete = initialParse.parseFailures === 0 && initialParse.unresolvedManifestInputs === 0;
   out(`  ${C.dim}Baseline: ${currentDeps.length} packages${C.reset}`);
   for (const w of initialParse.warnings) {
     out(`  ${C.yellow}! ${sanitize(w)}${C.reset}`);
   }
 
-  await runPollCycle(currentDeps, config);
+  if (dependencyInputComplete) {
+    await runPollCycle(currentDeps, config);
+  } else {
+    out(`  ${C.yellow}! Dependency input incomplete — OSV polling is paused until exact resolved versions are available${C.reset}`);
+  }
 
   // Watch lockfiles for changes
   const lockfilePaths = findDependencyFiles(targetDir, config.ecosystems);
@@ -213,13 +219,16 @@ async function runWatch(flags) {
 
         try {
           const nextParse = parseAllEcosystems(targetDir, config.ecosystems);
-          if (nextParse.parseFailures > 0) {
+          if (nextParse.parseFailures > 0 || nextParse.unresolvedManifestInputs > 0) {
+            dependencyInputComplete = false;
             for (const w of nextParse.warnings) {
               out(`  ${C.yellow}! ${sanitize(w)}${C.reset}`);
             }
             out(`  ${C.yellow}! Lockfile parsing incomplete — keeping previous baseline until parsing succeeds${C.reset}`);
             return;
           }
+
+          dependencyInputComplete = true;
 
           const newDeps = nextParse.deps;
           const newSnapshot = toSnapshot(newDeps);
@@ -258,7 +267,7 @@ async function runWatch(flags) {
                   out(`    ${C.red}${sanitize(v.package)}@${sanitize(v.version)}${C.reset}: ${sanitize(v.summary)}`);
                 }
               } else {
-                out(`  ${C.green}\u2713 New/changed packages are clean${C.reset}`);
+                out(`  ${C.green}\u2713 OSV returned no findings for the new/changed packages at the active threshold${C.reset}`);
               }
             }
 
@@ -278,32 +287,47 @@ async function runWatch(flags) {
 
   // Periodic OSV poll
   const pollInterval = setInterval(async () => {
+    if (!dependencyInputComplete) {
+      out(`\n  ${C.yellow}! OSV poll skipped — dependency input is incomplete${C.reset}`);
+      return;
+    }
     out(`\n  ${C.dim}[${new Date().toISOString().slice(11, 19)}] Polling OSV for ${currentDeps.length} packages...${C.reset}`);
     await runPollCycle(currentDeps, config);
   }, intervalMs);
 
   // Freshness poll — detects suspicious NEW releases before any CVE exists.
-  // Polls the registry (visible within minutes of publish), not OSV (which
-  // lags whole attack windows). Alerts only fire on NEW versions with
-  // attacker-shaped deltas.
+  // Polls the registry separately from OSV. Alerts only fire on versions first
+  // observed after the persisted baseline and with attacker-shaped deltas.
   let freshnessInterval = null;
+  let freshnessCache = null;
+  let freshnessRunning = false;
   const freshnessMin = flags.freshness ? parseInt(flags.freshness, 10) : 0;
   if (freshnessMin > 0) {
     const freshnessMs = Math.max(freshnessMin * 60 * 1000, MIN_POLL_INTERVAL_MS);
-    out(`  ${C.cyan}Freshness enabled: polling registry every ${freshnessMin} min for new releases${C.reset}`);
-    freshnessInterval = setInterval(async () => {
+    try { freshnessCache = new AdvisoryCache(config.cache?.dir); }
+    catch (err) {
+      freshnessCache = new NoOpCache();
+      out(`  ${C.yellow}! Freshness disabled: persistent release state is unavailable (${sanitize(err.message)})${C.reset}`);
+    }
+    const tickFreshness = async () => {
+      if (!dependencyInputComplete || freshnessRunning || freshnessCache instanceof NoOpCache) return;
+      freshnessRunning = true;
       out(`\n  ${C.dim}[${new Date().toISOString().slice(11, 19)}] Freshness poll: checking ${currentDeps.length} packages for new releases...${C.reset}`);
-      await runFreshnessCycle(currentDeps, config);
-    }, freshnessMs);
-    // Kick it off immediately too — the initial baseline is minutes of lead
-    // time the attacker may have already burned.
-    setTimeout(() => runFreshnessCycle(currentDeps, config), 1500);
+      try { await runFreshnessCycle(currentDeps, config, { cache: freshnessCache }); }
+      finally { freshnessRunning = false; }
+    };
+    if (!(freshnessCache instanceof NoOpCache)) {
+      out(`  ${C.cyan}Freshness enabled: polling npm/PyPI every ${freshnessMin} min; first poll establishes a baseline${C.reset}`);
+      freshnessInterval = setInterval(tickFreshness, freshnessMs);
+      setTimeout(tickFreshness, 1500);
+    }
   }
 
   // Keep process alive until Ctrl+C
   process.on('SIGINT', () => {
     clearInterval(pollInterval);
     if (freshnessInterval) clearInterval(freshnessInterval);
+    freshnessCache?.close?.();
     for (const w of watchers) w.close();
     out(`\n  ${C.dim}Monitor stopped.${C.reset}\n`);
     process.exit(EXIT.OK);
@@ -333,7 +357,7 @@ export async function runPollCycle(deps, config) {
       }
       if (filtered.length > 10) out(`    ${C.dim}... and ${filtered.length - 10} more${C.reset}`);
     } else if (complete) {
-      out(`  ${C.green}\u2713 All ${deps.length} packages clean${C.reset}`);
+      out(`  ${C.green}\u2713 OSV returned no findings for ${deps.length} packages at the active threshold${C.reset}`);
     }
 
     if (!complete) {
@@ -355,32 +379,38 @@ export async function runPollCycle(deps, config) {
  * shared envelope as everything else when --json is active so agents can
  * consume the alerts directly.
  */
-export async function runFreshnessCycle(deps, config) {
-  const events = await checkFreshness(deps);
-  const alerts = events.filter(e => e.isNew);
-  if (alerts.length === 0) return;
+export async function runFreshnessCycle(deps, config, opts = {}) {
+  const result = await checkFreshness(deps, opts);
+  const alerts = result.alerts;
+  if (alerts.length === 0 && result.complete) return result;
 
   const isJSON = config.output?.format === 'json';
   if (isJSON) {
     out(JSON.stringify(buildEnvelope({
       command: 'monitor',
       target: { dir: config.targetPath || '.', lockfiles: [], ecosystems: [...config.ecosystems] },
-      complete: true,
-      warnings: [],
-      summary: { total: deps.length, vulnerable: 0, fresh: alerts.filter(a => a.isNew).length },
+      complete: result.complete,
+      warnings: result.warnings,
+      summary: { total: deps.length, vulnerable: 0, fresh: alerts.length, checked: result.checked, skipped: result.skipped },
       findings: [],
       extra: { mode: 'freshness', version: VERSION, alerts },
     }), null, 2));
-    return;
+    return result;
   }
 
-  out(`\n  ${C.red}${C.bold}⚠ Fresh release(s) detected:${C.reset}`);
-  for (const a of alerts) {
-    const tag = a.level === 'high' ? C.red : C.yellow;
-    out(`  ${tag}${C.bold}${sanitize(a.name)}${C.reset} ${C.dim}${sanitize(a.installed)} → ${sanitize(a.latest)}${C.reset}`);
-    for (const reason of a.reasons) out(`    ${tag}▸ ${sanitize(reason)}${C.reset}`);
+  if (alerts.length > 0) {
+    out(`\n  ${C.red}${C.bold}⚠ Newly observed release signal(s):${C.reset}`);
+    for (const a of alerts) {
+      const tag = a.level === 'high' ? C.red : C.yellow;
+      out(`  ${tag}${C.bold}${sanitize(a.name)}${C.reset} ${C.dim}${sanitize(a.lastSeenVersion)} → ${sanitize(a.latest)}${C.reset}`);
+      for (const reason of a.reasons) out(`    ${tag}▸ ${sanitize(reason)}${C.reset}`);
+    }
+  }
+  for (const warning of result.warnings) {
+    out(`  ${C.yellow}! Freshness incomplete: ${sanitize(warning)}${C.reset}`);
   }
   out('');
+  return result;
 }
 
 /**
@@ -391,16 +421,49 @@ export function parseAllEcosystems(dir, ecosystems) {
   const warnings = [];
   let parseFailures = 0;
   let filesFound = 0;
+  let unresolvedManifestInputs = 0;
 
   for (const eco of ecosystems) {
     if (eco === 'npm') {
       // npm lockfile + pnpm + yarn (all npm ecosystem)
+      let npmLockfileCount = 0;
       for (const [discFn, parseFn] of [[discoverNpm, parseNpmLock], [discoverPnpm, parsePnpmLock], [discoverYarn, parseYarnLock]]) {
         const { lockfiles } = discFn(dir);
+        npmLockfileCount += lockfiles.length;
         filesFound += lockfiles.length;
         for (const lf of lockfiles) {
-          try { deps.push(...parseFn(lf)); }
+          try {
+            const parsed = parseFn(lf);
+            if (parsed.unresolvedEntries > 0) {
+              unresolvedManifestInputs++;
+              warnings.push(`${basename(lf)} contains ${parsed.unresolvedEntries} local, linked, remote, or unanchored npm entr${parsed.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+            }
+            deps.push(...parsed);
+          }
           catch (err) { const msg = `failed to parse ${basename(lf)}: ${err.message}`; warnings.push(msg); parseFailures++; log.warn(msg); }
+        }
+      }
+      if (npmLockfileCount === 0) {
+        const { manifests } = discoverNpm(dir);
+        filesFound += manifests.length;
+        if (manifests.length > 0) {
+          unresolvedManifestInputs++;
+          warnings.push('no npm lockfile found — exact package.json pins can be checked, but resolved/transitive coverage is incomplete');
+        }
+        for (const mf of manifests) {
+          try {
+            const parsed = parseNpmManifest(mf);
+            deps.push(...parsed);
+            if (hasUnresolvedManifestEntries(mf, 'npm', 'package.json', parsed.length)) {
+              unresolvedManifestInputs++;
+              warnings.push(`${basename(mf)} contains dependencies without exact registry versions — add a lockfile or exact pins; those entries were not scanned`);
+            }
+          } catch (err) {
+            const msg = `failed to parse ${basename(mf)}: ${err.message}`;
+            warnings.push(msg);
+            parseFailures++;
+            log.warn(msg);
+          }
         }
       }
     }
@@ -408,8 +471,20 @@ export function parseAllEcosystems(dir, ecosystems) {
       const { lockfiles, manifests } = discoverPypi(dir);
       const files = lockfiles.length > 0 ? lockfiles : manifests;
       filesFound += files.length;
+      if (lockfiles.length === 0 && manifests.length > 0) {
+        unresolvedManifestInputs++;
+        warnings.push('no PyPI lockfile found — exact manifest pins can be checked, but resolved/transitive coverage is incomplete');
+      }
       for (const f of files) {
-        try { deps.push(...parsePypiFile(f.path, f.format)); }
+        try {
+          const parsed = parsePypiFile(f.path, f.format);
+          deps.push(...parsed);
+          if (hasUnresolvedManifestEntries(f.path, 'pypi', f.format, parsed)) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(f.path)} contains dependencies without exact public-PyPI identities — those entries were not scanned`);
+            for (const failure of parsed.includeFailures || []) warnings.push(`${basename(f.path)}: ${failure}`);
+          }
+        }
         catch (err) { const msg = `failed to parse ${basename(f.path)}: ${err.message}`; warnings.push(msg); parseFailures++; log.warn(msg); }
       }
     }
@@ -417,18 +492,33 @@ export function parseAllEcosystems(dir, ecosystems) {
       const { lockfiles } = discoverCargo(dir);
       filesFound += lockfiles.length;
       for (const lf of lockfiles) {
-        try { deps.push(...parseCargoLock(lf)); }
+        try {
+          const parsed = parseCargoLock(lf);
+          if (parsed.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(lf)} contains ${parsed.unresolvedEntries} non-crates.io or unanchored entr${parsed.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
+          deps.push(...parsed);
+        }
         catch (err) { const msg = `failed to parse ${basename(lf)}: ${err.message}`; warnings.push(msg); parseFailures++; log.warn(msg); }
       }
     }
     if (GENERIC_ECOSYSTEM_PARSERS[eco]) {
       const { files, usingManifestFallback } = selectGenericFiles(dir, eco);
       if (usingManifestFallback) {
-        warnings.push(`no lockfile found — scanning ${files.map(file => basename(file.path)).join(', ')} (best-effort manifest fallback, lower confidence)`);
+        warnings.push(`no lockfile found — scanning exact pins from ${files.map(file => basename(file.path)).join(', ')}; manifest fallback is not a resolved dependency graph, so coverage is incomplete`);
+        unresolvedManifestInputs++;
       }
       filesFound += files.length;
       for (const file of files) {
-        try { deps.push(...parseGenericFile(eco, file)); }
+        try {
+          const parsed = parseGenericFile(eco, file);
+          if (parsed.unresolvedEntries > 0) {
+            unresolvedManifestInputs++;
+            warnings.push(`${basename(file.path)} contains ${parsed.unresolvedEntries} replaced or otherwise unanchored module entr${parsed.unresolvedEntries === 1 ? 'y' : 'ies'} — those entries were not scanned`);
+          }
+          deps.push(...parsed);
+        }
         catch (err) { const msg = `failed to parse ${basename(file.path)}: ${err.message}`; warnings.push(msg); parseFailures++; log.warn(msg); }
       }
     }
@@ -448,7 +538,48 @@ export function parseAllEcosystems(dir, ecosystems) {
     warnings,
     parseFailures,
     filesFound,
+    unresolvedManifestInputs,
   };
+}
+
+/** Identify manifest declarations that could not be anchored to exact versions. */
+function hasUnresolvedManifestEntries(filePath, ecosystem, format, parsed) {
+  try {
+    const parsedCount = Array.isArray(parsed) ? parsed.length : parsed;
+    if (ecosystem === 'npm') {
+      const pkg = JSON.parse(readFileSync(filePath, 'utf8'));
+      let declared = 0;
+      for (const section of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+        const entries = pkg[section];
+        if (entries && typeof entries === 'object') declared += Object.keys(entries).length;
+      }
+      return declared > parsedCount;
+    }
+
+    const content = readFileSync(filePath, 'utf8');
+    if (Array.isArray(parsed) && parsed.unresolvedEntries > 0) return true;
+    if (format === 'requirements.txt') {
+      return content.split('\n').some(raw => {
+        const line = raw.split('#')[0].trim();
+        if (!line || (/^--?/.test(line) && !/^(?:-e|--editable)\b/.test(line))) return false;
+        const stripped = line.replace(/\[.*?\]/, '');
+        const match = stripped.match(/^([a-zA-Z0-9._-]+)\s*(?:([=!<>~]+)\s*(.+?))?(?:\s*;.*)?$/);
+        if (!match) return true;
+        const op = match[2] || '';
+        const value = match[3]?.trim()?.split(',')[0]?.trim() || '';
+        return !((op === '==' || op === '===') && /^[A-Za-z0-9][A-Za-z0-9.!+_-]*$/.test(value) && !value.includes('*'));
+      });
+    }
+
+    if (format === 'pyproject.toml' && parsedCount === 0) {
+      return /^\s*dependencies\s*=\s*\[\s*["']/m.test(content) ||
+        /^\s*\[project\.optional-dependencies\]\s*$/m.test(content) ||
+        /^\s*\[tool\.poetry\.(?:dev-)?dependencies\]\s*$/m.test(content);
+    }
+  } catch {
+    // The parser reports malformed/unreadable files separately.
+  }
+  return false;
 }
 
 /**

@@ -5,8 +5,8 @@ import { log } from '../core/logger.js';
  * AST-based code analysis for JavaScript.
  *
  * Parses JS source into an AST via acorn, then walks the tree to detect
- * dangerous patterns that indicate supply chain compromise. This catches
- * obfuscated code that regex-based scanners miss — we see the call graph.
+ * dangerous syntax patterns and capability indicators. This is static pattern
+ * matching, not a complete call graph or proof that a path executes.
  *
  * Returns a capability manifest: what the code CAN do, not just what it looks like.
  */
@@ -91,6 +91,7 @@ export function inspectJS(source, filename = '<unknown>') {
       sourceType: 'module',
       allowReturnOutsideFunction: true,
       allowImportExportEverywhere: true,
+      allowHashBang: true,
       // Tolerate minor syntax issues — malicious code may have intentional oddities
       onComment: () => {},
     });
@@ -101,6 +102,7 @@ export function inspectJS(source, filename = '<unknown>') {
         ecmaVersion: 2022,
         sourceType: 'script',
         allowReturnOutsideFunction: true,
+        allowHashBang: true,
       });
     } catch (err2) {
       log.debug(`AST parse failed for ${filename}: ${err2.message}`);
@@ -132,6 +134,15 @@ export function inspectJS(source, filename = '<unknown>') {
   try {
     detectObfuscationPatterns(ast, findings);
   } catch { /* non-critical, don't let this crash the inspector */ }
+
+  // Acorn's `start` values are byte/character offsets. Convert them before
+  // exposing the public `line` field; reporting offsets as line numbers makes
+  // findings point at the wrong source location in real files.
+  for (const finding of findings) {
+    if (Number.isInteger(finding.line)) {
+      finding.line = source.slice(0, finding.line).split('\n').length;
+    }
+  }
 
   return buildResult(findings);
 }

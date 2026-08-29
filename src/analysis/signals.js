@@ -23,13 +23,16 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 /**
  * Confidence grade per signal — how strongly the evidence backs the claim.
  * (grades defined in src/cli/schema.js CONFIDENCE)
- *   proven        — registry/OSV-confirmed fact (active compromise, known vuln)
+ *   proven        — exact match to an upstream registry/OSV fact; not proof of exploitation
  *   deterministic — derived purely from first-party registry data (publish
  *                   times, maintainer identity, script presence, Unicode)
  *   heuristic     — tuned heuristic with thresholds that can false-positive
  *   (anything unmapped defaults to 'inferred' — a lead, not a verdict)
  */
 export const SIGNAL_CONFIDENCE = Object.freeze({
+  KNOWN_MALICIOUS: 'proven',
+  KNOWN_VULNERABILITY: 'proven',
+  OSV_MATCH: 'proven', // compatibility name accepted by downstream consumers
   KNOWN_COMPROMISED: 'proven',
   MAINTAINER_CHANGE: 'deterministic',
   POSTINSTALL_SCRIPT: 'deterministic',
@@ -54,6 +57,36 @@ export const SIGNAL_CONFIDENCE = Object.freeze({
   SANDBOX_BEHAVIOR: 'heuristic', // observed at runtime under OS isolation — solid, but behavior can be staged/benign-in-context
 });
 
+// `KNOWN_COMPROMISED` was historically emitted for every OSV match, including
+// ordinary CVEs.  Keep it only as an input/config compatibility name; new
+// results use a truthful distinction between a vulnerability match and an
+// advisory that explicitly identifies a malicious package/version.
+export const KNOWN_ADVISORY_SIGNALS = Object.freeze([
+  'KNOWN_MALICIOUS',
+  'KNOWN_VULNERABILITY',
+  'OSV_MATCH',
+  'KNOWN_COMPROMISED',
+]);
+
+export function isKnownAdvisorySignal(signal) {
+  return KNOWN_ADVISORY_SIGNALS.includes(signal);
+}
+
+const DEP_GRAPH_SIGNALS = Object.freeze([
+  'NEW_DEPENDENCY',
+  'PHANTOM_DEPENDENCY',
+  'CIRCULAR_STAGING',
+  'NEW_DEP_HAS_INSTALL_SCRIPTS',
+]);
+
+const BEHAVIOR_SIGNALS = Object.freeze([
+  'INITIAL_DANGEROUS_CAPABILITY',
+  'CAPABILITY_ESCALATION',
+  'DEPENDENCY_SPIKE',
+  'MAINTAINER_REDUCTION',
+  'REPOSITORY_REMOVED',
+]);
+
 /**
  * Run all detection layers for a single package.
  *
@@ -74,28 +107,45 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
     return { signals: [], riskScore: 0, riskLevel: 'UNKNOWN', warnings: ['metadata unavailable'] };
   }
 
-  // Check if signal is disabled in config.
-  // Critical safety signals can NEVER be disabled — they detect active compromises.
-  const UNDISABLEABLE_SIGNALS = new Set([
-    'KNOWN_COMPROMISED',
-    'PHANTOM_DEPENDENCY',
-    'CIRCULAR_STAGING',
-    'CAPABILITY_ESCALATION',
-  ]);
+  // Every documented signal switch is honored. A scanner may choose safe
+  // defaults, but silently ignoring an explicit per-signal `off` makes policy
+  // configuration untrustworthy. The legacy KNOWN_COMPROMISED switch applies
+  // to the new advisory signal names only when their own switch is absent.
   const signalConfig = config?.analyze?.signals || {};
-  const isEnabled = (signal) => UNDISABLEABLE_SIGNALS.has(signal) || signalConfig[signal] !== 'off';
+  const isEnabled = (signal) => {
+    if (signalConfig[signal] === 'off') return false;
+    if ((signal === 'KNOWN_MALICIOUS' || signal === 'KNOWN_VULNERABILITY') &&
+        signalConfig[signal] === undefined && signalConfig.KNOWN_COMPROMISED === 'off') {
+      return false;
+    }
+    return true;
+  };
 
   // ─── Layer 4: Registry metadata signals (fast, no async) ───────────
 
-  // KNOWN_COMPROMISED: OSV results exist
-  if (isEnabled('KNOWN_COMPROMISED') && osvResult?.length > 0) {
-    signals.push({
-      signal: 'KNOWN_COMPROMISED',
-      severity: 'CRITICAL',
-      description: `${osvResult.length} known vulnerability(ies) in OSV database`,
-      evidence: { vulnCount: osvResult.length, ids: osvResult.map(v => v.id) },
-      layer: 4,
-    });
+  // OSV is a vulnerability database, not proof that every affected package
+  // was compromised. Only explicit MAL-* records carry the malicious label;
+  // ordinary advisories retain the highest upstream severity in their group.
+  if (osvResult?.length > 0) {
+    const malicious = osvResult.filter(isExplicitMaliciousAdvisory);
+    const vulnerabilities = osvResult.filter(v => !isExplicitMaliciousAdvisory(v));
+
+    if (malicious.length > 0 && isEnabled('KNOWN_MALICIOUS')) {
+      signals.push(advisorySignal(
+        'KNOWN_MALICIOUS',
+        malicious,
+        `${malicious.length} explicit malicious-package advisory match(es) in OSV`,
+        'CRITICAL'
+      ));
+    }
+    if (vulnerabilities.length > 0 && isEnabled('KNOWN_VULNERABILITY')) {
+      signals.push(advisorySignal(
+        'KNOWN_VULNERABILITY',
+        vulnerabilities,
+        `${vulnerabilities.length} known vulnerability match(es) in OSV`,
+        'MODERATE'
+      ));
+    }
   }
 
   // MAINTAINER_CHANGE
@@ -132,7 +182,10 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
     const isKnownGood = KNOWN_POSTINSTALL.has(metadata.name);
     signals.push({
       signal: 'POSTINSTALL_SCRIPT',
-      severity: isKnownGood ? 'LOW' : 'HIGH',
+      // Script presence is deterministic evidence of an execution surface,
+      // not evidence of malicious intent. Dangerous content is scored by the
+      // AST and behavioral layers rather than double-counted here.
+      severity: isKnownGood ? 'LOW' : 'MODERATE',
       description: `Has install lifecycle scripts: ${Object.keys(metadata.installScripts || {}).join(', ')}`,
       evidence: { scripts: metadata.installScripts, knownGood: isKnownGood },
       layer: 4,
@@ -180,15 +233,21 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
         layer: 4,
       });
     }
-    // Long dormancy then sudden publish
-    // Dormancy: if any gap between consecutive versions exceeds 1 year, that's suspicious
-    // regardless of how long ago the latest publish was
+    // Long dormancy then a publish is useful context, but it is not a permanent
+    // HIGH verdict. A reactivation years ago has had time to accumulate review
+    // and usage; preserve the fact while decaying its present-day urgency.
     if (metadata.dormancyMs && metadata.dormancyMs > ONE_YEAR_MS) {
+      const daysSincePublish = metadata.latestPublishTime
+        ? Math.max(0, (now - new Date(metadata.latestPublishTime).getTime()) / 86400000)
+        : 0;
+      const severity = daysSincePublish < 90
+        ? 'HIGH'
+        : (daysSincePublish < 365 ? 'MODERATE' : 'LOW');
       signals.push({
         signal: 'VERSION_ANOMALY',
-        severity: 'HIGH',
-        description: `Package was dormant for ${Math.floor(metadata.dormancyMs / (86400000))} days then suddenly published`,
-        evidence: { dormancyMs: metadata.dormancyMs },
+        severity,
+        description: `Package was dormant for ${Math.floor(metadata.dormancyMs / 86400000)} days before this version${daysSincePublish >= 90 ? ` (${Math.floor(daysSincePublish)} days ago)` : ''}`,
+        evidence: { dormancyMs: metadata.dormancyMs, daysSincePublish: Math.floor(daysSincePublish) },
         layer: 4,
       });
     }
@@ -208,17 +267,19 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
   }
 
   // HOMOGLYPH: suspicious Unicode in package name
-  const homoglyphs = detectHomoglyphs(metadata.name);
+  const homoglyphs = isEnabled('HOMOGLYPH') ? detectHomoglyphs(metadata.name) : [];
   if (homoglyphs.length > 0) {
-    for (const h of homoglyphs) {
-      signals.push({
-        signal: 'HOMOGLYPH',
-        severity: 'CRITICAL',
-        description: h.description,
-        evidence: { type: h.type, name: metadata.name },
-        layer: 4,
-      });
-    }
+    signals.push({
+      signal: 'HOMOGLYPH',
+      severity: 'CRITICAL',
+      description: homoglyphs.map(h => h.description).join('; '),
+      evidence: {
+        type: homoglyphs[0].type, // legacy single-finding consumer compatibility
+        types: homoglyphs.map(h => h.type),
+        name: metadata.name,
+      },
+      layer: 4,
+    });
   }
 
   // TYPOSQUAT
@@ -267,10 +328,10 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
 
   // ─── Layer 2: Dependency graph analysis ────────────────────────────
 
-  if (isEnabled('PHANTOM_DEPENDENCY') && ecosystem === 'npm') {
+  if (DEP_GRAPH_SIGNALS.some(isEnabled) && ecosystem === 'npm') {
     try {
       const depFindings = await analyzeNewDeps(metadata);
-      for (const f of depFindings) {
+      for (const f of depFindings.filter(f => isEnabled(f.signal))) {
         signals.push({ ...f, layer: 2 });
       }
     } catch (err) {
@@ -281,7 +342,7 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
 
   // ─── Layer 3: Behavioral fingerprinting ────────────────────────────
 
-  if (isEnabled('CAPABILITY_ESCALATION')) {
+  if (BEHAVIOR_SIGNALS.some(isEnabled)) {
     try {
       const astResult = metadata.installScripts
         ? inspectAllScripts(metadata.installScripts, metadata.name)
@@ -315,7 +376,9 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
 
       const behaviorFindings = diffProfiles(currentProfile, effectivePrevious);
 
-      for (const f of behaviorFindings) {
+      for (const f of collapseCapabilityFindings(
+        behaviorFindings.filter(f => isEnabled(f.signal))
+      )) {
         signals.push({ ...f, layer: 3 });
       }
     } catch (err) {
@@ -329,14 +392,106 @@ export async function analyzePackage(metadata, osvResult, options = {}) {
   // Attach confidence grades after all layers finished, so dep-graph and
   // behavioral signals (pushed via spread) get graded too. Every consumer
   // (analyze, inspect, watch) sees the same grading without duplicating it.
-  for (const s of signals) {
+  const finalSignals = deduplicateSignals(signals);
+  for (const s of finalSignals) {
     s.confidence = SIGNAL_CONFIDENCE[s.signal] || 'inferred';
   }
 
-  const riskScore = computeRiskScore(signals, metadata);
+  const riskScore = computeRiskScore(finalSignals, metadata);
   const riskLevel = scoreToLevel(riskScore);
 
-  return { signals, riskScore, riskLevel, warnings };
+  return { signals: finalSignals, riskScore, riskLevel, warnings };
+}
+
+function advisoryIdentifiers(advisory) {
+  return [advisory?.id, advisory?.displayId, ...(advisory?.aliases || [])]
+    .filter(id => typeof id === 'string' && id.length > 0);
+}
+
+export function isExplicitMaliciousAdvisory(advisory) {
+  return advisoryIdentifiers(advisory).some(id => /^MAL-/i.test(id)) ||
+    advisory?.databaseSpecific?.type === 'MALWARE' ||
+    advisory?.database_specific?.type === 'MALWARE';
+}
+
+function highestAdvisorySeverity(advisories, fallback) {
+  const highest = advisories.reduce((current, advisory) => {
+    const candidate = String(advisory?.severity || '').toUpperCase();
+    if (!SEVERITY[candidate]) return current;
+    if (!current || SEVERITY[candidate].order > SEVERITY[current].order) return candidate;
+    return current;
+  }, null);
+  return highest || fallback;
+}
+
+function advisorySignal(signal, advisories, description, fallbackSeverity) {
+  const ids = [...new Set(advisories.flatMap(advisoryIdentifiers))];
+  return {
+    signal,
+    severity: highestAdvisorySeverity(advisories, fallbackSeverity),
+    description,
+    evidence: {
+      vulnCount: advisories.length,
+      ids,
+      advisories: advisories.map(v => ({
+        id: v.id,
+        displayId: v.displayId,
+        aliases: v.aliases || [],
+        severity: v.severity,
+      })),
+    },
+    layer: 4,
+  };
+}
+
+function collapseCapabilityFindings(findings) {
+  const collapsible = new Set(['INITIAL_DANGEROUS_CAPABILITY', 'CAPABILITY_ESCALATION']);
+  const grouped = new Map();
+  const result = [];
+
+  for (const finding of findings) {
+    if (!collapsible.has(finding.signal)) {
+      result.push(finding);
+      continue;
+    }
+    const group = grouped.get(finding.signal) || [];
+    group.push(finding);
+    grouped.set(finding.signal, group);
+  }
+
+  for (const [signal, group] of grouped) {
+    const capabilities = [...new Set(group.map(f => f.evidence?.capability).filter(Boolean))];
+    const strongest = group.reduce((best, f) =>
+      (SEVERITY[f.severity]?.order || 0) > (SEVERITY[best.severity]?.order || 0) ? f : best
+    );
+    result.push({
+      ...strongest,
+      description: group.length === 1
+        ? strongest.description
+        : `${signal === 'CAPABILITY_ESCALATION' ? 'Package gained' : 'Package has'} dangerous capabilities: ${capabilities.join(', ')}`,
+      evidence: { ...strongest.evidence, capabilities },
+    });
+  }
+  return result;
+}
+
+function deduplicateSignals(signals) {
+  const byKey = new Map();
+  for (const finding of signals) {
+    const depName = finding.evidence?.depName || '';
+    const script = finding.evidence?.script || '';
+    const pattern = finding.evidence?.pattern || '';
+    const key = depName
+      ? `${finding.signal}|dep:${depName}`
+      : (finding.signal === 'AST_DANGEROUS_PATTERN'
+          ? `${finding.signal}|script:${script}|pattern:${pattern}`
+          : `${finding.signal}|${finding.description}`);
+    const existing = byKey.get(key);
+    if (!existing || (SEVERITY[finding.severity]?.order || 0) > (SEVERITY[existing.severity]?.order || 0)) {
+      byKey.set(key, finding);
+    }
+  }
+  return [...byKey.values()];
 }
 
 /**

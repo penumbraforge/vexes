@@ -2,52 +2,40 @@ import { fetchNpmProvenance } from '../advisories/npm-registry.js';
 import { log } from '../core/logger.js';
 
 /**
- * Check npm packages for Sigstore provenance attestations.
+ * Inspect npm packages for published Sigstore provenance attestations.
  *
- * Provenance means the package was built by a CI system from a public
- * source repository, with a cryptographic chain linking the published
- * artifact to the source commit. Packages WITHOUT provenance could have
- * been published from any machine (including a compromised one).
+ * This module fetches attestation bundles and decodes DSSE payload JSON. It
+ * does NOT verify the DSSE signature, certificate chain, Rekor inclusion, or
+ * subject digest against downloaded package bytes. Presence and decoded
+ * claims are useful evidence, but they are not cryptographic verification.
  *
  * 2026 addition: we now also surface the attestation *subjects* (the artifact
- * names the signature certifies) — `SIGNATURE_SPOOF` in signals.js xrefs them
- * against the package identity. Provenance ≠ trust: the TanStack worm shipped
- * cryptographically valid SLSA L3 provenance, so "has provenance" alone proves
- * nothing. What an attestation SAYS it certified still has to match who the
- * package says it is.
+ * names the payload claims as subjects) and compare those claims with package
+ * identity. Provenance presence is not a trust verdict.
  */
 export async function checkProvenance(packageName, version) {
   try {
     const data = await fetchNpmProvenance(packageName, version);
 
     if (!data) {
-      return {
-        hasProvenance: null, // Could not determine (fetch failed)
-        buildType: null,
-        sourceRepo: null,
-        transparency: null,
-        subjects: [],
-      };
+      return provenanceResult({ hasAttestation: null, status: 'unavailable' });
     }
 
     if (!data.hasProvenance || !data.attestations?.length) {
-      return {
-        hasProvenance: false,
-        buildType: null,
-        sourceRepo: null,
-        transparency: null,
-        subjects: [],
-      };
+      return provenanceResult({ hasAttestation: false, status: 'absent' });
     }
 
     // Parse SLSA provenance from attestations
     let buildType = null;
     let sourceRepo = null;
-    let transparency = null;
+    let transparencyLogEntryPresent = false;
     let anyParsedSuccessfully = false;
     const subjects = new Set();
 
     for (const att of data.attestations) {
+      if (att.bundle?.verificationMaterial?.tlogEntries?.length > 0) {
+        transparencyLogEntryPresent = true;
+      }
       try {
         if (att.bundle?.dsseEnvelope?.payload) {
           const payload = JSON.parse(
@@ -58,70 +46,87 @@ export async function checkProvenance(packageName, version) {
           sourceRepo = payload.predicate?.invocation?.configSource?.uri || sourceRepo;
 
           // SLSA statement: `subject` sits at the top of the in-toto
-          // Statement, alongside `predicate` — the artifact names the
-          // signature certifies. npm uses `pkg:npm/<name>@<version>`.
+          // Statement, alongside `predicate` — these are the artifact names
+          // the decoded payload claims. npm uses `pkg:npm/<name>@<version>`.
           for (const s of payload.subject || []) {
             if (typeof s?.name === 'string' && s.name.length > 0) subjects.add(s.name);
-          }
-
-          if (att.bundle?.verificationMaterial?.tlogEntries?.length > 0) {
-            transparency = 'verified';
           }
 
           anyParsedSuccessfully = true;
         }
       } catch (err) {
-        // Corrupted/crafted attestation that crashes parser — don't claim provenance is verified
+        // A malformed payload remains "present but undecodable".
         log.warn(`attestation parse failed for ${packageName}@${version}: ${err.message}`);
       }
     }
 
-    return {
-      // Only claim provenance if we successfully parsed at least one attestation
-      hasProvenance: anyParsedSuccessfully ? true : null,
+    return provenanceResult({
+      hasAttestation: true,
+      attestationDecoded: anyParsedSuccessfully,
+      status: anyParsedSuccessfully ? 'decoded' : 'present-undecodable',
       buildType,
       sourceRepo,
-      transparency,
+      transparencyLogEntryPresent,
       subjects: [...subjects],
-    };
+    });
   } catch (err) {
     log.debug(`provenance check failed for ${packageName}@${version}: ${err.message}`);
-    return {
-      hasProvenance: null,
-      buildType: null,
-      sourceRepo: null,
-      transparency: null,
-      subjects: [],
-    };
+    return provenanceResult({ hasAttestation: null, status: 'unavailable' });
   }
 }
 
+function provenanceResult({
+  hasAttestation,
+  attestationDecoded = false,
+  status,
+  buildType = null,
+  sourceRepo = null,
+  transparencyLogEntryPresent = hasAttestation === true ? false : null,
+  subjects = [],
+}) {
+  return {
+    hasAttestation,
+    attestationDecoded,
+    attestationStatus: status,
+    verificationStatus: 'not-performed',
+    cryptographicallyVerified: false,
+    transparencyLogEntryPresent,
+    claimedBuildType: buildType,
+    claimedSourceRepo: sourceRepo,
+    claimedSubjects: subjects,
+
+    // Compatibility fields. `hasProvenance` means an attestation payload was
+    // present and decoded; it must not be read as signature verification.
+    hasProvenance: hasAttestation === false ? false : (attestationDecoded ? true : null),
+    buildType,
+    sourceRepo,
+    transparency: transparencyLogEntryPresent === true ? 'entry-present' : null,
+    subjects,
+  };
+}
+
 /**
- * Detect provenance-replay / misattributed-provenance (TanStack-family vector).
+ * Detect identity mismatches in decoded attestation claims.
  *
  * Pure — no I/O — so the spoof judgment is unit-testable. Returns a signal
  * object or null. Two independent checks:
  *
- * 1. SUBJECT MISMATCH (replay): the attestation cryptographically certifies an
- *    artifact whose name never contains THIS package's name. Valid signature,
- *    wrong package → provenance replay (attacker re-hosted someone else's
- *    attestation bundle). Deterministic.
- * 2. SOURCE/REPO MISMATCH (credible-denial): provenance claims "built in CI
- *    from repo X" but the registry declares interface repo Y and they don't
- *    agree. The TanStack worm's provenance was valid — fully-repo it, the tool
- *    can't see the token theft. What it CAN see is the package pointing at a
- *    source repo that the attestation never mentions. Heuristic: builds from
- *    org forks/mirrors false-positive.
+ * 1. SUBJECT MISMATCH: the decoded subject names never match this package.
+ *    This is a deterministic metadata mismatch, not proof of signature replay.
+ * 2. SOURCE/REPO MISMATCH: the decoded payload claims "built in CI
+ *    from repo X" but the registry declares repo Y and they do not agree.
+ *    This only compares decoded fields; it does not cryptographically verify
+ *    the bundle. Builds from legitimate forks or mirrors can false-positive.
  *
  * @param {object} ctx — { packageName, subjects: string[], sourceRepo: string|null, declaredRepo: string|null }
  * @returns {{ signal: string, severity: string, description: string, evidence: object }|null}
  */
-export function detectProvenanceSpoof(ctx) {
+export function detectAttestationIdentityMismatch(ctx) {
   const { packageName, subjects = [], sourceRepo = null, declaredRepo = null } = ctx || {};
   if (!packageName) return null;
   const evidence = {};
 
-  // 1. Subject mismatch → replay. Normalize `pkg:npm/name@version` forms.
+  // 1. Subject mismatch. Normalize `pkg:npm/name@version` forms; do not infer replay.
   // Strip only a @<digits...> version tail (never the scope `@`), so both
   // `lodash@4.17.21` and `@babel/core@7.0.0` normalize cleanly.
   const normalized = (s) => s
@@ -135,9 +140,10 @@ export function detectProvenanceSpoof(ctx) {
     const matching = subjects.filter(s => normalized(s) === pkgKey || normalized(s).startsWith(pkgKey + '/'));
     if (matching.length === 0) {
       return {
-        signal: 'SIGNATURE_SPOOF',
+        signal: 'ATTESTATION_IDENTITY_MISMATCH',
+        legacySignal: 'SIGNATURE_SPOOF',
         severity: 'HIGH',
-        description: `Provenance attestation certifies artifact(s) that never match package "${packageName}" — probable replay of another package's signature`,
+        description: `Decoded attestation subject name(s) do not match package "${packageName}"`,
         evidence: { kind: 'subject-mismatch', subjects, packageName },
         confidence: 'deterministic',
         layer: 4,
@@ -164,9 +170,10 @@ export function detectProvenanceSpoof(ctx) {
         (src.path !== dec.path && src.path + '.git' !== dec.path && src.path !== dec.path + '.git');
       if (differs) {
         return {
-          signal: 'SIGNATURE_SPOOF',
+          signal: 'ATTESTATION_IDENTITY_MISMATCH',
+          legacySignal: 'SIGNATURE_SPOOF',
           severity: 'HIGH',
-          description: `Provenance claims build from "${sourceRepo}" but package metadata declares "${declaredRepo}"`,
+          description: `Decoded attestation claims source "${sourceRepo}" but package metadata declares "${declaredRepo}"`,
           evidence: { kind: 'repo-mismatch', sourceRepo, declaredRepo },
           confidence: 'heuristic',
           layer: 4,
@@ -177,3 +184,7 @@ export function detectProvenanceSpoof(ctx) {
 
   return null;
 }
+
+// Backward-compatible export name. The returned signal uses the truthful
+// ATTESTATION_IDENTITY_MISMATCH identifier.
+export const detectProvenanceSpoof = detectAttestationIdentityMismatch;
