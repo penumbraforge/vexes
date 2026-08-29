@@ -8,7 +8,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 > implementation. The entries below have been corrected in place where needed;
 > current limitations in README and SECURITY.md take precedence over older copy.
 
-## [0.6.1] — 2026-08-28
+## [0.6.1] — 2026-08-29
 
 Trust and correctness follow-up to 0.6.0. The changes below tighten behavior
 and terminology; they are not a security certification.
