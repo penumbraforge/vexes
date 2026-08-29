@@ -14,17 +14,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Run vexes action on demo/
+      - name: Run vexes action on the source-anchored fixture
         id: scan
         uses: ./
         # Default (fail-on-findings: false) → the action succeeds and exposes
-        # outputs even though the demo fixtures contain vulnerabilities. We
-        # assert on those outputs.
+        # outputs even though the npm fixture contains vulnerabilities. The
+        # dedicated lockfile carries canonical registry and integrity evidence;
+        # the presentation fixtures in demo/ intentionally omit that evidence
+        # and must now fail loud under the source-identity boundary.
         with:
           command: scan
-          path: demo
+          path: test/fixtures/action
           severity: moderate
           sarif-file: vexes-demo.sarif
+          args: --ecosystem npm
 
       - name: Assert on action outputs
         shell: bash
