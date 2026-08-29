@@ -10,8 +10,11 @@
  *  - NOTHING executes unless an isolation host is detected AND the caller
  *    passes `allow: true` (inspect --sandbox / analyze --sandbox set this
  *    explicitly; the argv is built but never spawned otherwise).
- *  - No host available (Windows, no bwrap, sandbox-exec stripped) ⇒ `refused`,
- *    never a fake "clean". A warning surfaces instead.
+ *  - A detected host MUST have filesystem write isolation (sandbox-exec,
+ *    bwrap). Namespace-only primitives (unshare, firejail) are refused —
+ *    package code must never reach the user's files under a "sandboxed" label.
+ *  - No acceptable host (Windows, no bwrap, sandbox-exec stripped) ⇒
+ *    `refused`, never a fake "clean". A warning surfaces instead.
  *  - The address space is a throwaway temp dir; kills happen on timeout.
  *
  * @module analysis/sandbox
@@ -34,10 +37,15 @@ const HOSTS = {
 // What the user can actually count on, per host. sandbox-exec (Seatbelt) and
 // bwrap ro-bind root + writable workdir ⇒ FILE WRITES CANNOT ESCAPE the
 // workdir. unshare/firejail isolate process/net namespaces only — they run on
-// the host filesystem, so writes are NOT contained (and we say so out loud).
+// the host filesystem, so writes are NOT contained. Only hosts with
+// writeIsolation: true are EVER accepted (detectSandboxHost refuses the rest):
+// "sandboxed" package code that can touch the user's home directory is not a
+// sandbox, and reporting it as one is the lie this module must never tell.
 const HOST_CAP = {
   'sandbox-exec': { writeIsolation: true },
   bwrap: { writeIsolation: true },
+  // Namespace-only primitives — accepted by nobody. Listed so the refusal
+  // reason can name exactly why they were skipped.
   unshare: { writeIsolation: false },
   firejail: { writeIsolation: false },
 };
@@ -63,18 +71,26 @@ let cachedHost = { done: false, value: null };
  * bare while reporting "isolated" — the one lie this module must never tell.
  * So each candidate is live-verified with a benign `node -e` under the
  * primitive; candidates that cannot run yield NO host (refuse, warn, keep the
- * scan complete). Verification result is cached for the process lifetime.
+ * scan complete).
+ *
+ * Filesystem write isolation is NON-NEGOTIABLE: a host that cannot contain
+ * writes (unshare, firejail — process/net namespaces only) is refused exactly
+ * like a missing binary. Package code must never run where it could modify
+ * user files while anything reports "isolated". Verification result is cached
+ * for the process lifetime.
  *
  * @param {object} [opts] — { live: false } skips the probe (for pure callers)
- * @returns {{ host: string, writeIsolation: boolean }|null}
+ * @returns {{ host: string, writeIsolation: true }|null} — a non-null result
+ *   ALWAYS has writeIsolation true; null means "no acceptable host".
  */
 export function detectSandboxHost({ live = true } = {}) {
   if (cachedHost.done) return cachedHost.value;
   let value = null;
   for (const c of HOSTS[process.platform] || []) {
     if (!probe(c)) continue;
+    if (!HOST_CAP[c]?.writeIsolation) continue; // cannot contain writes — refuse
     if (live && !verifyPrimitive(c)) continue; // binary exists, can't isolate
-    value = { host: c, writeIsolation: !!HOST_CAP[c]?.writeIsolation };
+    value = { host: c, writeIsolation: true };
     break;
   }
   cachedHost = { done: true, value };
@@ -208,7 +224,18 @@ export function runSandboxed(opts = {}) {
     return {
       status: 'refused', host: null, stdout: '', stderr: '',
       spawns: [], code: null, writeIsolation: false,
-      reason: 'no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)',
+      reason: 'no isolation host with filesystem write isolation (need sandbox-exec on macOS, or bwrap on Linux — unshare/firejail cannot contain writes)',
+    };
+  }
+  // Hard floor, independent of detection: a host that cannot contain
+  // filesystem writes is refused even when explicitly forced. Running
+  // untrusted package code bare on the host filesystem while anything calls
+  // it "sandboxed" is the one outcome this module must never allow.
+  if (!writeIsolation) {
+    return {
+      status: 'refused', host: hostName, stdout: '', stderr: '',
+      spawns: [], code: null, writeIsolation: false,
+      reason: `${hostName} cannot contain filesystem writes (process/net namespaces only) — refusing to run package code`,
     };
   }
   if (!allow) {

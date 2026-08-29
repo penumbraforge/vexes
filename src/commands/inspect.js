@@ -187,7 +187,7 @@ export async function runInspect(flags, args) {
       // to refuse it. One honest warning; never a signal, never an exit change.
       const effectiveHost = config.sandboxHost !== undefined ? config.sandboxHost : detectSandboxHost();
       if (!effectiveHost) {
-        warnings.push('sandbox skipped — no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)');
+        warnings.push('sandbox skipped — no isolation host with filesystem write isolation (need sandbox-exec on macOS, or bwrap on Linux)');
       } else if (assessment.riskScore < 15 || assessment.signals.length === 0) {
         warnings.push('sandbox: package below sandbox threshold (riskScore >= 15) — skipped');
       } else {

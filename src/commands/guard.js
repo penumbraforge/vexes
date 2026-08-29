@@ -15,24 +15,30 @@ import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { buildEnvelope } from '../cli/schema.js';
 
 /**
- * `vexes guard` — Pre-install protection.
+ * `vexes guard` — Pre-install protection. EXPERIMENTAL, npm only.
  *
  * Unlike proxy-based tools (Socket Firewall), this works by diffing lockfiles:
  * 1. Snapshot the current lockfile
  * 2. Run `npm install --package-lock-only --ignore-scripts` (dry-run: updates lockfile without executing)
  * 3. Diff the lockfile to find new/changed packages
- * 4. Run analyze on those packages
+ * 4. Analyze those packages at the EXACT proposed versions (never dist-tags.latest)
  * 5. Block or prompt if dangerous signals found
- * 6. If approved, run the real install
+ * 6. If approved, run the real install — then RE-READ the lockfile and verify
+ *    every analyzed package is installed at exactly the approved version. If
+ *    the second resolution drifted, that's a fail-loud error, not a shrug.
  *
  * This approach works even with cached packages (no network interception needed).
+ *
+ * Known limits (why this stays "experimental"):
+ *  - The analysis gate and the real install are two separate resolutions of
+ *    the same request. Post-install verification closes that gap by checking
+ *    the actual result, but it is a check, not a transaction.
+ *  - pnpm/yarn are refused: guard diffs package-lock.json, which they don't
+ *    maintain — a "dry-run" there would analyze the wrong project state.
  */
 /**
- * Lockfile-only dry-run flags per package manager. `--package-lock-only` is
- * npm-only; pnpm needs `--lockfile-only`; yarn (berry) updates the lockfile
- * without touching node_modules via `--mode=update-lockfile`. npx has no
- * lockfile mode and is refused in runGuard before reaching this point.
- * Never executes scripts.
+ * Lockfile-only dry-run flags. npm only — guard refuses other managers before
+ * this ever matters. Never executes scripts.
  */
 export function dryRunFlags(manager) {
   switch (manager) {
@@ -130,6 +136,40 @@ export function verifyLockfileDiff({ beforeRaw, afterRaw, diff, requestedNames =
 }
 
 /**
+ * Bind the approval to what actually got installed. The analysis gate and the
+ * real install are two separate resolutions of the same request — the registry
+ * can answer them differently (dist-tag moved, cache expired, mirror split).
+ * After the real install, re-read the lockfile and require that every analyzed
+ * package is present at EXACTLY the analyzed version. Anything else means the
+ * installed artifact is not the approved artifact → fail loud.
+ *
+ * PURE — takes the post-install lockfile text, no I/O. Returns { ok: true } or
+ * { ok: false, reason } naming every package that is missing or drifted.
+ */
+export function verifyInstalledVersions({ afterRaw, expected }) {
+  const installed = new Map(); // name → Set<version>
+  for (const [key, entry] of Object.entries(parseLockGraph(afterRaw))) {
+    if (!key || !entry?.version) continue;
+    const name = key.split('node_modules/').pop().toLowerCase();
+    if (!name) continue;
+    if (!installed.has(name)) installed.set(name, new Set());
+    installed.get(name).add(entry.version);
+  }
+
+  const problems = [];
+  for (const { name, version } of expected || []) {
+    const versions = installed.get(String(name).toLowerCase());
+    if (!versions) { problems.push(`${name} is not in the lockfile after install`); continue; }
+    if (!versions.has(version)) {
+      problems.push(`${name} approved as ${version} but installed as ${[...versions].join(', ')}`);
+    }
+  }
+
+  if (problems.length === 0) return { ok: true };
+  return { ok: false, reason: problems.join('; ') };
+}
+
+/**
  * Emit guard's machine output through the shared JSON envelope (cli/schema.js)
  * so agents/CI get the same versioned shape they get from every other vexes
  * command. Command-specific fields (installCommand, blocked, incomplete,
@@ -146,7 +186,15 @@ export function buildGuardEnvelope({ installCommand, diff, blocked, incomplete, 
     warnings,
     summary: { added, changed, removed, blocked, incomplete },
     findings: [],
-    extra: { installCommand, blocked, incomplete, diff: { added, changed, removed }, results: results || [] },
+    extra: {
+      installCommand,
+      packageManager: 'npm',
+      experimental: true,
+      blocked,
+      incomplete,
+      diff: { added, changed, removed },
+      results: results || [],
+    },
   });
 }
 
@@ -185,6 +233,16 @@ export async function runGuard(flags, args) {
     return EXIT.ERROR;
   }
 
+  // guard diffs package-lock.json, which pnpm/yarn do not maintain: their
+  // "dry-run" would update a DIFFERENT lockfile while guard analyzes
+  // package-lock.json — approving one artifact and installing another.
+  // Until per-manager transactional support exists, refusing is the honest
+  // answer (label: guard is npm-only, experimental).
+  if (manager && manager !== 'npm') {
+    log.error(`guard is experimental and npm-only — "${manager}" is not supported yet (guard diffs package-lock.json, which ${manager} does not maintain). Use "vexes inspect <package>" to assess packages before installing with ${manager}.`);
+    return EXIT.ERROR;
+  }
+
   const lockfilePath = join(targetDir, 'package-lock.json');
 
   if (!existsSync(lockfilePath)) {
@@ -193,7 +251,7 @@ export async function runGuard(flags, args) {
   }
 
   if (!isJSON) {
-    out(`\n  ${C.bold}vexes guard${C.reset} v${VERSION} ${C.dim}— pre-install protection${C.reset}\n`);
+    out(`\n  ${C.bold}vexes guard${C.reset} v${VERSION} ${C.dim}— pre-install protection (experimental — npm only)${C.reset}\n`);
   }
 
   // 1. Snapshot current lockfile
@@ -257,8 +315,12 @@ export async function runGuard(flags, args) {
   if (!diff.hasChanges) {
     // Restore original lockfile (dry-run may have reformatted it)
     writeFileSync(lockfilePath, lockfileBackup);
-    if (!isJSON) out(`\n  ${C.green}\u2713 No dependency changes — install is safe${C.reset}\n`);
-    return EXIT.OK;
+    // The dry run resolved to EXACTLY the current lockfile — nothing new to
+    // analyze, but the caller still asked for an install. Guard is a wrapper:
+    // returning "safe" without installing would silently drop the user's
+    // command, so proceed (the resolution introduced nothing new).
+    if (!isJSON) out(`\n  ${C.green}\u2713 No dependency changes — nothing new to analyze${C.reset}\n`);
+    return executeRealInstall(manager, installArgs, targetDir, { expected: [], lockfilePath, lockfileBackup });
   }
 
   // --- Lockfile tamper guard ------------------------------------------------
@@ -311,7 +373,11 @@ export async function runGuard(flags, args) {
 
     for (const dep of packagesToAnalyze) {
       try {
-        const metadata = await fetchNpmMetadata(dep.name);
+        // Anchor metadata to the EXACT proposed version from the diff — never
+        // dist-tags.latest. Analyzing latest while installing dep.version
+        // would attribute someone else's scripts/publisher/timing to the
+        // artifact the user is about to get.
+        const metadata = await fetchNpmMetadata(dep.name, dep.version);
         const key = `${dep.ecosystem}:${dep.name}@${dep.version}`;
         const osvResult = osvData.results.get(key) || null;
         const analysis = await analyzePackage(metadata, osvResult, { ecosystem: dep.ecosystem, config });
@@ -362,7 +428,7 @@ export async function runGuard(flags, args) {
       out(`\n  ${C.green}\u2713 All ${packagesToAnalyze.length} new/changed packages look safe${C.reset}`);
       out(`  ${C.dim}Proceeding with install...${C.reset}\n`);
       // Run the real install
-      return executeRealInstall(manager, installArgs, targetDir);
+      return executeRealInstall(manager, installArgs, targetDir, { expected: packagesToAnalyze, lockfilePath, lockfileBackup });
     }
 
     // Show findings
@@ -410,7 +476,7 @@ export async function runGuard(flags, args) {
 
       if (forceInstall) {
         out(`\n  ${C.yellow}--force used — proceeding despite incomplete analysis.${C.reset}\n`);
-        return executeRealInstall(manager, installArgs, targetDir);
+        return executeRealInstall(manager, installArgs, targetDir, { expected: packagesToAnalyze, lockfilePath, lockfileBackup });
       }
 
       out(`\n  ${C.dim}Install blocked until analysis completes successfully. Use --force to override.${C.reset}\n`);
@@ -422,7 +488,7 @@ export async function runGuard(flags, args) {
 
       if (forceInstall) {
         out(`  ${C.yellow}--force used — proceeding despite warnings.${C.reset}\n`);
-        return executeRealInstall(manager, installArgs, targetDir);
+        return executeRealInstall(manager, installArgs, targetDir, { expected: packagesToAnalyze, lockfilePath, lockfileBackup });
       }
 
       // Check if we have a TTY for interactive prompt
@@ -430,7 +496,7 @@ export async function runGuard(flags, args) {
         out(`  ${C.dim}Proceed with install? [y/N]${C.reset}`);
         const answer = await prompt();
         if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
-          return executeRealInstall(manager, installArgs, targetDir);
+          return executeRealInstall(manager, installArgs, targetDir, { expected: packagesToAnalyze, lockfilePath, lockfileBackup });
         }
         out(`  ${C.dim}Install cancelled.${C.reset}\n`);
         return EXIT.VULNS_FOUND;
@@ -443,7 +509,7 @@ export async function runGuard(flags, args) {
 
     // Only unknown results — warn but allow
     out(`  ${C.yellow}! Some packages could not be fully analyzed — proceeding with caution.${C.reset}\n`);
-    return executeRealInstall(manager, installArgs, targetDir);
+    return executeRealInstall(manager, installArgs, targetDir, { expected: packagesToAnalyze, lockfilePath, lockfileBackup });
 
   } finally {
     cache.close();
@@ -481,24 +547,56 @@ export function evaluateGuardResults(results, osvData, expectedChecks) {
 }
 
 /**
- * Execute the real install command after guard approval.
+ * Execute the real install command after guard approval, then verify the
+ * installed artifact matches what was analyzed.
  * Uses execFileSync (no shell) to prevent command injection.
+ *
+ * @param {object} ctx
+ * @param {string[]} ctx.expected \u2014 packagesToAnalyze ({name, version, ...})
+ * @param {string} ctx.lockfilePath \u2014 path to package-lock.json
+ * @param {string} ctx.lockfileBackup \u2014 original lockfile text (for rollback)
  */
-function executeRealInstall(manager, installArgs, targetDir) {
+function executeRealInstall(manager, installArgs, targetDir, { expected = [], lockfilePath, lockfileBackup } = {}) {
   const display = installArgs.join(' ');
   out(`  ${C.dim}Running: ${display}${C.reset}\n`);
+  let failed = false;
   try {
     execFileSync(manager, installArgs.slice(1), {
       cwd: targetDir,
       stdio: 'inherit',
       timeout: 300_000,
     });
-    out(`\n  ${C.green}\u2713 Install complete${C.reset}\n`);
-    return EXIT.OK;
   } catch (err) {
     log.error(`install failed: ${err.message}`);
+    failed = true;
+  }
+
+  if (failed) {
+    // Incomplete-rollback guard: a failed install can leave a half-written
+    // lockfile. Restore the snapshot we took so the on-disk state matches the
+    // pre-install world. node_modules may still be partially modified \u2014 say so.
+    try { writeFileSync(lockfilePath, lockfileBackup); } catch { /* nothing to undo */ }
+    out(`  ${C.yellow}! Install failed \u2014 package-lock.json restored to its pre-install state.${C.reset}`);
+    out(`  ${C.dim}node_modules may be partially modified; re-run the install to converge it.${C.reset}\n`);
     return EXIT.ERROR;
   }
+
+  // Post-install binding check: the installed artifact must be the approved
+  // artifact. Two resolutions can diverge (registry moved, mirror, cache);
+  // approving one thing and installing another defeats the entire gate.
+  let afterRaw = '';
+  try { afterRaw = readFileSync(lockfilePath, 'utf8'); } catch { /* missing lockfile \u2192 verification fails below */ }
+  const verdict = verifyInstalledVersions({ afterRaw, expected });
+  if (!verdict.ok) {
+    out(`  ${C.red}${C.bold}\u2717 INSTALL DOES NOT MATCH APPROVAL${C.reset}`);
+    out(`  ${C.red}${sanitize(verdict.reason)}${C.reset}`);
+    out(`  ${C.dim}The lockfile now on disk is what the package manager actually resolved.${C.reset}`);
+    out(`  ${C.dim}Re-run "vexes guard -- <command>" to analyze what was really installed.${C.reset}\n`);
+    return EXIT.ERROR;
+  }
+
+  out(`\n  ${C.green}\u2713 Install complete \u2014 installed versions verified against the analyzed set${C.reset}\n`);
+  return EXIT.OK;
 }
 
 /**

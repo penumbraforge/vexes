@@ -52,13 +52,12 @@ describe('doctor: self test', () => {
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const dir = mkdtempSync(join(tmpdir(), 'vexes-doctor-empty-'));
-    const cwd = process.cwd();
-    process.chdir(dir); // parser fixtures are resolved from cwd — an empty dir fails them
     let code;
     try {
-      code = await runDoctor({ path: dir, json: true }, []);
+      // Fixtures resolve from the package root (not cwd), so the fail-loud
+      // path is exercised by pointing doctor at a missing fixtures dir.
+      code = await runDoctor({ path: dir, json: true }, [], { fixturesDir: join(dir, 'no-such-fixtures') });
     } finally {
-      process.chdir(cwd);
       rmSync(dir, { recursive: true, force: true });
     }
     assert.equal(code, 2); // EXIT.ERROR — incomplete self test must not look clean

@@ -84,7 +84,7 @@ The red team test suite contains hand-built, offline fixtures modeled on publish
 
 Passing these tests shows that vexes flags these particular fixtures. It does not show that it would flag the original attacks as they were actually published, or that it would catch a new one. There is also a false-positive suite that checks common benign patterns are not flagged, but neither suite is a substitute for evidence from real-world use, which vexes does not yet have.
 
-On top of the unit-level red team suite, a [detection benchmark](BENCHMARK.md) measures three things end to end and publishes the numbers: flagging of historically compromised packages against their OSV advisories (5/5), detection of re-authored attack techniques (6/6), and the false-positive rate on popular benign packages (0/10 flagged at HIGH+). The benchmark downloads no malware anywhere — the known-bad set works from lockfile text plus OSV, and the rest uses inert fixtures we wrote ourselves. CI re-runs it on every change to `src/`, and a regression on the known-bad set fails the build.
+On top of the unit-level red team suite, a [detection benchmark](BENCHMARK.md) measures three things end to end and publishes the numbers honestly: exact-advisory identification of historically compromised packages (5/5, gated in CI), detection of re-authored attack techniques with a negative control (5/5 attacks, 0/1 controls clean), and the false-positive rate on popular benign packages measured against ALL HIGH/CRITICAL signals, not just OSV (5/10 — published as tuning targets, not hidden). The benchmark downloads no malware anywhere — the known-bad set works from lockfile text plus OSV, and the rest uses inert fixtures we wrote ourselves.
 
 ## Installation
 
@@ -253,7 +253,7 @@ vexes fix --json                    # Machine-readable output
 
 ### `vexes guard` -- Pre-install check
 
-Intercepts `npm install` (and `pnpm`/`yarn` lockfile updates) and analyzes new or changed packages before they execute. Works by diffing lockfiles -- no network proxy needed. **`npx` is refused, not guarded**: it has no dry-run mode, so the package would execute before it could be analyzed -- use `vexes inspect <pkg>` first. This is the least exercised command; it sits in the path of your installs, so try it on a throwaway project first.
+**Experimental and npm only.** Intercepts `npm install` and analyzes new or changed packages at the exact versions the dry-run resolution proposed, before they execute. Works by diffing `package-lock.json` -- no network proxy needed. After the real install, guard re-reads the lockfile and verifies every analyzed package landed at exactly the approved version; any drift is a loud failure, not a silent approval. **`npx` is refused** (no dry-run mode -- the package would execute before it could be analyzed), and **`pnpm`/`yarn` are refused**: guard diffs `package-lock.json`, which they do not maintain, so it cannot honestly analyze their installs -- use `vexes inspect <pkg>` first. This is the least exercised command; it sits in the path of your installs, so try it on a throwaway project first.
 
 ```bash
 vexes guard -- npm install axios    # Guard a specific install

@@ -90,13 +90,16 @@ describe('schema: llmSummary', () => {
     const s = llmSummary(VULN, null, { reachability: REACHABILITY.REACHABLE });
     assert.match(s, /\[CRITICAL\] axios@1\.14\.1 \(npm\)/);
     assert.match(s, /Fixed in >= 1\.14\.2/);
-    assert.match(s, /Reachable from this project's code/);
+    assert.match(s, /Imported by this project's code/);
     assert.match(s, /Blocker: yes\.$/);
   });
 
   it('notes dead deps as non-blocking', () => {
     const s = llmSummary({ severity: 'CRITICAL', package: 'x', version: '1', ecosystem: 'npm', id: 'A' },
       null, { reachability: REACHABILITY.DEAD });
-    assert.match(s, /dead in the lockfile/);
+    assert.match(s, /No direct import found/);
+    // The old wording claimed the package is "not reachable" — overclaiming.
+    // Dead is import evidence, not proof the code can never execute.
+    assert.doesNotMatch(s, /not reachable/);
   });
 });

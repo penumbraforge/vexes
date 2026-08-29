@@ -58,19 +58,44 @@ describe('sandbox: refuse-by-default (no untrusted execution)', () => {
   });
 
   it('refuses even with a valid host unless allow=true', () => {
-    const r = runSandboxed({ command: CMD, workdir: '/tmp', allow: false, host: { host: 'sandbox-exec' } });
+    const r = runSandboxed({ command: CMD, workdir: '/tmp', allow: false, host: { host: 'sandbox-exec', writeIsolation: true } });
     assert.equal(r.status, 'refused');
     assert.match(r.reason, /not opted in/);
   });
 
-  it('fails cleanly on a host binary that does not exist', () => {
-    const r = runSandboxed({ command: ['no-such-binary-xyz'], workdir: '/tmp', allow: true, host: { host: 'firejail' } });
+  it('refuses namespace-only hosts (firejail/unshare) even when forced with allow=true', () => {
+    // firejail isolates processes/network but NOT filesystem writes — package
+    // code under it could modify user files. Refused before any binary probe.
+    for (const h of ['firejail', 'unshare']) {
+      const r = runSandboxed({ command: CMD, workdir: '/tmp', allow: true, host: { host: h, writeIsolation: false } });
+      assert.equal(r.status, 'refused');
+      assert.match(r.reason, /cannot contain filesystem writes/);
+      assert.equal(r.writeIsolation, false);
+    }
+  });
+
+  it('refuses a forced host whose writeIsolation is absent (not assumed true)', () => {
+    const r = runSandboxed({ command: CMD, workdir: '/tmp', allow: true, host: { host: 'bwrap' } });
+    assert.equal(r.status, 'refused');
+    assert.match(r.reason, /cannot contain filesystem writes/);
+  });
+
+  it('fails cleanly on a host with write isolation whose handler is missing', () => {
+    const r = runSandboxed({ command: CMD, workdir: '/tmp', allow: true, host: { host: 'no-such-primitive', writeIsolation: true } });
     assert.equal(r.status, 'failed');
-    assert.ok(r.reason || true);
+    assert.ok(r.reason);
   });
 });
 
 describe('sandbox: benign execution smoke (skip when hostless)', { skip: !detectSandboxHost()?.host }, () => {
+  it('never detects a host without filesystem write isolation', () => {
+    // The invariant the whole module exists for: a non-null detection is
+    // ALWAYS a write-isolating host, on every platform.
+    const h = detectSandboxHost();
+    assert.ok(h);
+    assert.equal(h.writeIsolation, true);
+  });
+
   it('runs a benign node -e inside the isolation primitive', () => {
     const r = runSandboxed({
       command: ['node', '-e', 'process.stdout.write("sandbox-live")'],

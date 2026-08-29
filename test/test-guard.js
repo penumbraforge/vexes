@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { dryRunFlags, requestedNamesFromArgs, verifyLockfileDiff, buildGuardEnvelope } from '../src/commands/guard.js';
+import { dryRunFlags, requestedNamesFromArgs, verifyLockfileDiff, verifyInstalledVersions, buildGuardEnvelope } from '../src/commands/guard.js';
 import { SCHEMA_VERSION } from '../src/cli/schema.js';
 
 describe('guard dry-run flags (manager-correct)', () => {
@@ -163,5 +163,63 @@ describe('guard JSON envelope (buildGuardEnvelope)', () => {
     });
     assert.equal(payload.complete, false);
     assert.equal(payload.result.complete, false);
+  });
+});
+
+describe('verifyInstalledVersions (approval binds to the installed artifact)', () => {
+  const lock = (packages) => JSON.stringify({ name: 'proj', lockfileVersion: 3, packages });
+
+  it('accepts when every analyzed package is installed at the exact approved version', () => {
+    const verdict = verifyInstalledVersions({
+      afterRaw: lock({
+        'node_modules/lodash': { version: '4.17.21' },
+        'node_modules/left-pad': { version: '1.3.0' },
+      }),
+      expected: [
+        { name: 'lodash', version: '4.17.21' },
+        { name: 'left-pad', version: '1.3.0' },
+      ],
+    });
+    assert.deepEqual(verdict, { ok: true });
+  });
+
+  it('rejects a version drift between the second resolution and the analyzed one', () => {
+    const verdict = verifyInstalledVersions({
+      afterRaw: lock({ 'node_modules/lodash': { version: '4.17.22' } }),
+      expected: [{ name: 'lodash', version: '4.17.21' }],
+    });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /approved as 4\.17\.21 but installed as 4\.17\.22/);
+  });
+
+  it('rejects an approved package that vanished in the real install', () => {
+    const verdict = verifyInstalledVersions({
+      afterRaw: lock({ 'node_modules/other': { version: '1.0.0' } }),
+      expected: [{ name: 'lodash', version: '4.17.21' }],
+    });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /not in the lockfile after install/);
+  });
+
+  it('matches nested occurrences (hoisted vs nested node_modules paths)', () => {
+    const verdict = verifyInstalledVersions({
+      afterRaw: lock({
+        'node_modules/a/node_modules/lodash': { version: '3.10.1' },
+        'node_modules/lodash': { version: '4.17.21' },
+      }),
+      expected: [{ name: 'lodash', version: '4.17.21' }],
+    });
+    assert.deepEqual(verdict, { ok: true });
+  });
+
+  it('is case-insensitive on names and fails loud on an empty/missing lockfile', () => {
+    const ok = verifyInstalledVersions({
+      afterRaw: lock({ 'node_modules/Lodash': { version: '4.17.21' } }),
+      expected: [{ name: 'lodash', version: '4.17.21' }],
+    });
+    assert.deepEqual(ok, { ok: true });
+
+    const bad = verifyInstalledVersions({ afterRaw: '', expected: [{ name: 'lodash', version: '4.17.21' }] });
+    assert.equal(bad.ok, false);
   });
 });

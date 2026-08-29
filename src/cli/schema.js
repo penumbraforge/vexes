@@ -47,10 +47,13 @@ export const CONFIDENCE = Object.freeze({
 });
 
 /**
- * Reachability grades — is the package actually hit by this project's code?
- *   reachable — importable transitively from an entry point (and typically imported)
+ * Reachability grades — DIRECT IMPORT EVIDENCE, not proven runtime reachability.
+ * The grades say what the project's own parsed source imports; they do not
+ * claim the package can never execute. Tooling, plugin loaders, and files the
+ * source scanner could not parse can still load a "dead" dependency.
+ *   reachable — statically imported from an entry point reached through the project's own files
  *   lazy      — only ever reached via dynamic import (`import()`), gated at runtime
- *   dead      — not imported anywhere; often dev/test/optional leftovers in the lockfile
+ *   dead      — no import found in any parsed project source file
  *   unknown   — not analyzed (non-JS ecosystem, or reachability analysis not run)
  */
 export const REACHABILITY = Object.freeze({
@@ -161,9 +164,9 @@ export function llmSummary(v, finding = null, opts = {}) {
 
   const fixed = v.fixed ? ` Fixed in ${v.fixed.replace(/^>=\s*/, '>= ')}.` : '';
   const reach = opts.reachability === REACHABILITY.DEAD
-    ? " Not reachable from this project's code (dead in the lockfile)."
+    ? " No direct import found in this project's source (may still load via tooling or dynamic paths)."
     : opts.reachability === REACHABILITY.REACHABLE
-      ? " Reachable from this project's code."
+      ? " Imported by this project's code."
       : '';
   const blocker = level === 'CRITICAL' || level === 'HIGH' ? 'Blocker: yes.' : 'Blocker: review.';
   return `[${level}] ${loc} — ${id}: ${desc}.${fixed}${reach} ${blocker}`;

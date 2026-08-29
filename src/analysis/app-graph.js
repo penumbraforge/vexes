@@ -1,22 +1,27 @@
 /**
- * Tier A reachability — build an import graph over the project's OWN source.
+ * Tier A — build a DIRECT IMPORT EVIDENCE graph over the project's OWN source.
  *
- * Concept: a vulnerability only matters if the code can actually be loaded.
- * The lockfile gives us the closure; the source tells us which parts the app
- * reaches. We parse the project source (acorn for JS, light scan for Python
+ * Concept: a vulnerability matters more if the project's code actually imports
+ * the package. The lockfile gives us the closure; the source tells us what it
+ * imports. We parse the project source (acorn for JS, light scan for Python
  * and Rust `use`) to find bare-specifier imports, then classify each
  * dependency as:
  *
  *   reachable — imported statically (import/from or require) from an entrypoint
  *               reached transitively through the project's own files
  *   lazy      — only ever dynamically imported (`import()` / `require.resolve`)
- *   dead      — referenced by no project source at all (often dev/test/optional
- *               or a package left behind in the lockfile)
+ *   dead      — referenced by no project source we parsed
+ *
+ * HONESTY BOUNDARY: this is import evidence, not proven runtime reachability.
+ * "dead" means "nothing we parsed imports it" — it does NOT mean the package
+ * can never execute. Tooling, plugin loaders, binaries invoked by manifest
+ * scripts, and files the scanner could not parse can all still load a "dead"
+ * package. Consumers must not suppress findings on this grade alone.
  *
  * We deliberately do NOT recurse into node_modules: this tool is zero-dependency
- * and offline, and its value is separating the lockfile's reachable surface
- * from the archive of the dead. Vulnerable dead deps still show up in the
- * output — but graded honestly, not as urgent.
+ * and offline, and its value is separating the lockfile's imported surface
+ * from the rest. Vulnerable "dead" deps still show up in the output — graded
+ * with this evidence attached, not hidden.
  *
  * @module analysis/app-graph
  */

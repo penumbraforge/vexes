@@ -7,8 +7,11 @@ import { log } from '../core/logger.js';
 // Bump whenever the *shape or meaning* of cached rows changes, not just the
 // table DDL. Cached advisories store normalized severities — v2 invalidates
 // caches written before the CVSS vector-parsing fix, which recorded false
-// CRITICALs for every PYSEC/RUSTSEC/GO advisory.
-const CACHE_SCHEMA_VERSION = 2;
+// CRITICALs for every PYSEC/RUSTSEC/GO advisory. v3 invalidates signal rows
+// written before the osvFingerprint field existed — those carry no record of
+// which advisory evidence they were formed against, so they cannot be
+// reconciled with fresh OSV results and must be re-analyzed.
+const CACHE_SCHEMA_VERSION = 3;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS advisories (

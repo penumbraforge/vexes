@@ -146,6 +146,16 @@ export function loadConfig(dir, flags = {}) {
   if (flags.sandboxHost !== undefined) config.sandboxHost = flags.sandboxHost;
   if (flags.fix) config.fix = true;
   if (flags.explain) config.explain = flags.explain;
+  // --top <n>: limit how many findings TEXT output displays. JSON/SARIF always
+  // carry the full result set; exit codes and summary counts are unaffected.
+  if (flags.top !== undefined) {
+    const n = parseInt(flags.top, 10);
+    if (Number.isInteger(n) && n > 0) {
+      config.top = n;
+    } else {
+      log.warn(`invalid --top "${flags.top}" — must be a positive integer. Showing all findings.`);
+    }
+  }
   // --min-reachability: only report findings whose reachability grades at/above
   // this bar. Valid: reachable, lazy, dead (dead = report everything), or unset.
   if (flags['min-reachability']) {

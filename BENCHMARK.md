@@ -6,13 +6,20 @@ benchmark downloads malware anywhere (see [Safety](#safety)).
 
 | Part | Measures | Result | Gate |
 |---|---|---|---|
-| A — known-bad flagging | Does scan flag historical compromised packages via OSV? | **5/5** | Yes — regression fails CI |
-| B — technique fixtures | Do the heuristic layers fire on re-authored attack techniques? | **6/6** | No — tuning target |
-| C — benign false positives | How often do popular packages draw HIGH/CRITICAL flags? | **0/10** | No — tuning target |
+| A — known-bad identification | Does scan match the SPECIFIC OSV advisory for each historical compromise? | **5/5** | Yes — regression fails CI |
+| B — technique detection | Do the heuristic layers fire on re-authored attacks — and stay quiet on a benign control? | **5/5 attacks** · **0/1 controls clean** | No — tuning target |
+| C — benign false positives | How often do popular packages draw HIGH/CRITICAL signals? | **5/10** | No — tuning target |
 
-Last full run: **2026-08-28** (v0.5.0). CI re-runs the benchmark on every
+Last full run: **2026-08-28** (v0.6.1). CI re-runs the benchmark on every
 change to `src/` — the latest numbers live in the
 [benchmark workflow runs](https://github.com/penumbraforge/vexes/actions/workflows/benchmark.yml).
+
+> **Honesty note (0.6.1):** earlier versions of this document reported Part B
+> as "6/6" — the benign control auto-passed by construction — and Part C as
+> "0/10", which counted only OSV advisories and ignored heuristic HIGH/CRITICAL
+> signals entirely. Both numbers were overclaims. The scoring now requires an
+> exact advisory-identity match (A), scores controls as must-stay-quiet (B),
+> and counts any HIGH/CRITICAL signal from any layer (C).
 
 ## Part A — known-bad flagging
 
@@ -41,14 +48,20 @@ malware archives, which we won't do.
 Attack techniques re-authored by us as inert source strings (no copied
 malware), fed through the full `analyzePackage` pipeline in-process:
 
-| technique | expected (any of) | fired | result |
-|---|---|---|---|
-| env-exfil-postinstall | POSTINSTALL_SCRIPT, AST_DANGEROUS_PATTERN, INITIAL_DANGEROUS_CAPABILITY | all three | ✅ |
-| downloader-postinstall | POSTINSTALL_SCRIPT, AST_DANGEROUS_PATTERN, INITIAL_DANGEROUS_CAPABILITY | all three | ✅ |
-| obfuscated-payload | POSTINSTALL_SCRIPT, AST_DANGEROUS_PATTERN, INITIAL_DANGEROUS_CAPABILITY | all three | ✅ |
-| capability-escalation | CAPABILITY_ESCALATION | CAPABILITY_ESCALATION | ✅ |
-| typosquat-name | TYPOSQUAT | TYPOSQUAT | ✅ |
-| clean-build-script (FP check) | — | none | ✅ |
+| technique | kind | expected (any of) | fired | result |
+|---|---|---|---|---|
+| env-exfil-postinstall | attack | POSTINSTALL_SCRIPT, AST_DANGEROUS_PATTERN, INITIAL_DANGEROUS_CAPABILITY | all three | ✅ |
+| downloader-postinstall | attack | POSTINSTALL_SCRIPT, AST_DANGEROUS_PATTERN, INITIAL_DANGEROUS_CAPABILITY | all three | ✅ |
+| obfuscated-payload | attack | POSTINSTALL_SCRIPT, AST_DANGEROUS_PATTERN, INITIAL_DANGEROUS_CAPABILITY | all three | ✅ |
+| capability-escalation | attack | CAPABILITY_ESCALATION | CAPABILITY_ESCALATION | ✅ |
+| typosquat-name | attack | TYPOSQUAT | TYPOSQUAT | ✅ |
+| clean-build-script | control (must stay quiet) | — | POSTINSTALL_SCRIPT (HIGH) | ❌ |
+
+**The control failure is a real finding, not a benchmark bug:** a benign
+`postinstall` build-verification script draws a HIGH `POSTINSTALL_SCRIPT`
+signal for any package not on the hand-maintained known-good allowlist.
+That is over-flagging on the heuristic layer's part — published here as a
+tuning target, exactly like Part C.
 
 The benchmark already paid for itself: the `capability-escalation` fixture
 exposed that `require('https').get(...)` — a direct require with no variable
@@ -61,13 +74,32 @@ text, never executed). A false positive is any HIGH or CRITICAL signal.
 esbuild is included deliberately as a stressor: it carries a real
 postinstall script (platform-binary bootstrap) that must NOT draw HIGH flags.
 
+Popular packages, analyzed with `inspect --deep` (tarball AST-inspected as
+text, never executed). A false positive is **any HIGH or CRITICAL signal from
+any layer** — OSV-derived or heuristic. esbuild is included deliberately as a
+stressor: it carries a real postinstall script (platform-binary bootstrap).
+
 | package | HIGH/CRITICAL signals |
 |---|---|
-| lodash, express, chalk, ms, debug, semver, typescript, react, axios, esbuild | none |
+| express, chalk, debug, semver, react | none |
+| lodash | VERSION_ANOMALY (HIGH) |
+| ms | VERSION_ANOMALY (HIGH) |
+| typescript | MAINTAINER_CHANGE, CIRCULAR_STAGING ×20 (CRITICAL) |
+| esbuild | TARBALL_DANGEROUS_PATTERN ×9 (HIGH/CRITICAL) |
+| axios | POSTINSTALL_SCRIPT (HIGH) |
+
+**5/10 flagged** — not 0/10. Earlier versions of this table counted only OSV
+advisories in the envelope summary and were blind to heuristic signals; the
+scoring now reads signal severities directly. These are genuine
+false-positive tuning targets for the heuristic layers, published honestly:
+
+- `VERSION_ANOMALY` on long-lived stable versions (lodash, ms) is over-flagging.
+- `CIRCULAR_STAGING` firing 20× on typescript's tarball suggests the detector
+  double-counts rather than deduplicating per pattern.
+- `TARBALL_DANGEROUS_PATTERN` on esbuild is the documented stressor case.
 
 MODERATE/LOW context signals (dormancy, missing provenance, maintainer
-history) still appear in normal output — those are informational and
-expected to fire on real-world packages.
+history) also appear in normal output — those are informational.
 
 ## OSV parity vs osv-scanner
 

@@ -303,7 +303,7 @@ export async function runAnalyze(flags, args) {
         ? !config.sandboxHost
         : !detectSandboxHost();
       if (hostRefusalReported) {
-        warnings.push('sandbox skipped — no isolation host (need sandbox-exec on macOS, or bwrap/unshare/firejail on Linux)');
+        warnings.push('sandbox skipped — no isolation host with filesystem write isolation (need sandbox-exec on macOS, or bwrap on Linux)');
       }
 
       for (const pkg of candidates) {
@@ -556,9 +556,22 @@ export async function runAnalyze(flags, args) {
 export async function analyzeSinglePackage(dep, osvData, config, cache) {
   const key = `${dep.ecosystem}:${dep.name}@${dep.version}`;
 
-  // Check signal cache
+  // Fresh OSV evidence for THIS run (queryBatch ran before we were called).
+  // The signal cache below is only trustworthy when the fresh evidence matches
+  // what the cached verdict was formed against — otherwise a cached "clean"
+  // could mask an advisory published while the cache was still warm.
+  const osvCovered = osvData?.checked?.has(key) === true;
+  const osvResult = osvCovered ? (osvData.results.get(key) || []) : null;
+  const osvFingerprint = osvCovered ? osvResult.map(v => v.id).sort().join(',') : 'uncovered';
+
+  // Check signal cache — a hit is valid ONLY if its OSV fingerprint matches
+  // the fresh evidence ('uncovered' never matches a cached fingerprint, so a
+  // degraded OSV run always re-analyzes instead of trusting stale signals).
   const cachedSignals = cache.getSignals(dep.ecosystem, dep.name, dep.version);
-  if (cachedSignals) return cachedSignals;
+  if (cachedSignals && cachedSignals.osvFingerprint === osvFingerprint) {
+    const { osvFingerprint: _evidence, ...output } = cachedSignals;
+    return output;
+  }
 
   // Fetch registry metadata
   let metadata = null;
@@ -567,10 +580,6 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
   } else if (dep.ecosystem === 'pypi' || dep.ecosystem === 'PyPI') {
     metadata = await fetchPypiMetadata(dep.name, dep.version);
   }
-
-  // Get OSV results for this package
-  const osvCovered = osvData?.checked?.has(key) === true;
-  const osvResult = osvCovered ? (osvData.results.get(key) || []) : null;
 
   // Run all signal detectors
   const result = await analyzePackage(metadata, osvResult, {
@@ -595,11 +604,13 @@ export async function analyzeSinglePackage(dep, osvData, config, cache) {
   }
 
   // Only cache complete results — never cache degraded analysis
-  // A transient network failure must not poison the cache with false-clean for 24 hours
+  // A transient network failure must not poison the cache with false-clean for 24 hours.
+  // The stored copy carries osvFingerprint so a later run can tell whether the
+  // advisory landscape this verdict was formed on still matches today's.
   const isDegraded = !osvCovered || metadata === null || output.riskLevel === 'UNKNOWN' || (output.warnings?.length > 0);
   if (!isDegraded) {
     try {
-      cache.setSignals(dep.ecosystem, dep.name, dep.version, output);
+      cache.setSignals(dep.ecosystem, dep.name, dep.version, { ...output, osvFingerprint });
     } catch (err) {
       log.debug(`cache write failed for signals ${key}: ${err.message}`);
     }

@@ -281,13 +281,16 @@ export async function runScan(flags, args) {
     uniqueDeps.filter(d => d.isDirect).map(d => `${d.ecosystem}:${d.name}@${d.version}`),
   );
 
-  // Tier A reachability — map each dependency to reachable/lazy/dead/unknown
-  // by parsing the project's OWN source, not recursing into node_modules.
-  // This is what separates a live vuln from a dead lockfile entry.
+  // Tier A direct-import evidence — map each dependency to
+  // reachable/lazy/dead/unknown by parsing the project's OWN source, not
+  // recursing into node_modules. This is IMPORT EVIDENCE, not proven
+  // runtime reachability: "dead" means "no project source we parsed imports
+  // it", which is not the same as "can never execute" (tooling, plugin
+  // loaders, and manifest-referenced files can still load it).
   appGraph = buildAppGraph(targetDir, uniqueDeps);
   if (!quietStdout) {
     const c = appGraph.categories;
-    out(`  ${C.dim}reachability: ${c.reachable} reachable · ${c.lazy} lazy · ${c.dead} dead${C.reset}`);
+    out(`  ${C.dim}direct-import evidence: ${c.reachable} imported · ${c.lazy} dynamic-only · ${c.dead} not imported${C.reset}`);
   }
 
   if (!quietStdout) {
@@ -473,10 +476,9 @@ export async function runScan(flags, args) {
           if (topN != null && shownCount >= topN) break;
           shownCount++;
           out(formatVuln(v));
-          out(formatVuln(v));
           const reach = reachabilityOf(appGraph, v.ecosystem, v.package);
           if (reach === 'dead') {
-            out(`    ${C.dim}not reachable from project source — dead in the lockfile${C.reset}`);
+            out(`    ${C.dim}no direct import found in project source (may still load via tooling or dynamic paths)${C.reset}`);
           } else if (reach === 'lazy') {
             out(`    ${C.dim}only dynamically imported (lazy)${C.reset}`);
           } else if (reach === 'reachable') {

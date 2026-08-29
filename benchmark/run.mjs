@@ -93,11 +93,19 @@ function runPartA() {
     const findings = (report?.findings || []).filter(
       (f) => (typeof f.package === 'string' ? f.package : f.package?.name || f.name) === entry.name
     );
-    const hit =
+    // "Flagged" — any loud signal on the package. "Hit" — the SPECIFIC advisory
+    // from the manifest is matched. A CRITICAL from some unrelated advisory is
+    // a flag, not a correct identification of this compromise; the gate is on
+    // the identity match, otherwise the score overclaims.
+    const flagged =
       findings.some((f) => f.signal === 'KNOWN_COMPROMISED') ||
       findings.some((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH');
+    const advisoryIds = new Set(findings.flatMap((f) => [
+      f.id, f.displayId, ...(f.advisories || []), ...(f.aliases || []),
+    ].filter(Boolean)));
+    const hit = advisoryIds.has(entry.advisory);
 
-    results.push({ ...entry, hit, signals: findings.map((f) => f.signal) });
+    results.push({ ...entry, hit, flagged, signals: findings.map((f) => f.signal) });
   }
   return results;
 }
@@ -139,15 +147,25 @@ async function runPartB() {
     // popular-name set. addedDeps is empty, so Layer 2 makes no registry
     // fetches — nothing here touches the network.
     const fired = new Set(signals.map((s) => s.signal));
-    const hit = t.expectAnyOf.length === 0 || t.expectAnyOf.some((s) => fired.has(s));
+    // ATTACK fixtures (expectAnyOf non-empty) are detected when any expected
+    // signal family fires. CONTROL fixtures (expectAnyOf empty) are NOT
+    // "detected" — they PASS when nothing dangerous fired. Conflating the two
+    // is how a benchmark claims 6/6 when it ran 5 attacks + 1 negative.
+    const isControl = t.expectAnyOf.length === 0;
+    const loudSignals = signals.filter((s) => s.severity === 'CRITICAL' || s.severity === 'HIGH');
+    const hit = isControl
+      ? (t.expectNone || []).every((s) => !fired.has(s)) && loudSignals.length === 0
+      : t.expectAnyOf.some((s) => fired.has(s));
     const strayFP = (t.expectNone || []).filter((s) => fired.has(s));
 
     results.push({
       id: t.id,
       technique: t.technique,
+      isControl,
       hit,
       expectAnyOf: t.expectAnyOf,
       fired: [...fired],
+      loudSignals: loudSignals.map((s) => s.signal),
       strayFP,
     });
   }
@@ -166,12 +184,17 @@ function runPartC() {
       continue;
     }
     const s = report.summary || {};
-    const fired = (report.assessment?.signals || []).map((x) => x.signal);
+    const signals = report.assessment?.signals || [];
+    // FP = any HIGH/CRITICAL signal, heuristic or OSV-derived. The envelope's
+    // `summary` counts only OSV advisories, so heuristic HIGH/CRITICAL signals
+    // would be invisible there — read the signals' severities directly.
+    const loud = signals.filter((x) => x.severity === 'CRITICAL' || x.severity === 'HIGH');
     results.push({
       ...entry,
-      fp: s.critical > 0 || s.high > 0,
+      fp: loud.length > 0,
       severities: { critical: s.critical, high: s.high, moderate: s.moderate, low: s.low },
-      signals: fired,
+      signals: signals.map((x) => x.signal),
+      loudSignals: loud.map((x) => `${x.signal}(${x.severity})`),
     });
   }
   return results;
@@ -181,30 +204,35 @@ function runPartC() {
 
 function summarize([a, b, c]) {
   const aHit = a.filter((r) => r.hit).length;
-  const bHit = b.filter((r) => r.hit).length;
+  const aFlagged = a.filter((r) => r.flagged).length;
+  const attacks = b.filter((r) => !r.isControl);
+  const controls = b.filter((r) => r.isControl);
+  const bHit = attacks.filter((r) => r.hit).length;
+  const bControlsClean = controls.filter((r) => r.hit).length;
   const cFP = c.filter((r) => r.fp).length;
   const cErr = c.filter((r) => r.error).length;
   const lines = [];
 
   lines.push(`# vexes detection benchmark`);
   lines.push('');
-  lines.push(`## Part A — known-bad flagging (OSV) — ${aHit}/${a.length} flagged`);
+  lines.push(`## Part A — known-bad identification (OSV) — ${aHit}/${a.length} advisory-matched (${aFlagged}/${a.length} flagged at HIGH+)`);
   lines.push('');
-  lines.push('| package | version | incident | advisory | flagged |');
-  lines.push('|---|---|---|---|---|');
+  lines.push('| package | version | incident | advisory | flagged | advisory matched |');
+  lines.push('|---|---|---|---|---|---|');
   for (const r of a) {
-    lines.push(`| ${r.name} | ${r.version} | ${r.incident} | ${r.advisory} | ${r.hit ? '✅' : '❌'} |`);
+    lines.push(`| ${r.name} | ${r.version} | ${r.incident} | ${r.advisory} | ${r.flagged ? '🚩' : '—'} | ${r.hit ? '✅' : '❌'} |`);
   }
   lines.push('');
 
-  lines.push(`## Part B — technique fixtures — ${bHit}/${b.length} detected`);
+  lines.push(`## Part B — technique detection — ${bHit}/${attacks.length} attacks detected; ${bControlsClean}/${controls.length} negative controls clean`);
   lines.push('');
-  lines.push('| technique | expected (any of) | fired | result |');
-  lines.push('|---|---|---|---|');
+  lines.push('| technique | kind | expected (any of) | fired | result |');
+  lines.push('|---|---|---|---|---|');
   for (const r of b) {
     const mark = r.hit ? '✅' : '❌';
+    const kind = r.isControl ? 'control (must stay quiet)' : 'attack';
     const extra = r.strayFP.length ? ` (stray: ${r.strayFP.join(', ')})` : '';
-    lines.push(`| ${r.id} | ${r.expectAnyOf.join(', ') || '—'} | ${r.fired.join(', ') || 'none'} | ${mark}${extra} |`);
+    lines.push(`| ${r.id} | ${kind} | ${r.expectAnyOf.join(', ') || '—'} | ${r.fired.join(', ') || 'none'} | ${mark}${extra} |`);
   }
   lines.push('');
 
@@ -216,7 +244,7 @@ function summarize([a, b, c]) {
     if (r.error) {
       lines.push(`| ${r.name} | — | ⚠️ error |`);
     } else {
-      lines.push(`| ${r.name} | ${r.signals.join(', ') || 'none'} | ${r.fp ? '🚩 FP' : '✅'} |`);
+      lines.push(`| ${r.name} | ${r.loudSignals.join(', ') || 'none'} | ${r.fp ? '🚩 FP' : '✅'} |`);
     }
   }
   lines.push('');
@@ -243,8 +271,9 @@ if (asJSON) {
 if (reportFile) writeFileSync(reportFile, markdown);
 if (process.env.GITHUB_STEP_SUMMARY) writeFileSync(process.env.GITHUB_STEP_SUMMARY, markdown);
 
-// The only gate: a known compromise must be flagged. Technique detection and
-// the benign FP rate are published, not gated — they're tuning targets.
+// The only gate: the SPECIFIC advisory for each known compromise must be
+// matched (not merely any HIGH+ signal). Technique detection and the benign
+// FP rate are published, not gated — they're tuning targets.
 const misses = a.filter((r) => !r.hit).length;
 if (misses > 0) {
   console.error(`benchmark regression: ${misses} known-bad package(s) not flagged`);

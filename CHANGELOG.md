@@ -3,6 +3,65 @@
 All notable changes to vexes are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.6.1] — 2026-08-28
+
+Trust hotfix release. No new features — every change closes an honesty or
+safety gap found in external review of 0.6.0.
+
+### Security
+- **Sandbox refuses hosts without filesystem write isolation.** `unshare` and
+  `firejail` isolate processes/network but run on the host filesystem, so
+  package code under them could modify user files while the tool reported
+  "sandboxed". Detection now accepts only `sandbox-exec` (macOS) and `bwrap`
+  (Linux), and `runSandboxed` hard-refuses any forced host whose
+  `writeIsolation` is not true.
+- **Cached signal results can no longer mask fresh advisories.** Cached
+  analysis was served before current OSV evidence was considered, so an
+  advisory published while the cache was warm could stay hidden for up to 24
+  hours. Cached verdicts now carry an `osvFingerprint` of the advisory
+  evidence they were formed against and are trusted only when today's fresh
+  OSV results match. Cache schema bumped to 3 (stale rows re-analyzed).
+
+### Fixed
+- **Guard analyzes the exact proposed version, not `latest`** — registry
+  metadata is now anchored to the version the dry-run resolution produced, so
+  someone else's scripts/publisher/timing are never attributed to the
+  artifact about to be installed.
+- **Guard's approval is bound to what actually installs.** After the real
+  install, the lockfile is re-read and every analyzed package must be present
+  at exactly the analyzed version; drift fails loud instead of silently
+  approving a different artifact. A failed install also restores the original
+  lockfile (incomplete-rollback fix), and the no-diff path now actually runs
+  the requested install instead of returning "safe" without installing.
+- **Guard is labeled npm-only, experimental — and enforces it.** `pnpm`/`yarn`
+  are refused: guard diffs `package-lock.json`, which they do not maintain, so
+  it cannot honestly analyze their installs. The JSON envelope now states
+  `packageManager: 'npm'`, `experimental: true`.
+- **`scan --top` was a silent no-op** — parsed but never wired into
+  configuration. Now mapped (and validated) in `loadConfig`.
+- **Displayed vulnerabilities no longer print twice in text mode.**
+- **`doctor` works from installed packages** — parser fixtures resolve
+  relative to the package root, not the caller's cwd, and the fixture files
+  ship in the npm artifact. A new packed-artifact test installs the real
+  tarball into an unrelated project and exercises the actual CLI.
+
+### Changed
+- **Reachability relabeled as "direct import evidence".** The Tier A grade is
+  import evidence from parsed project source, not proven runtime
+  reachability: "dead" means "no import found", not "can never execute"
+  (tooling, plugin loaders, and unparseable files can still load it). Machine
+  keys are unchanged; all user-facing wording and the agent-facing
+  `llmSummary` text now state the evidence, not a verdict.
+- **Benchmark scoring made honest.** Part A requires the exact manifest
+  advisory to be matched (any loud HIGH+ flag is reported but not credited);
+  Part B scores attacks (5/5) separately from the negative control, which
+  must stay quiet (0/1 — `POSTINSTALL_SCRIPT` fires HIGH on a benign
+  non-allowlisted build script, published as a tuning target); Part C counts
+  any HIGH/CRITICAL signal from any layer (5/10, previously reported as 0/10
+  by counting only OSV advisories).
+- **Vendored Acorn license notice ships** (`src/vendor/LICENSE-acorn.txt`) —
+  its MIT license requires the notice be included with the vendored copy.
+
 ## [0.6.0] — 2026-08-28
 
 ### Added

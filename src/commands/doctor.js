@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../cli/config.js';
 import { buildEnvelope } from '../cli/schema.js';
 import { C, out } from '../cli/output.js';
@@ -44,10 +45,19 @@ const PARSER_CHECKS = [
   ['pub (pubspec.lock)', pubParser.parseLockfile, 'pubspec.lock'],
 ];
 
-async function runParserChecks() {
+// Fixture paths resolve relative to the PACKAGE ROOT (this module lives at
+// src/commands/doctor.js), NOT the current working directory. The old
+// cwd-relative path only worked when cwd happened to be the repo — a doctor
+// run from an installed package or an unrelated project failed every parser
+// check and reported the tool untrustworthy.
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+// `fixturesDir` is injectable so tests can exercise the fail-loud path (all
+// parser checks failing ⇒ EXIT.ERROR) without relying on the caller's cwd.
+async function runParserChecks(fixturesDir = join(PACKAGE_ROOT, 'test', 'fixtures')) {
   const checks = [];
   for (const [name, parseFn, file] of PARSER_CHECKS) {
-    const path = join('test', 'fixtures', file);
+    const path = join(fixturesDir, file);
     try {
       const deps = parseFn(path);
       const count = Array.isArray(deps) ? deps.length : 'parsed';
@@ -92,7 +102,7 @@ async function probeReachable(url) {
   }
 }
 
-export async function runDoctor(flags, args) {
+export async function runDoctor(flags, args, { fixturesDir } = {}) {
   const targetDir = resolve(flags.path || process.cwd());
   const config = loadConfig(targetDir, flags);
   const isJSON = config.output?.format === 'json';
@@ -101,7 +111,7 @@ export async function runDoctor(flags, args) {
     out(`\n  ${C.bold}vexes doctor${C.reset} v${VERSION} ${C.dim}— self test${C.reset}\n`);
   }
 
-  const checks = await runParserChecks();
+  const checks = await runParserChecks(fixturesDir);
   const parserOk = checks.filter(c => c.name.startsWith('parser')).every(c => c.ok);
 
   const cacheCheck = await runCacheCheck();
@@ -112,12 +122,14 @@ export async function runDoctor(flags, args) {
   checks.push({ name: 'osv.dev', ok: osv.ok, detail: osv.detail, optional: true });
   checks.push({ name: 'registry.npmjs.org', ok: npm.ok, detail: npm.detail, optional: true });
 
-  // Sandbox is experimental availability (reported, never a failure).
+  // Sandbox is experimental availability (reported, never a failure). A host
+  // is only reported when it has filesystem write isolation — detection
+  // refuses namespace-only primitives (unshare/firejail) outright.
   const sandboxHost = detectSandboxHost()?.host || null;
   checks.push({
     name: 'sandbox host',
     ok: sandboxHost !== null,
-    detail: sandboxHost ? `${sandboxHost} available (network blocked, writes scoped)` : 'none (no isolation primitive)',
+    detail: sandboxHost ? `${sandboxHost} available (network blocked, filesystem writes contained)` : 'none (no isolation primitive with filesystem write isolation)',
     optional: true,
   });
 
