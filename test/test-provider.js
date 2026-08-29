@@ -286,5 +286,7 @@ describe('provider: reachability prompt builder', () => {
     });
     assert.ok(p.user.includes('example-package'));
     assert.ok(!p.user.includes('\x1b['), 'no escape sequences reach the model');
+    assert.match(p.user, /not vulnerable-path evidence/i);
+    assert.match(p.user, /Do not claim exploitation/i);
   });
 });

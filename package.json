@@ -1,7 +1,7 @@
 {
   "name": "@penumbraforge/vexes",
-  "version": "0.6.1",
-  "description": "Experimental evidence-rich dependency risk CLI for local developers and coding agents.",
+  "version": "0.6.2",
+  "description": "Experimental local CLI for OSV advisory matches and selected heuristic dependency-risk signals.",
   "type": "module",
   "bin": {
     "vexes": "bin/vexes.js"

@@ -53,7 +53,7 @@ export async function runMonitor(flags, args) {
     --interval <min>     OSV poll interval in minutes ${C.dim}(default: 60)${C.reset}
     --freshness <min>    Registry poll interval — assesses newly observed
                          releases (default: off). Combine with
-                         --interval for the full real-time layer.
+                         --interval to run both registry and OSV polling.
 
   ${C.bold}CI EXAMPLE${C.reset}
     ${C.dim}# GitHub Actions workflow step${C.reset}

@@ -67,7 +67,7 @@ jobs:
 Where GitHub code scanning is enabled, uploaded SARIF results appear in the
 repository's **Security** tab under Code Scanning Alerts.
 
-### Deep analysis on PRs
+### Heuristic source inspection on PRs
 
 ```yaml
 name: Supply Chain Analysis
@@ -81,7 +81,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.13'
-      - name: Deep analysis
+      - name: Heuristic source inspection
         id: vexes-analysis
         run: npx @penumbraforge/vexes analyze --deep --strict --json --no-user-config --no-project-config > analysis.json
         continue-on-error: true

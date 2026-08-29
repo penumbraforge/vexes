@@ -8,6 +8,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 > implementation. The entries below have been corrected in place where needed;
 > current limitations in README and SECURITY.md take precedence over older copy.
 
+## [0.6.2] — 2026-08-29
+
+### Changed
+- **AI output now describes the evidence it actually has.** The optional model
+  pass is documented and displayed as import context, not an exploitability
+  verdict. Findings add `aiImportContext` and summaries add `aiReachable`; the
+  historical `exploitability` and `exploitable` keys remain as deprecated
+  aliases with the same values for compatibility.
+- **Agent summaries no longer make blocker decisions.** `llmSummary` reports
+  advisory, severity, fixed-event, and direct-import facts without converting a
+  HIGH/CRITICAL severity into categorical `Blocker: yes` wording.
+- **Short product copy is more literal.** Package/help/wiki language now names
+  polling, heuristic analysis, and disabled guard setup directly rather than
+  using "real-time," "deep," or release-hardening shorthand where it did not
+  describe the behavior precisely.
+
 ## [0.6.1] — 2026-08-29
 
 Trust and correctness follow-up to 0.6.0. The changes below tighten behavior

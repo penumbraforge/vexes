@@ -136,7 +136,7 @@ vexes scan --fix                    # Show advisory-derived upgrade hints
 vexes scan --json                   # Machine-readable JSON output
 vexes scan --cached                 # Accept stale cache hits; misses may still query OSV
 vexes scan --min-reachability reachable  # Deprecated no-op; findings are never filtered this way
-vexes scan --ai --json                   # + opt-in LLM exploitability context per finding
+vexes scan --ai --json                   # + optional LLM import context per finding
 ```
 
 **Ecosystems supported:** npm (package-lock.json, pnpm-lock.yaml, yarn.lock), PyPI (Pipfile.lock, poetry.lock, requirements.txt, pyproject.toml), Cargo (Cargo.lock), Go (go.mod preferred, go.sum fallback), Ruby (Gemfile.lock), PHP (composer.lock), NuGet (packages.lock.json), Java (gradle.lockfile, pom.xml), Hex (mix.lock), Dart/pub (pubspec.lock)
@@ -165,13 +165,16 @@ that ecosystem are `unknown`. The older `reachability` values
 `--min-reachability` is deprecated and ignored; direct-import evidence never
 suppresses an advisory.
 
-**Tier B exploitability (`--ai`):** the same reachability foundation, upgraded
-with an optional LLM judge (reuses the configured provider — see
-`vexes explain`). Per finding, vexes sends extracted direct-import evidence plus
-a control-character-stripped, truncated advisory summary and asks one question: *is the vulnerable path
-plausibly exploitable HERE?* The model answers `reachable | plausible | unclear`
-plus a one-line reason, attached as `findings[].exploitability` with summary
-roll-ups (`.exploitable`/`.plausible`/`.unclear`/`.aiError`).
+**Optional AI import context (`--ai`):** an LLM can classify the limited
+direct-import evidence already collected by the scan. Per finding, vexes sends
+that evidence plus a control-character-stripped, truncated advisory summary.
+The model answers `reachable | plausible | unclear` with a one-line reason. A
+package import is not proof that the vulnerable API or code path runs, so this
+classification is context for review rather than an exploitability verdict. It
+is attached under `findings[].aiImportContext`. The historical
+`findings[].exploitability` field remains a deprecated alias. Summary roll-ups
+use `.aiReachable`/`.plausible`/`.unclear`/`.aiError`; `.exploitable` remains a
+deprecated alias for `.aiReachable` and does not prove exploitation.
 
 ```bash
 vexes scan --ai --json                 # find vulns and ask the configured LLM which may matter
@@ -192,7 +195,7 @@ export ANTHROPIC_API_KEY=sk-ant-...            # hosted Anthropic API
 route requires `ANTHROPIC_API_KEY`. Advisory metadata is untrusted and is framed
 as data in the prompt. A remote configured provider receives summarized
 package/advisory/import facts; source files are not sent.
-Verdicts are **advisory metadata, never a filter**: a deterministic finding is
+AI classifications are **advisory metadata, never a filter**: a deterministic finding is
 never silenced by an AI opinion, and an AI failure never flips `complete` to
 false — it degrades to a warning. If no provider is configured, `--ai` is
 skipped, a warning is added, and the deterministic scan result is unchanged.
@@ -380,7 +383,7 @@ undecodable bundle makes the result incomplete. A decoded bundle is
 cross-referenced, not cryptographically verified.
 
 ```bash
-vexes inspect lodash@4.17.21 --json    # JSON envelope (agent-ready)
+vexes inspect lodash@4.17.21 --json    # JSON envelope
 vexes inspect express                  # latest version
 vexes inspect requests --ecosystem pypi
 vexes inspect express@4.21.2 --deep    # + inspect a bounded tarball file sample
@@ -586,7 +589,7 @@ validate JSON before trusting stdout.
     "confidence": "proven", "reachability": "unknown", "importEvidence": "unknown",
     "signal": "KNOWN_COMPROMISED", "advisories": ["GHSA-23hp-3jrh-7fpw", "CVE-2026-59873"],
     "fixed": ">= 7.5.19", "fixCommand": "npm install -- tar@7.5.21",
-    "llmSummary": "[CRITICAL] tar@6.1.0 (npm) — CVE-2026-59873: node-tar: Decompression/parse DoS via unlimited input. Fixed in >= 7.5.19. No direct import found in this project's source (may still load via tooling or dynamic paths). Blocker: yes." } ]
+    "llmSummary": "[CRITICAL] tar@6.1.0 (npm) — CVE-2026-59873: node-tar: Decompression/parse DoS via unlimited input. Fixed in >= 7.5.19. No direct import found in this project's source (may still load via tooling or dynamic paths)." } ]
 }
 ```
 

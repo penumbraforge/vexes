@@ -14,7 +14,7 @@ separately and is not the release artifact.
 - **[Detection Signals](Detection-Signals.md)** -- Signal identifiers, severities, examples, and live-pipeline limitations
 - **[Configuration](Configuration.md)** -- .vexesrc.json, user config, signal overrides, cache tuning
 - **[CI/CD Integration](CI-CD-Integration.md)** -- GitHub Actions, SARIF upload, exit codes, JSON output
-- **[Architecture](Architecture.md)** -- 4-layer detection engine, code structure, design decisions
-- **[Security Design](Security-Design.md)** -- Threat model, hardening measures, trust boundaries
+- **[Architecture](Architecture.md)** -- Four heuristic evidence layers, code structure, design decisions
+- **[Security Design](Security-Design.md)** -- Threat model, implemented checks, trust boundaries
 - **[Allowlists](Allowlists.md)** -- Curated scoring adjustments, current names, and limitations
 - **[FAQ](FAQ.md)** -- Common questions and troubleshooting

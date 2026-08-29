@@ -212,7 +212,7 @@ export function loadConfig(dir, flags = {}) {
     }
     config.minReachability = r;
   }
-  // --ai: opt-in Tier B exploitability triage on scan findings via the pluggable
+  // --ai: opt-in Tier B import-context triage on scan findings via the pluggable
   // provider (local by default). Advisory metadata only — see exploitability.js.
   if (flags.ai) config.ai = true;
 

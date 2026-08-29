@@ -20,7 +20,7 @@ import { AdvisoryCache, NoOpCache } from '../cache/advisory-cache.js';
 import { buildEnvelope } from '../cli/schema.js';
 
 /**
- * `vexes guard` — Pre-install protection. EXPERIMENTAL, npm only.
+ * `vexes guard` — Pre-install assessment. EXPERIMENTAL, npm only.
  *
  * The proposal is resolved in a disposable copy of the project's npm manifest
  * and lockfile, leaving the target files untouched during review. Every changed
@@ -581,7 +581,7 @@ export async function runGuard(flags, args) {
   }
 
   if (!isJSON) {
-    out(`\n  ${C.bold}vexes guard${C.reset} v${VERSION} ${C.dim}— pre-install protection (experimental — npm only)${C.reset}\n`);
+    out(`\n  ${C.bold}vexes guard${C.reset} v${VERSION} ${C.dim}— pre-install assessment (experimental — npm only)${C.reset}\n`);
   }
 
   // 1. Snapshot manifest + lockfile with every npm occurrence preserved.
@@ -728,7 +728,7 @@ export async function runGuard(flags, args) {
     const osvData = await queryBatch(packagesToAnalyze);
     analyzeSpinner?.stop('Vulnerability check complete');
 
-    // Deep analysis on each new/changed package
+    // Heuristic analysis on each new/changed package
     const signalSpinner = isJSON ? null : createSpinner('Running behavioral analysis...');
     const results = [];
 
@@ -1282,7 +1282,7 @@ function runSetup(flags) {
   // deliberately narrow grammar (bare installs, workspaces, private sources,
   // global/prefix installs). Refuse setup until those flows can be routed or
   // bypassed without surprising the user.
-  out(`  ${C.yellow}Automatic guard shell setup is disabled in this trust-hardening release.${C.reset}`);
+  out(`  ${C.yellow}Automatic guard shell setup is currently disabled because it would intercept npm commands outside guard's supported grammar.${C.reset}`);
   out(`  ${C.dim}Use the explicit form: vexes guard -- npm install <public-registry-package>${C.reset}\n`);
   return EXIT.ERROR;
 }

@@ -74,11 +74,12 @@ updated.
 | `1` | Vulnerabilities found at or above the severity threshold |
 | `2` | Error -- scan was incomplete (query failures, parse errors) |
 
-**Why exit code 2?** A security scanner that silently reports clean when queries fail is dangerous. If vexes can't check a package, it tells you.
+**Why exit code 2?** Known parsing or query failures mark the scan incomplete
+instead of being reported as a clean result.
 
-## Deep analysis
+## Heuristic analysis
 
-For supply chain threat detection beyond known vulnerabilities:
+For npm/PyPI registry and source-pattern signals beyond OSV matches:
 
 ```bash
 vexes analyze

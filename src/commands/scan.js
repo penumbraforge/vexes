@@ -454,11 +454,11 @@ export async function runScan(flags, args) {
       v.importEvidence = importEvidenceOf(appGraph, v.ecosystem, v.package);
     }
 
-    // 7d. Tier B (--ai, opt-in): LLM exploitability verdicts on TOP of the
-    // deterministic Tier A grades. Advisory metadata only — records keep their
-    // evidence, an AI failure never turns `complete` false, and verdicts never
-    // filter a finding out. When no provider is configured we warn and proceed
-    // exactly as before, so --ai is safe to bake into an agent's default loop.
+    // 7d. Tier B (--ai, opt-in): LLM import-context classifications on top of
+    // the deterministic Tier A evidence. Advisory metadata only — records keep
+    // their evidence, an AI failure never turns `complete` false, and labels never
+    // filter a finding out. When no provider is configured we warn and leave the
+    // deterministic scan result unchanged.
     let aiTriage;
     if (config.ai) {
       const onWarning = (msg) => warnings.push(msg);
@@ -466,7 +466,7 @@ export async function runScan(flags, args) {
         // no spinner on structured stdout; run directly, warnings carry the story
         aiTriage = await triageFindings(filtered, appGraph, { onWarning });
       } else {
-        const aiSpinner = createSpinner('AI exploitability triage...');
+        const aiSpinner = createSpinner('AI import-context triage...');
         aiTriage = await triageFindings(filtered, appGraph, { onWarning });
         aiSpinner.stop(aiLabel(aiTriage));
       }
@@ -483,7 +483,7 @@ export async function runScan(flags, args) {
 
     if (quietStdout) {
       const counts = countBySeverity(filtered);
-      const aiCounts = config.ai ? countByExploitability(filtered) : {};
+      const aiCounts = config.ai ? countByAiImportContext(filtered) : {};
       emitStructured({
         version: VERSION,
         timestamp: new Date().toISOString(),
@@ -521,18 +521,18 @@ export async function runScan(flags, args) {
           } else if (importEvidence === 'found_static') {
             out(`    ${C.yellow}imported by project code${C.reset}`);
           }
-          // Tier B (--ai): per-finding verdict, clearly advisory — it never
+          // Tier B (--ai): per-finding classification, clearly advisory — it never
           // downgrades the deterministic finding above it.
-          if (v.exploitability) {
-            const e = v.exploitability;
+          if (v.aiImportContext || v.exploitability) {
+            const e = v.aiImportContext || v.exploitability;
             if (e.verdict === 'reachable') {
-              out(`    ${C.magenta}AI: reachable — ${sanitize(e.why)}${C.reset}`);
+              out(`    ${C.magenta}AI import context: reachable — ${sanitize(e.why)}${C.reset}`);
             } else if (e.verdict === 'plausible') {
-              out(`    ${C.magenta}AI: plausible — ${sanitize(e.why)}${C.reset}`);
+              out(`    ${C.magenta}AI import context: plausible — ${sanitize(e.why)}${C.reset}`);
             } else if (e.verdict === 'unclear') {
-              out(`    ${C.dim}AI: unclear — ${sanitize(e.why)}${C.reset}`);
+              out(`    ${C.dim}AI import context: unclear — ${sanitize(e.why)}${C.reset}`);
             } else {
-              out(`    ${C.red}AI: error — ${sanitize(e.why)}${C.reset}`);
+              out(`    ${C.red}AI import context: error — ${sanitize(e.why)}${C.reset}`);
             }
           }
           out('');
@@ -580,8 +580,8 @@ export async function runScan(flags, args) {
       out(summary(counts, uniqueDeps.length, ecoList, elapsed));
 
       if (config.ai && aiTriage) {
-        const aiC = countByExploitability(filtered);
-        out(`  ${C.dim}AI (advisory): ${aiC.exploitable} exploitable · ${aiC.plausible} plausible · ${aiC.unclear} unclear · ${aiC.aiError} error${C.reset}`);
+        const aiC = countByAiImportContext(filtered);
+        out(`  ${C.dim}AI (advisory import context): ${aiC.aiReachable} reachable · ${aiC.plausible} plausible · ${aiC.unclear} unclear · ${aiC.aiError} error${C.reset}`);
       }
 
       if (suppressed.length > 0) {
@@ -614,15 +614,20 @@ function countBySeverity(vulns) {
 }
 
 /**
- * Roll up per-verdict counts for the structured summary (additive keys):
- * exploitable / plausible / unclear / aiError (per-finding verdicts).
+ * Roll up per-classification counts for the structured summary (additive keys).
+ * `aiReachable` is the honest name for a `reachable` model response.
+ * `exploitable` is retained as a deprecated compatibility alias with the same
+ * count; it must not be read as proof of exploitability.
  */
-function countByExploitability(vulns) {
-  const out = { exploitable: 0, plausible: 0, unclear: 0, aiError: 0 };
+function countByAiImportContext(vulns) {
+  const out = { aiReachable: 0, exploitable: 0, plausible: 0, unclear: 0, aiError: 0 };
   for (const v of vulns) {
-    const e = v.exploitability;
+    const e = v.aiImportContext || v.exploitability;
     if (!e) continue;
-    if (e.verdict === 'reachable') out.exploitable++;
+    if (e.verdict === 'reachable') {
+      out.aiReachable++;
+      out.exploitable++; // Deprecated compatibility alias.
+    }
     else if (e.verdict === 'plausible') out.plausible++;
     else if (e.verdict === 'error') out.aiError++;
     else out.unclear++; // verdict 'unclear', or malformed
@@ -632,8 +637,8 @@ function countByExploitability(vulns) {
 
 /** One-line spinner/status label for the Tier B pass. */
 function aiLabel(t) {
-  if (t.skipped) return `AI triage unavailable — ${t.reason}`;
-  return `AI triage: ${t.total - t.errored}/${t.total} judged${t.errored ? ` · ${t.errored} errored` : ''}`;
+  if (t.skipped) return `AI import-context triage unavailable — ${t.reason}`;
+  return `AI import context: ${t.total - t.errored}/${t.total} classified${t.errored ? ` · ${t.errored} errored` : ''}`;
 }
 
 /**

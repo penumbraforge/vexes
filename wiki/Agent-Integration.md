@@ -34,7 +34,7 @@ target          { dir, lockfiles: [], ecosystems: [] }
 complete        boolean  — FALSE ⇒ never read the result as "clean"
 warnings        string[]
 result          { complete, warnings }   — nested copy for old consumers
-summary         { total, vulnerable, critical, high, moderate, low, suppressed, directImportEvidence, ... }
+summary         { total, vulnerable, critical, high, moderate, low, suppressed, directImportEvidence, aiReachable, ... }
 findings        []      — normalized OSV-style records when that command uses them
 (extra)         command-specific data, e.g. fixes, results, assessment, licenses
 ```
@@ -51,7 +51,7 @@ direct          boolean — false means "known transitive", undefined = unknown
 advisories      [osvId, ...aliases] deduped
 fixed           ">= x.y.z" when a fix range is known
 fixCommand      scan convenience command derived from OSV fixed events, when available; use `vexes fix` for candidate cross-checking
-llmSummary      one generated summary; treat blocker language as severity-policy shorthand
+llmSummary      generated advisory/fix/import summary; no exploitability or blocker decision
 ```
 
 Do not assume identical command payloads. For example, analyze records are under
@@ -87,7 +87,7 @@ Do not assume identical command payloads. For example, analyze records are under
 ## 6. Readiness & speed
 
 - `scan` batches against OSV.dev (`POST /v1/querybatch`, up to 1000 packages),
-  deduplicates, and caches in local SQLite with TTL — friendly to rate limits.
+  deduplicates, and caches in local SQLite with TTL to reduce repeated requests.
   `--cached` accepts stale cache hits without a freshness check; cache misses
   can still require OSV access.
 - Batching and caching reduce repeated OSV requests; elapsed time still depends
@@ -112,14 +112,21 @@ Do not assume identical command payloads. For example, analyze records are under
 
 ```bash
 vexes doctor --json | jq -e '.result.complete == true'
-vexes scan --ai --json --path ./app | jq -c '.findings[] | {pkg: .package, sev: .severityLevel.level, ai: .exploitability.verdict, why: .exploitability.why, fix: .fixCommand}'
+vexes scan --ai --json --path ./app | jq -c '.findings[] | {pkg: .package, sev: .severityLevel.level, ai: .aiImportContext.verdict, why: .aiImportContext.why, fix: .fixCommand}'
 vexes inspect lodash@4.17.21 --json     # collect package evidence; no project needed
 vexes fix --json --path ./app           # OSV-cross-checked upgrade candidates
 vexes licenses --json --path ./app      # flat declared-license inventory
 ```
 
-`scan --ai` is advisory. AI never silences a finding, and an AI failure leaves
-the deterministic scan's `complete` value untouched. `importEvidence` is scoped
+`scan --ai` adds advisory import-context classifications. AI never silences a
+finding, and an AI failure leaves the deterministic scan's `complete` value
+untouched. A `reachable` model response means the limited import evidence
+supports package use; it does not establish execution of the vulnerable path.
+The per-finding key is `aiImportContext`; the historical `exploitability` key
+remains a deprecated compatibility alias. The summary key `aiReachable` records
+the reachable-label count. `exploitable` remains a deprecated summary alias with
+the same value and must not be interpreted as proof of exploitability.
+`importEvidence` is scoped
 to parsed project source and never suppresses findings. The older
 `--min-reachability` option is deprecated and ignored.
 
@@ -137,7 +144,7 @@ ANTHROPIC_API_KEY    → hosted Anthropic API (x-api-key auth)
 
 `VEXES_AI_MODEL` (or `ANTHROPIC_MODEL`) pins the model and skips discovery.
 Discovery is cached per process and never throws: a dead cluster degrades each
-finding to `exploitability.verdict: "error"` with `summary.aiError` counting it
+finding to `aiImportContext.verdict: "error"` with `summary.aiError` counting it
 — exit path and `complete` are unaffected. An agent provisioning the cluster
 can't be sure a model answers there, so treat AI results as optional context.
 
@@ -146,5 +153,4 @@ lookup fails; missing declared license → exit `1`. License data is metadata fo
 policy, not exploitability — never treat it as a security blocker verdict.
 
 The `llmSummary` field compresses severity, package, fix, and import evidence.
-It is generated policy-oriented text, not proof that a finding is exploitable
-or a universal blocker.
+It does not decide whether a finding is exploitable or a policy blocker.

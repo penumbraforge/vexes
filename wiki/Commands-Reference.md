@@ -241,7 +241,7 @@ vexes guard -- npm install <package>
 
 ### Shell wrappers
 
-Automatic wrapper setup is disabled in the current hardening release because a
+Automatic wrapper setup is currently disabled because a
 general `npm install` wrapper would intercept commands outside guard's supported
 grammar. Use the explicit form above. `vexes guard --uninstall` remains available
 to remove bash, zsh, or fish wrapper blocks written by an older release; it

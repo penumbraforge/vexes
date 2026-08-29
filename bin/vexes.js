@@ -97,7 +97,7 @@ async function main() {
 
 function printHelp() {
   out(`
-  ${C.bold}vexes${C.reset} v${VERSION} — ${C.dim}shakes the tree to see what falls${C.reset}
+  ${C.bold}vexes${C.reset} v${VERSION} — ${C.dim}experimental dependency-risk CLI${C.reset}
 
   ${C.bold}USAGE${C.reset}
     vexes <command> [options]
@@ -121,7 +121,7 @@ function printHelp() {
     --severity <level>   Minimum: critical, high, moderate, low ${C.dim}(default: moderate)${C.reset}
     --fix                Show fix commands for each vulnerability
     --min-reachability <bar>  Deprecated no-op; import evidence never hides findings
-    --ai                 Tier B: LLM exploitability verdict per finding
+    --ai                 Optional LLM context from advisory + direct-import evidence
                           ${C.dim}(advisory; uses configured provider; never filters)${C.reset}
     --top <n>            Show only the first n findings in text output
     --cached             Use cached results without freshness check
@@ -136,7 +136,7 @@ function printHelp() {
   ${C.bold}ANALYZE OPTIONS${C.reset}
     --path <dir>         Target directory ${C.dim}(default: cwd)${C.reset}
     --ecosystem <name>   Filter: npm, pypi
-    --deep               Download + AST-inspect bounded source samples
+    --deep               Download + inspect bounded source samples
     --sandbox ${C.dim}(experimental, opt-in)${C.reset} Run CRITICAL/HIGH candidate
                           selected entrypoint in an accepted OS sandbox and
                           collect best-effort recorder evidence ${C.dim}(Linux bwrap only)${C.reset}
@@ -153,7 +153,7 @@ function printHelp() {
 
   ${C.bold}GUARD OPTIONS${C.reset}
     vexes guard -- npm install <pkg>   Analyze before installing
-    --setup              Unavailable in this hardening release (fails closed)
+    --setup              Currently unavailable (fails closed)
     --uninstall          Remove shell wrappers
     --force              Override HIGH signals only; incomplete/CRITICAL still block
 
@@ -168,7 +168,7 @@ function printHelp() {
   ${C.bold}INSPECT OPTIONS${C.reset} ${C.dim}(single-package on-demand assessment)${C.reset}
     vexes inspect lodash@4.17.21    Assess a package spec (defaults to latest)
     --ecosystem <name>   npm (default) or pypi
-    --deep               Download + AST-inspect bounded tarball source samples
+    --deep               Download + inspect bounded tarball source samples
     --sandbox ${C.dim}(experimental, opt-in)${C.reset} Run the package in the OS
                           sandbox under a best-effort recorder shim
                           ${C.dim}(Linux bwrap only; selected entrypoint)${C.reset}

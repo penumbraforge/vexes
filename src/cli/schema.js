@@ -171,8 +171,9 @@ function buildAdvisoryList(v) {
 }
 
 /**
- * One deterministic sentence written for an LLM/agent to act on.
- * Answers: what is it, how bad, is it fixed, is it reachable, is it a blocker.
+ * One concise summary written for an LLM/agent to review.
+ * It reports advisory, severity, fix-event, and direct-import facts without
+ * deciding whether the finding is exploitable or a policy blocker.
  * Never contains raw attacker-controlled source — only sanitized metadata.
  */
 export function llmSummary(v, finding = null, opts = {}) {
@@ -191,8 +192,7 @@ export function llmSummary(v, finding = null, opts = {}) {
     : importEvidence === IMPORT_EVIDENCE.FOUND_STATIC
       ? " Imported by this project's code."
       : '';
-  const blocker = level === 'CRITICAL' || level === 'HIGH' ? 'Blocker: yes.' : 'Blocker: review.';
-  return `[${level}] ${loc} — ${id}: ${desc}.${fixed}${reach} ${blocker}`;
+  return `[${level}] ${loc} — ${id}: ${desc}.${fixed}${reach}`;
 }
 
 function importEvidenceFromLegacy(value) {

@@ -1,6 +1,7 @@
 # Security Design
 
-vexes is a security tool that inspects untrusted data (package metadata, vulnerability descriptions, source code). Its own security posture must be rigorous.
+vexes inspects untrusted package metadata, vulnerability descriptions, and
+source code. This page documents the checks it implements and their limits.
 
 ## Threat model
 
@@ -19,7 +20,7 @@ vexes is a security tool that inspects untrusted data (package metadata, vulnera
 - **Config files** -- parsed JSON that could attempt prototype pollution
 - **Tarballs** -- untrusted compressed data that could be gzip bombs
 
-## Hardening measures
+## Implemented checks
 
 ### 1. Terminal-control sanitization
 
@@ -87,7 +88,7 @@ clean result. The scan path enforces:
 
 ### 5. Gzip bomb + SSRF + memory exhaustion protection
 
-Tarball inspection is hardened against multiple attack vectors:
+Tarball inspection applies these input bounds and destination checks:
 - **Compressed size:** 5MB maximum download, enforced while reading the stream
 - **Decompressed size:** 50MB maximum after gunzip
 - **SSRF restriction:** The initial tarball URL and every redirect hop (at most

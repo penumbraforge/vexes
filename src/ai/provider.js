@@ -178,7 +178,7 @@ export function providerLabel() {
 }
 
 /**
- * Build a prompt input for Tier B reachability reasoning.
+ * Build a prompt input for Tier B import-context reasoning.
  * Only accepts OUR extracted package spec + advisory summaries — a caller
  * passing in raw package source would violate the privacy boundary, so this
  * is the single entry point for that flow.
@@ -188,11 +188,11 @@ export function buildReachabilityPrompt({ graph, advisory }) {
   const safeSummary = String(advisory?.summary || '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
   return {
     user: [
-      'Reachability question for a dependency security scanner.',
+      'Limited import-context question for a dependency security scanner.',
       `Package: ${advisory?.package ?? '?'} ${advisory?.version ?? ''} (${advisory?.ecosystem ?? '?'})`,
       `Advisory summary: ${safeSummary}`,
-      `Imported by the project (transitive closure of entrypoints): ${rows}`,
-      `Is the vulnerable code path plausibly reachable? Answer reachable|plausible|unclear in one line, then one short reason.`,
+      `Selected project direct-import evidence (not vulnerable-path evidence): ${rows}`,
+      'Classify this limited context as reachable|plausible|unclear in one line, then one short reason. Do not claim exploitation, runtime reachability, or safety.',
     ].join('\n'),
   };
 }

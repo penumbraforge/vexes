@@ -215,7 +215,7 @@ export async function runAnalyze(flags, args) {
     }
 
     // 4. Fetch registry metadata + run analysis (concurrency-limited)
-    const analyzeSpinner = isJSON ? null : createSpinner('Fetching registry metadata and running deep analysis...');
+    const analyzeSpinner = isJSON ? null : createSpinner('Fetching registry metadata and running heuristic analysis...');
     const results = [];
     let analyzed = 0;
 

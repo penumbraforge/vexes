@@ -84,7 +84,7 @@ describe('schema: finding normalization', () => {
     assert.equal(f.fixCandidate.status, 'advisory-fixed-version-hint');
     assert.equal(f.fixCandidate.osvCrossChecked, false);
     assert.equal(f.fixCandidate.remediationVerified, false);
-    assert.match(f.llmSummary, /Blocker: yes\./);
+    assert.doesNotMatch(f.llmSummary, /Blocker:/);
   });
 
   it('orders severity via SEVERITY map', () => {
@@ -95,12 +95,13 @@ describe('schema: finding normalization', () => {
 });
 
 describe('schema: llmSummary', () => {
-  it('answers the blocker question and is one sentence', () => {
+  it('summarizes supplied facts without deciding policy', () => {
     const s = llmSummary(VULN, null, { reachability: REACHABILITY.REACHABLE });
     assert.match(s, /\[CRITICAL\] axios@1\.14\.1 \(npm\)/);
     assert.match(s, /OSV records a fixed event at >= 1\.14\.2/);
     assert.match(s, /Imported by this project's code/);
-    assert.match(s, /Blocker: yes\.$/);
+    assert.doesNotMatch(s, /Blocker:/);
+    assert.match(s, /Imported by this project's code\.$/);
   });
 
   it('describes not-found import evidence without claiming runtime unreachability', () => {
